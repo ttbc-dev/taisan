@@ -280,6 +280,20 @@ pub enum Effect {
         operation_id: String,
         receipt_body: Vec<u8>,
     },
+    /// Full-row upsert of the durable remote-collection record
+    /// (`docs/executor-transport-contract.md` §6, #376). One request
+    /// admits one collection identity: a row naming a different
+    /// `collection_id`, `invocation_id`, or `collection_digest` is a
+    /// `ConstraintConflict` — the contract's "a different collection
+    /// digest for one Invocation is a conflict". State moves are
+    /// monotonic (`collecting → collected → acknowledged`, `invalid`
+    /// terminal); a regression or a move off a terminal row conflicts.
+    /// `expected_seq` is the `recorded_seq` the writer read (0 for a
+    /// row believed absent).
+    UpsertExecutorCollection {
+        collection: crate::executor::ExecutorCollection,
+        expected_seq: EventSequence,
+    },
     /// Replaces the singleton intake-settings record, guarded by the
     /// caller-observed revision: `expected_revision` must equal the
     /// currently recorded `settings_revision`, and `None` requires the
@@ -813,6 +827,26 @@ pub trait ReadView {
         &self,
         request_id: &str,
     ) -> Result<Vec<crate::executor::ExecutorOperation>, StoreError>;
+    /// The durable remote-collection record for one request; `None` =
+    /// absent (nothing collected or declared). A corrupt row is an
+    /// error, never silently absent — a collection that cannot prove
+    /// its durable record is never `acknowledged` (contract §6, #376).
+    /// Stores that cannot enumerate them return `None` and rely on the
+    /// collection driver's explicit re-check.
+    fn executor_collection(
+        &self,
+        _request_id: &str,
+    ) -> Result<Option<crate::executor::ExecutorCollection>, StoreError> {
+        Ok(None)
+    }
+    /// Collection rows the collection/acknowledgement sweep must
+    /// advance: everything not yet `acknowledged` or `invalid`.
+    /// Stores that cannot enumerate them return none.
+    fn incomplete_executor_collections(
+        &self,
+    ) -> Result<Vec<crate::executor::ExecutorCollection>, StoreError> {
+        Ok(Vec::new())
+    }
     /// The first recorded handoff row for an Invocation; an Invocation
     /// may carry one handoff per required artifact.
     fn handoff_for_invocation(

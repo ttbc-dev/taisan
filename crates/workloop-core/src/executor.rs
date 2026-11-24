@@ -1559,6 +1559,496 @@ impl ExecutorOperation {
 }
 
 // ---------------------------------------------------------------------
+// Bounded transfer mechanics (contract §6, #376): the transfer
+// manifest declared before data frames arrive and the per-chunk
+// identity each data frame carries. Both directions share the same
+// types — a prepare transfer and a collect transfer differ only in
+// which side declares them.
+// ---------------------------------------------------------------------
+
+/// The only transfer-manifest format this contract reads or writes.
+pub const EXECUTOR_TRANSFER_V1_FORMAT: &str = "taisan.executor.transfer/1";
+/// The only chunk-header format this contract reads or writes.
+pub const EXECUTOR_CHUNK_V1_FORMAT: &str = "taisan.executor.chunk/1";
+
+/// Hard bound on one transfer manifest — metadata, never a body.
+pub const MAX_TRANSFER_MANIFEST_BYTES: u64 = 1024 * 1024;
+/// Hard bound on one chunk header; chunk bodies travel as data
+/// frames bounded by the declared `chunk_size` and §4's 4 MiB limit.
+pub const MAX_CHUNK_HEADER_BYTES: u64 = 64 * 1024;
+/// Bound on one transfer identifier.
+pub const MAX_TRANSFER_ID_CHARS: usize = 256;
+
+/// Digest tags (contract §6): the manifest digest covers the canonical
+/// manifest; the item digest covers a transferred item's exact bytes;
+/// the chunk digest covers one chunk's body bytes.
+pub const TRANSFER_DIGEST_TAG: &[u8] = b"taisan.executor.transfer.v1\0";
+pub const ITEM_DIGEST_TAG: &[u8] = b"taisan.executor.item.v1\0";
+pub const CHUNK_BODY_DIGEST_TAG: &[u8] = b"taisan.executor.chunk.v1\0";
+/// Coordinator-local tag for the durable collection record's
+/// self-check digest; the record never crosses the wire.
+const COLLECTION_RECORD_DIGEST_TAG: &[u8] = b"taisan.executor.collection-record.v1\0";
+
+/// The content digest one transfer manifest item declares: SHA-256
+/// over the item tag and the item's exact bytes.
+pub fn item_content_digest(bytes: &[u8]) -> String {
+    tagged_sha256(ITEM_DIGEST_TAG, bytes)
+}
+
+/// The digest one chunk header declares for its body bytes.
+pub fn chunk_body_digest(body: &[u8]) -> String {
+    tagged_sha256(CHUNK_BODY_DIGEST_TAG, body)
+}
+
+/// Whether a transfer-supplied identifier is a safe single token:
+/// non-empty, bounded, and free of path and framing characters —
+/// a transfer/collection/item id names a staging directory entry and
+/// a wire identity, so anything that could traverse or split is
+/// refused here rather than at the filesystem.
+pub fn transfer_id_is_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id.chars().count() <= MAX_TRANSFER_ID_CHARS
+        && !id.contains(['/', '\\', '\0'])
+        && id != "."
+        && id != ".."
+}
+
+/// One declared transfer item (contract §6): the stable identity,
+/// the safe relative path the receiver materializes it under, its
+/// byte count, and its content digest — all declared before the
+/// first data frame arrives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransferItemV1 {
+    pub item_id: String,
+    /// UTF-8 slash-separated relative path under the transfer root —
+    /// the same grammar [`RemoteHandoffV1::path_is_valid`] enforces.
+    pub path: String,
+    pub bytes: u64,
+    /// 64 lowercase hex — [`item_content_digest`] of the item body.
+    pub digest: String,
+}
+
+/// `taisan.executor.transfer/1`: the bounded declaration a sender
+/// commits before any data frame — one transfer session
+/// (`transfer_id`), the item group it belongs to (`collection_id`),
+/// the framing bound, and every item's identity, path, size, and
+/// digest. The receiver enforces the bound request's immutable limits
+/// before accepting any chunk.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutorTransferV1 {
+    pub format_version: String,
+    pub transfer_id: String,
+    pub collection_id: String,
+    pub total_bytes: u64,
+    pub item_count: u64,
+    /// Maximum bytes one chunk body may carry; bounded by §4's
+    /// 4 MiB data-frame limit and the Invocation's limits.
+    pub chunk_size: u64,
+    pub items: Vec<TransferItemV1>,
+}
+
+impl ExecutorTransferV1 {
+    /// Declare a transfer: `total_bytes`/`item_count` are derived from
+    /// the item set, never supplied, so a manifest cannot lie about
+    /// its own extent.
+    pub fn declared(
+        transfer_id: impl Into<String>,
+        collection_id: impl Into<String>,
+        chunk_size: u64,
+        items: Vec<TransferItemV1>,
+    ) -> Result<Self, EnvelopeError> {
+        // Checked accumulation: an item set whose bytes overflow u64
+        // has no representable extent — refuse it rather than wrap a
+        // `total_bytes` the receiver's limits would then trust.
+        let total_bytes = items
+            .iter()
+            .map(|i| i.bytes)
+            .try_fold(0u64, u64::checked_add)
+            .ok_or_else(|| EnvelopeError::Invalid {
+                reason: "transfer.invalid",
+                detail: "item byte sum overflows u64".into(),
+            })?;
+        let manifest = Self {
+            format_version: EXECUTOR_TRANSFER_V1_FORMAT.into(),
+            transfer_id: transfer_id.into(),
+            collection_id: collection_id.into(),
+            total_bytes,
+            item_count: items.len() as u64,
+            chunk_size,
+            items,
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// The manifest digest: SHA-256 over the transfer tag and the
+    /// canonical manifest — the binding both sides persist so a
+    /// resumed transfer re-declares byte-identically.
+    pub fn digest(&self) -> Result<String, EnvelopeError> {
+        let canonical =
+            executor_canonical_json(&serde_json::to_value(self).expect("manifest serializes"))?;
+        Ok(tagged_sha256(TRANSFER_DIGEST_TAG, &canonical))
+    }
+
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, EnvelopeError> {
+        executor_canonical_json(&serde_json::to_value(self).expect("manifest serializes"))
+    }
+
+    /// The declared item a chunk names, or `None`.
+    pub fn item(&self, item_id: &str) -> Option<&TransferItemV1> {
+        self.items.iter().find(|i| i.item_id == item_id)
+    }
+
+    /// Parse a manifest body: bound first, strict JSON, exact format,
+    /// closed member sets, then the internal consistency rules — the
+    /// declared set is refused, never normalized.
+    pub fn parse(raw: &[u8]) -> Result<Self, EnvelopeError> {
+        check_bound(raw, MAX_TRANSFER_MANIFEST_BYTES)?;
+        let value = strict_json(raw)?;
+        let declared = declared_format(&value);
+        if declared != EXECUTOR_TRANSFER_V1_FORMAT {
+            return Err(EnvelopeError::VersionUnknown { declared });
+        }
+        let manifest: Self =
+            serde_json::from_value(value).map_err(|e| EnvelopeError::Malformed {
+                detail: format!("transfer manifest malformed: {e}"),
+            })?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// The internal contract rules: safe identifiers, a finite chunk
+    /// bound, honest totals, unique item identities and paths, safe
+    /// paths, and 64-hex item digests.
+    pub fn validate(&self) -> Result<(), EnvelopeError> {
+        let invalid = |detail: String| EnvelopeError::Invalid {
+            reason: "transfer.invalid",
+            detail,
+        };
+        if !transfer_id_is_valid(&self.transfer_id) {
+            return Err(invalid("transfer_id is not a safe identifier".into()));
+        }
+        if !transfer_id_is_valid(&self.collection_id) {
+            return Err(invalid("collection_id is not a safe identifier".into()));
+        }
+        if self.chunk_size == 0 || self.chunk_size > MAX_DATA_FRAME_BYTES {
+            return Err(invalid(format!(
+                "chunk_size {} is not within 1..={MAX_DATA_FRAME_BYTES}",
+                self.chunk_size
+            )));
+        }
+        if self.item_count != self.items.len() as u64 {
+            return Err(invalid(format!(
+                "item_count {} disagrees with {} items",
+                self.item_count,
+                self.items.len()
+            )));
+        }
+        // An item sum that overflows u64 cannot equal any declared
+        // `total_bytes` — refuse it outright instead of wrapping into
+        // a small total a receiver's byte bound would accept.
+        let total: u64 = self
+            .items
+            .iter()
+            .map(|i| i.bytes)
+            .try_fold(0u64, u64::checked_add)
+            .ok_or_else(|| invalid("item byte sum overflows u64".into()))?;
+        if self.total_bytes != total {
+            return Err(invalid(format!(
+                "total_bytes {} disagrees with item sum {total}",
+                self.total_bytes
+            )));
+        }
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut seen_paths = std::collections::HashSet::new();
+        for item in &self.items {
+            if !transfer_id_is_valid(&item.item_id) {
+                return Err(invalid(format!(
+                    "item_id {:?} is not a safe identifier",
+                    item.item_id
+                )));
+            }
+            if !seen_ids.insert(item.item_id.clone()) {
+                return Err(invalid(format!("duplicate item_id {:?}", item.item_id)));
+            }
+            if !RemoteHandoffV1::path_is_valid(&item.path) {
+                return Err(invalid(format!("unsafe item path {:?}", item.path)));
+            }
+            if !seen_paths.insert(item.path.clone()) {
+                return Err(invalid(format!("duplicate item path {:?}", item.path)));
+            }
+            if !is_hex64(&item.digest) {
+                return Err(invalid(format!(
+                    "item {:?} digest is not 64 lowercase hex",
+                    item.item_id
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `taisan.executor.chunk/1`: the bounded header one data frame's
+/// chunk carries (contract §6) — transfer, collection, item, offset,
+/// byte count, and the body digest. A replay with identical fields is
+/// idempotent; a different digest at an occupied offset is
+/// `conflicting_replay`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutorChunkV1 {
+    pub format_version: String,
+    pub transfer_id: String,
+    pub collection_id: String,
+    pub item_id: String,
+    pub offset: u64,
+    pub bytes: u64,
+    /// 64 lowercase hex — [`chunk_body_digest`] of the chunk body.
+    pub chunk_digest: String,
+}
+
+impl ExecutorChunkV1 {
+    /// The header one chunk of `body` at `offset` in `item_id`
+    /// declares; `bytes`/`chunk_digest` are computed, never supplied.
+    pub fn new(
+        transfer_id: impl Into<String>,
+        collection_id: impl Into<String>,
+        item_id: impl Into<String>,
+        offset: u64,
+        body: &[u8],
+    ) -> Self {
+        Self {
+            format_version: EXECUTOR_CHUNK_V1_FORMAT.into(),
+            transfer_id: transfer_id.into(),
+            collection_id: collection_id.into(),
+            item_id: item_id.into(),
+            offset,
+            bytes: body.len() as u64,
+            chunk_digest: chunk_body_digest(body),
+        }
+    }
+
+    pub fn to_canonical_bytes(&self) -> Result<Vec<u8>, EnvelopeError> {
+        executor_canonical_json(&serde_json::to_value(self).expect("chunk serializes"))
+    }
+
+    /// Parse a chunk header: bound first, strict JSON, exact format,
+    /// closed member set, then safe identifiers and digest shape.
+    pub fn parse(raw: &[u8]) -> Result<Self, EnvelopeError> {
+        check_bound(raw, MAX_CHUNK_HEADER_BYTES)?;
+        let value = strict_json(raw)?;
+        let declared = declared_format(&value);
+        if declared != EXECUTOR_CHUNK_V1_FORMAT {
+            return Err(EnvelopeError::VersionUnknown { declared });
+        }
+        let chunk: Self = serde_json::from_value(value).map_err(|e| EnvelopeError::Malformed {
+            detail: format!("chunk header malformed: {e}"),
+        })?;
+        let invalid = |detail: String| EnvelopeError::Invalid {
+            reason: "chunk.invalid",
+            detail,
+        };
+        if !transfer_id_is_valid(&chunk.transfer_id)
+            || !transfer_id_is_valid(&chunk.collection_id)
+            || !transfer_id_is_valid(&chunk.item_id)
+        {
+            return Err(invalid("chunk identity is not a safe identifier".into()));
+        }
+        if !is_hex64(&chunk.chunk_digest) {
+            return Err(invalid("chunk_digest is not 64 lowercase hex".into()));
+        }
+        Ok(chunk)
+    }
+
+    /// Whether `body` is exactly what this header declares — byte
+    /// count and content digest together; a body check can never be
+    /// skipped without a digest check.
+    pub fn verifies_body(&self, body: &[u8]) -> bool {
+        body.len() as u64 == self.bytes && chunk_body_digest(body) == self.chunk_digest
+    }
+}
+
+// ---------------------------------------------------------------------
+// Durable collection record (contract §6, #376): the coordinator-side
+// record of one validated remote collection — declared identity and
+// digest first, validated entries and produced artifact identities on
+// `collected`, and the acknowledgement state the `acknowledge`
+// operation matches. The executor-side mirror is the collection/ack
+// tombstone file pair, which never crosses the wire.
+// ---------------------------------------------------------------------
+
+/// Lifecycle of one durable collection record
+/// (`collecting → collected → acknowledged`, or `invalid`).
+/// `acknowledged` is terminal for the record itself — remote body
+/// retention is the executor's custody, not this row's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorCollectionState {
+    /// The declared collection identity is committed; items are still
+    /// arriving or validating. A crash resumes the same collection.
+    Collecting,
+    /// Every member validated: the report/log durably retained and —
+    /// for producing roles — the artifact records committed and the
+    /// handoff refs verified. The coordinator may now `acknowledge`.
+    Collected,
+    /// The acknowledgement committed (or its receipt was recorded).
+    /// Repeated collection replays this record; it never duplicates
+    /// artifacts.
+    Acknowledged,
+    /// Collection failed validation; `invalid_reason` carries the
+    /// closed reason. An invalid collection never produces `Present`
+    /// evidence and is never acknowledged.
+    Invalid,
+}
+
+/// The canonical durable record sealed into `collection_body`
+/// (contract §6): collection identity and digest, the stop-proof
+/// receipt identity that authorized output collection, the validated
+/// entries, the produced artifact identities, and the honest
+/// truncation flags bounded retrieval records.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutorCollectionRecord {
+    pub request_id: String,
+    pub invocation_id: String,
+    pub collection_id: String,
+    /// The contract digest over `entries` — recomputed on read.
+    pub collection_digest: String,
+    /// The stop-proof receipt digest the `collect` named — the only
+    /// authorization output collection accepts.
+    pub stop_proof: String,
+    pub entries: Vec<CollectionEntry>,
+    /// The durable artifact identities the validated collection
+    /// produced (producing roles; empty for report-only).
+    pub artifact_ids: Vec<String>,
+    /// Bounded-retrieval flags: a report or log delivered past its
+    /// Invocation bound is recorded truncated, never silently whole.
+    pub report_truncated: bool,
+    pub log_truncated: bool,
+}
+
+/// The durable collection row: the canonical record body plus its
+/// self-check digest, the contract collection digest, the lifecycle
+/// state, and the compare-and-set sequence. Keyed by `request_id` —
+/// a bound request admits exactly one collection identity, so a
+/// different collection digest for one Invocation is a conflict
+/// (contract §6).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorCollection {
+    pub request_id: String,
+    pub invocation_id: String,
+    pub collection_id: String,
+    /// The contract collection digest — duplicated from the record for
+    /// keyed lookups; read-side verification checks it against the
+    /// body's entries.
+    pub collection_digest: String,
+    /// The canonical JSON of [`ExecutorCollectionRecord`].
+    pub collection_body: Vec<u8>,
+    /// `COLLECTION_RECORD_DIGEST_TAG` over `collection_body`,
+    /// re-checked on every read so a tampered row reads as corrupt.
+    pub body_digest: String,
+    pub state: ExecutorCollectionState,
+    /// Closed reason when `state == Invalid`
+    /// (`collection_incomplete`, `collection_invalid`,
+    /// `acknowledgement_conflict`, `limit_exceeded`, ...).
+    pub invalid_reason: Option<String>,
+    /// Compare-and-set cursor; see [`crate::domain::ArtifactHandoff`].
+    pub recorded_seq: i64,
+}
+
+impl ExecutorCollection {
+    /// Seal a validated record into a durable row.
+    pub fn new(
+        record: ExecutorCollectionRecord,
+        state: ExecutorCollectionState,
+        invalid_reason: Option<String>,
+        recorded_seq: i64,
+    ) -> Result<Self, EnvelopeError> {
+        let body = executor_canonical_json(
+            &serde_json::to_value(&record).expect("collection record serializes"),
+        )?;
+        Ok(Self {
+            request_id: record.request_id,
+            invocation_id: record.invocation_id,
+            collection_id: record.collection_id,
+            collection_digest: record.collection_digest,
+            body_digest: tagged_sha256(COLLECTION_RECORD_DIGEST_TAG, &body),
+            collection_body: body,
+            state,
+            invalid_reason,
+            recorded_seq,
+        })
+    }
+
+    /// The recorded fields, re-checked against the stored digest, the
+    /// row's own identity columns, and the contract collection digest
+    /// over the entries — `Err` marks a corrupt row the caller must
+    /// refuse, never silently re-collect.
+    pub fn record(&self) -> Result<ExecutorCollectionRecord, EnvelopeError> {
+        if tagged_sha256(COLLECTION_RECORD_DIGEST_TAG, &self.collection_body) != self.body_digest {
+            return Err(EnvelopeError::DigestMismatch {
+                member: "body_digest",
+            });
+        }
+        let record: ExecutorCollectionRecord = serde_json::from_slice(&self.collection_body)
+            .map_err(|e| EnvelopeError::Malformed {
+                detail: format!("collection body malformed: {e}"),
+            })?;
+        let invalid = |detail: String| EnvelopeError::Invalid {
+            reason: "collection.invalid",
+            detail,
+        };
+        if record.request_id != self.request_id
+            || record.invocation_id != self.invocation_id
+            || record.collection_id != self.collection_id
+        {
+            return Err(invalid("collection body names a different identity".into()));
+        }
+        if record.collection_digest != self.collection_digest {
+            return Err(invalid(
+                "collection body names a different collection digest".into(),
+            ));
+        }
+        if record.collection_digest != collection_digest(&record.entries)? {
+            return Err(EnvelopeError::DigestMismatch {
+                member: "collection_digest",
+            });
+        }
+        Ok(record)
+    }
+
+    /// Read-side integrity: digest, identity, and the contract
+    /// collection digest re-checked together.
+    pub fn verifies(&self) -> bool {
+        self.record().is_ok()
+    }
+
+    /// Whether the durable state may legally move `from → to`: the
+    /// lifecycle is monotonic (`invalid` from any non-terminal state,
+    /// `acknowledged` only from `collected`); a terminal row never
+    /// moves, and the same state is an idempotent replay.
+    pub fn transition_permitted(
+        from: ExecutorCollectionState,
+        to: ExecutorCollectionState,
+    ) -> bool {
+        use ExecutorCollectionState as S;
+        match (from, to) {
+            // Same-state is an idempotent replay even out of a
+            // terminal state — the lost-ack replay requirement; only a
+            // *different* target from `Invalid`/`Acknowledged` is a
+            // conflict.
+            _ if from == to => true,
+            (S::Invalid | S::Acknowledged, _) => false,
+            (_, S::Invalid) => true,
+            (S::Collecting, S::Collected) => true,
+            (S::Collected, S::Acknowledged) => true,
+            _ => false,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
 
@@ -2184,6 +2674,56 @@ mod tests {
         ));
     }
 
+    // -- transfer manifest -------------------------------------------
+
+    fn transfer_item(item_id: &str, path: &str, bytes: u64) -> TransferItemV1 {
+        TransferItemV1 {
+            item_id: item_id.into(),
+            path: path.into(),
+            bytes,
+            digest: "f".repeat(64),
+        }
+    }
+
+    #[test]
+    fn a_manifest_whose_item_bytes_overflow_u64_is_invalid() {
+        // Each integer only has to fit i64 — two near-i64::MAX items
+        // plus a small third sum past u64, and the wrapped total of 0
+        // must never satisfy the declared `total_bytes` a receiver's
+        // byte bound trusts (in debug this is also a panic).
+        let items = vec![
+            transfer_item("a", "a.bin", i64::MAX as u64),
+            transfer_item("b", "b.bin", i64::MAX as u64),
+            transfer_item("c", "c.bin", 2),
+        ];
+        // Both the constructor and the wire parse refuse with the same
+        // closed `transfer.invalid` token.
+        for err in [
+            ExecutorTransferV1::declared("t-1", "col-1", 1024, items.clone()).unwrap_err(),
+            ExecutorTransferV1::parse(
+                &serde_json::to_vec(&serde_json::json!({
+                    "format_version": EXECUTOR_TRANSFER_V1_FORMAT,
+                    "transfer_id": "t-1",
+                    "collection_id": "col-1",
+                    "total_bytes": 0,
+                    "item_count": 3,
+                    "chunk_size": 1024,
+                    "items": items,
+                }))
+                .unwrap(),
+            )
+            .unwrap_err(),
+        ] {
+            assert!(matches!(
+                err,
+                EnvelopeError::Invalid {
+                    reason: "transfer.invalid",
+                    ..
+                }
+            ));
+        }
+    }
+
     // -- durable records ----------------------------------------------
 
     fn binding_fields() -> ExecutorBindingFields {
@@ -2286,6 +2826,50 @@ mod tests {
         assert!(matches!(
             frame_body(body, 1),
             Err(EnvelopeError::Oversize { limit: 1, bytes: 2 })
+        ));
+    }
+
+    #[test]
+    fn collection_transitions_treat_same_state_as_idempotent_replay() {
+        use ExecutorCollectionState as S;
+        // A replayed terminal row — the acknowledge retry writing the
+        // state already recorded — is the same no-op a live-state
+        // replay is, never a conflict.
+        for state in [S::Collecting, S::Collected, S::Acknowledged, S::Invalid] {
+            assert!(
+                ExecutorCollection::transition_permitted(state, state),
+                "{state:?} -> {state:?} must be the idempotent replay"
+            );
+        }
+        // A *different* target out of a terminal state is the
+        // conflict; the monotonic steps stay permitted.
+        assert!(ExecutorCollection::transition_permitted(
+            S::Collecting,
+            S::Collected
+        ));
+        assert!(ExecutorCollection::transition_permitted(
+            S::Collected,
+            S::Acknowledged
+        ));
+        assert!(ExecutorCollection::transition_permitted(
+            S::Collected,
+            S::Invalid
+        ));
+        assert!(!ExecutorCollection::transition_permitted(
+            S::Acknowledged,
+            S::Collected
+        ));
+        assert!(!ExecutorCollection::transition_permitted(
+            S::Invalid,
+            S::Collected
+        ));
+        assert!(!ExecutorCollection::transition_permitted(
+            S::Acknowledged,
+            S::Invalid
+        ));
+        assert!(!ExecutorCollection::transition_permitted(
+            S::Collected,
+            S::Collecting
         ));
     }
 }

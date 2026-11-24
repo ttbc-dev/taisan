@@ -1,6 +1,6 @@
--- workloop v14 store: current-state tables enforcing structural
+-- workloop v15 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
--- `PRAGMA user_version = 14` marks the format; a stamped older file with
+-- `PRAGMA user_version = 15` marks the format; a stamped older file with
 -- the complete recognized schema upgrades additively at open, while an
 -- unversioned slice-0 database and a newer version are refused.
 -- v7 added work_usage.last_progress_basis; v8 added the intake run and
@@ -11,7 +11,8 @@
 -- #256); v12 added the finding_occurrences.summary column (#264); v13
 -- added the observations_execution evidence-lookup index; v14 added the
 -- executor_bindings and executor_operations durable remote-binding
--- tables (#375, docs/executor-transport-contract.md).
+-- tables (#375, docs/executor-transport-contract.md); v15 added the
+-- executor_collections durable remote-collection record (#376).
 
 CREATE TABLE IF NOT EXISTS store_meta (
     key TEXT PRIMARY KEY,
@@ -463,6 +464,28 @@ CREATE TABLE IF NOT EXISTS executor_operations (
 CREATE UNIQUE INDEX IF NOT EXISTS executor_one_start
     ON executor_operations (request_id)
     WHERE operation_kind = 'start';
+
+-- The durable remote-collection record (`docs/executor-transport-
+-- contract.md` §6, #376): one bound request admits exactly one
+-- collection identity — request_id is the key, and a record naming a
+-- different collection_id, invocation, or collection digest for the
+-- same request is a conflict, never an overwrite. `collection_body`
+-- is the canonical validated record; `body_digest` re-checks it on
+-- every read. State is monotonic — collecting → collected →
+-- acknowledged, invalid terminal — with recorded_seq the
+-- compare-and-set cursor the UpsertHandoff rows already use.
+CREATE TABLE IF NOT EXISTS executor_collections (
+    request_id TEXT PRIMARY KEY REFERENCES executor_bindings(request_id),
+    invocation_id TEXT NOT NULL,
+    collection_id TEXT NOT NULL,
+    collection_digest TEXT NOT NULL,
+    collection_body BLOB NOT NULL,
+    body_digest TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN
+        ('collecting', 'collected', 'acknowledged', 'invalid')),
+    invalid_reason TEXT,
+    recorded_seq INTEGER NOT NULL
+);
 
 -- Two-phase bounded reclaim plans for explicit `retention cleanup`.
 -- Phase 1 computes the eligible set and persists it here (bounded by

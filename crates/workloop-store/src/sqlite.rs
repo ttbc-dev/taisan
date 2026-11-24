@@ -10,8 +10,8 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `14` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1` through `13`
+//! `PRAGMA user_version` is the format gate: `15` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1` through `14`
 //! must carry the complete recognized schema of its version and
 //! upgrades additively at open; a stamped file whose schema is foreign
 //! or incomplete, an unversioned database with user tables (a slice-0
@@ -51,9 +51,11 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// `12` adds the `finding_occurrences.summary` column (#264);
 /// `13` adds the `observations_execution` evidence-lookup index;
 /// `14` adds the `executor_bindings` / `executor_operations` durable
-/// remote-binding tables (`docs/executor-transport-contract.md`, #375).
+/// remote-binding tables (`docs/executor-transport-contract.md`, #375);
+/// `15` adds the `executor_collections` durable remote-collection
+/// record (`docs/executor-transport-contract.md` §6, #376).
 /// Older files upgrade additively at open.
-pub(crate) const FORMAT_VERSION: i64 = 14;
+pub(crate) const FORMAT_VERSION: i64 = 15;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -71,6 +73,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "event_log",
     "executions",
     "executor_bindings",
+    "executor_collections",
     "executor_operations",
     "finding_occurrences",
     "host_action_intents",
@@ -139,6 +142,11 @@ const V10_ADDED_TABLES: &[&str] = &["worker_request_bodies"];
 /// bindings and operation ledger). Installed by the same `SCHEMA`
 /// batch on upgrade.
 const V13_ADDED_TABLES: &[&str] = &["executor_bindings", "executor_operations"];
+
+/// The table the v14 → v15 migration adds (the durable remote
+/// collection record). Installed by the same `SCHEMA` batch on
+/// upgrade.
+const V14_ADDED_TABLES: &[&str] = &["executor_collections"];
 
 /// How long a writer waits on the file lock before `SQLITE_BUSY` surfaces.
 /// Connection-local (applies inside `transact` and during `init` itself) and
@@ -350,9 +358,10 @@ impl SqliteStore {
             // except the v5, v8, and v9 additions (v4 adds a column,
             // not a table), a v5–v7 file everything except the v8 and
             // v9 additions (v6 and v7 each add a column, not a table),
-            // and a v8 file everything except the v9 addition, and a
-            // v9–v13 file everything except the additions landed
-            // after it — v14's executor tables among them. A
+            // and a v8 file everything except the v9 addition, a
+            // v9–v13 file everything except the v13 and v14
+            // additions, and a v14 file everything except v15's
+            // collection table. A
             // foreign or
             // truncated stamped file fails this check untouched, and
             // the accepted difference is a previous release's store: it
@@ -372,6 +381,7 @@ impl SqliteStore {
                             && !V9_ADDED_TABLES.contains(t)
                             && !V10_ADDED_TABLES.contains(t)
                             && !V13_ADDED_TABLES.contains(t)
+                            && !V14_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version == 2 {
@@ -384,6 +394,7 @@ impl SqliteStore {
                             && !V9_ADDED_TABLES.contains(t)
                             && !V10_ADDED_TABLES.contains(t)
                             && !V13_ADDED_TABLES.contains(t)
+                            && !V14_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 5 {
@@ -395,6 +406,7 @@ impl SqliteStore {
                             && !V9_ADDED_TABLES.contains(t)
                             && !V10_ADDED_TABLES.contains(t)
                             && !V13_ADDED_TABLES.contains(t)
+                            && !V14_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 8 {
@@ -405,6 +417,7 @@ impl SqliteStore {
                             && !V9_ADDED_TABLES.contains(t)
                             && !V10_ADDED_TABLES.contains(t)
                             && !V13_ADDED_TABLES.contains(t)
+                            && !V14_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 9 {
@@ -414,17 +427,30 @@ impl SqliteStore {
                         !V9_ADDED_TABLES.contains(t)
                             && !V10_ADDED_TABLES.contains(t)
                             && !V13_ADDED_TABLES.contains(t)
+                            && !V14_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 11 {
                 EXPECTED_TABLES
                     .iter()
-                    .filter(|t| !V10_ADDED_TABLES.contains(t) && !V13_ADDED_TABLES.contains(t))
+                    .filter(|t| {
+                        !V10_ADDED_TABLES.contains(t)
+                            && !V13_ADDED_TABLES.contains(t)
+                            && !V14_ADDED_TABLES.contains(t)
+                    })
                     .all(|t| present.contains(*t))
-            } else {
+            } else if version < 14 {
                 EXPECTED_TABLES
                     .iter()
-                    .filter(|t| !V13_ADDED_TABLES.contains(t))
+                    .filter(|t| !V13_ADDED_TABLES.contains(t) && !V14_ADDED_TABLES.contains(t))
+                    .all(|t| present.contains(*t))
+            } else {
+                // A v14 file holds every table the v13 → v14
+                // migration installed; only the v15 addition may be
+                // absent.
+                EXPECTED_TABLES
+                    .iter()
+                    .filter(|t| !V14_ADDED_TABLES.contains(t))
                     .all(|t| present.contains(*t))
             };
             if !required_complete {
@@ -1261,6 +1287,25 @@ fn executor_operation_from_row(
     })
 }
 
+const EXECUTOR_COLLECTION_COLS: &str = "request_id, invocation_id, collection_id, \
+     collection_digest, collection_body, body_digest, state, invalid_reason, recorded_seq";
+
+fn executor_collection_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<workloop_core::executor::ExecutorCollection, rusqlite::Error> {
+    Ok(workloop_core::executor::ExecutorCollection {
+        request_id: row.get(0)?,
+        invocation_id: row.get(1)?,
+        collection_id: row.get(2)?,
+        collection_digest: row.get(3)?,
+        collection_body: row.get(4)?,
+        body_digest: row.get(5)?,
+        state: untag(&row.get::<_, String>(6)?)?,
+        invalid_reason: row.get(7)?,
+        recorded_seq: row.get(8)?,
+    })
+}
+
 const VERIFICATION_COLS: &str = "id, artifact_id, requirement, argv, produced, \
     environment_digest, result, output, recorded_seq";
 
@@ -2044,6 +2089,56 @@ impl ReadView for Tx<'_> {
             }
         }
         Ok(operations)
+    }
+
+    fn executor_collection(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<workloop_core::executor::ExecutorCollection>, StoreError> {
+        let collection = self.query_opt(
+            &format!(
+                "SELECT {EXECUTOR_COLLECTION_COLS} FROM executor_collections \
+                 WHERE request_id=?1"
+            ),
+            params![request_id],
+            executor_collection_from_row,
+        )?;
+        // The durable record is the acknowledgement's only authority,
+        // so the read re-checks the self-digest, identity, and the
+        // contract collection digest: a tampered row is corrupt — an
+        // error, never a silently absent collection the caller could
+        // misread as "not yet collected" and duplicate.
+        match collection {
+            Some(collection) if collection.verifies() => Ok(Some(collection)),
+            Some(_) => Err(StoreError::Internal {
+                detail: format!("executor collection {request_id} failed integrity verification"),
+            }),
+            None => Ok(None),
+        }
+    }
+
+    fn incomplete_executor_collections(
+        &self,
+    ) -> Result<Vec<workloop_core::executor::ExecutorCollection>, StoreError> {
+        let collections = self.query_all(
+            &format!(
+                "SELECT {EXECUTOR_COLLECTION_COLS} FROM executor_collections \
+                 WHERE state NOT IN ('acknowledged','invalid') ORDER BY recorded_seq"
+            ),
+            params![],
+            executor_collection_from_row,
+        )?;
+        for collection in &collections {
+            if !collection.verifies() {
+                return Err(StoreError::Internal {
+                    detail: format!(
+                        "executor collection {} failed integrity verification",
+                        collection.request_id
+                    ),
+                });
+            }
+        }
+        Ok(collections)
     }
 
     fn artifact_handoff(&self, artifact_id: &str) -> Result<Option<ArtifactHandoff>, StoreError> {
@@ -3106,6 +3201,129 @@ impl TxView for Tx<'_> {
                         receipt.receipt_digest
                     ],
                 )?;
+            }
+            Effect::UpsertExecutorCollection {
+                collection,
+                expected_seq,
+            } => {
+                // One bound request admits one collection identity
+                // (contract §6): a row naming a different collection,
+                // invocation, or digest is a conflict — never an
+                // overwrite. State moves are monotonic, and
+                // `expected_seq` is the compare-and-set cursor so a
+                // concurrent collector's commit lands as a conflict
+                // instead of regressing the row it read.
+                if !collection.verifies() {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "executor collection {} failed integrity verification",
+                            collection.request_id
+                        ),
+                    });
+                }
+                let bound: Option<i64> = self.query_opt(
+                    "SELECT 1 FROM executor_bindings WHERE request_id=?1",
+                    params![collection.request_id],
+                    |row| row.get(0),
+                )?;
+                if bound.is_none() {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "executor collection {} names unbound request {}",
+                            collection.collection_id, collection.request_id
+                        ),
+                    });
+                }
+                let existing: Option<(String, String, String, String, i64)> = self.query_opt(
+                    "SELECT invocation_id, collection_id, collection_digest, state, \
+                     recorded_seq FROM executor_collections WHERE request_id=?1",
+                    params![collection.request_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )?;
+                match existing {
+                    Some((invocation_id, collection_id, collection_digest, _state, _))
+                        if invocation_id != collection.invocation_id
+                            || collection_id != collection.collection_id
+                            || collection_digest != collection.collection_digest =>
+                    {
+                        return Err(StoreError::ConstraintConflict {
+                            detail: format!(
+                                "executor collection for {} already recorded under \
+                                 a different identity or digest",
+                                collection.request_id
+                            ),
+                        });
+                    }
+                    Some((_, _, _, state, _)) => {
+                        let from: workloop_core::executor::ExecutorCollectionState = untag(&state)
+                            .map_err(|e| StoreError::Internal {
+                                detail: format!(
+                                    "executor collection {} holds an unreadable state: {e}",
+                                    collection.request_id
+                                ),
+                            })?;
+                        if !workloop_core::executor::ExecutorCollection::transition_permitted(
+                            from,
+                            collection.state,
+                        ) {
+                            return Err(StoreError::ConstraintConflict {
+                                detail: format!(
+                                    "executor collection {} cannot move \
+                                     {state} → {}",
+                                    collection.request_id,
+                                    tag(&collection.state)
+                                ),
+                            });
+                        }
+                    }
+                    None if *expected_seq != 0 => {
+                        return Err(StoreError::ConstraintConflict {
+                            detail: format!(
+                                "executor collection {} was believed recorded at \
+                                 seq {} but is absent",
+                                collection.request_id, expected_seq
+                            ),
+                        });
+                    }
+                    None => {}
+                }
+                let n = self.exec(
+                    "INSERT INTO executor_collections \
+                     (request_id, invocation_id, collection_id, collection_digest, \
+                      collection_body, body_digest, state, invalid_reason, recorded_seq) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
+                     ON CONFLICT(request_id) DO UPDATE SET collection_body=?5, \
+                     body_digest=?6, state=?7, invalid_reason=?8, recorded_seq=?9 \
+                     WHERE executor_collections.recorded_seq=?10",
+                    params![
+                        collection.request_id,
+                        collection.invocation_id,
+                        collection.collection_id,
+                        collection.collection_digest,
+                        collection.collection_body,
+                        collection.body_digest,
+                        tag(&collection.state),
+                        collection.invalid_reason,
+                        collection.recorded_seq,
+                        expected_seq,
+                    ],
+                )?;
+                if n == 0 {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "executor collection {} advanced concurrently",
+                            collection.request_id
+                        ),
+                    });
+                }
             }
             Effect::SetIntakeSettings {
                 settings,
