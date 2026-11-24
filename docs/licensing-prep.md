@@ -21,23 +21,26 @@ The workspace has **9 direct external dependencies** and **87 external
 crates total** in the resolved dependency graph (all targets, normal +
 build edges; dev-dependencies add no additional crates). Of those 87:
 
-- **69 crates compile into release binaries on unix** (verified with
-  `cargo tree --target aarch64-apple-darwin --edges normal,build`;
-  `x86_64-pc-windows-msvc` resolves 73).
-- **20 crates never ship inside a binary**: 7 proc-macro crates
-  (`clap_derive`, `ref-cast-impl`, `rustversion`, `schemars_derive`,
-  `serde_derive`, `wasm-bindgen-macro`, `zerocopy-derive`), 6 build-script
-  helpers (`cc`, `find-msvc-tools`, `pkg-config`, `shlex`, `vcpkg`,
-  `version_check`), and the proc-macro support crates reachable only
-  through them (`proc-macro2`, `quote`, `syn` ×2 versions, `heck`,
-  `serde_derive_internals`, `unicode-ident`). The table marks these
-  "(build only)".
-- Several crates are **target-gated and never compile for unix
-  release binaries**: `r-efi` (UEFI only), the `wasm-bindgen*`/`js-sys`/
+- **50 crates link into unix release binaries** — the table's
+  unmarked rows. (`cargo tree --target aarch64-apple-darwin --edges
+  normal,build` resolves 68 of the 87 — the linked set plus the
+  build-time set, which compiles on the host during build but never
+  links into the shipped binary; `x86_64-pc-windows-msvc` resolves 72.)
+- **20 crates compile only at build time and never ship inside a
+  binary** (21 table rows — `syn` is present at two versions): 7
+  proc-macro crates (`clap_derive`, `ref-cast-impl`, `rustversion`,
+  `schemars_derive`, `serde_derive`, `wasm-bindgen-macro`,
+  `zerocopy-derive`), 6 build-script helpers (`cc`, `find-msvc-tools`,
+  `pkg-config`, `shlex`, `vcpkg`, `version_check`), and the proc-macro
+  support crates reachable only through them (`proc-macro2`, `quote`,
+  `syn`, `heck`, `serde_derive_internals`, `unicode-ident`). The table
+  marks these "(build only)".
+- **16 crates are target-gated and never compile for unix release
+  binaries**: `r-efi` (UEFI only), the `wasm-bindgen*`/`js-sys`/
   `bumpalo`/`futures-*`/`slab`/`pin-project-lite`/`rustversion` cluster
-  (wasm32 only, reached via `uuid`), and the `windows-sys`/
-  `windows-link`/`anstyle-wincon`/`once_cell_polyfill` cluster
-  (Windows only).
+  (11 crates, wasm32 only, reached via `uuid`), and the `windows-sys`/
+  `windows-link`/`anstyle-wincon`/`once_cell_polyfill` cluster (4
+  crates, Windows only).
 
 `D` = declared directly in a workspace `Cargo.toml`.
 
@@ -81,7 +84,7 @@ build edges; dev-dependencies add no additional crates). Of those 87:
 | | is_terminal_polyfill | 1.70.2 | MIT OR Apache-2.0 | anstream |
 | | itoa | 1.0.18 | MIT OR Apache-2.0 | serde_json |
 | | js-sys | 0.3.107 | MIT OR Apache-2.0 | uuid (wasm only) |
-| D | libc | 0.2.191 | MIT OR Apache-2.0 | workspace crates (unix only) |
+| D | libc | 0.2.191 | MIT OR Apache-2.0 | workspace crates (unconditional deps — present in every target's dependency graph, links on unix targets only), cpufeatures, getrandom |
 | | libsqlite3-sys | 0.30.1 | MIT | rusqlite (bundled amalgamation — see §2) |
 | | memchr | 2.8.3 | Unlicense OR MIT | serde_json, winnow |
 | | once_cell | 1.21.4 | MIT OR Apache-2.0 | ahash |
@@ -131,8 +134,12 @@ build edges; dev-dependencies add no additional crates). Of those 87:
 | | zerocopy-derive | 0.8.63 | BSD-2-Clause OR Apache-2.0 OR MIT | zerocopy (build only) |
 | | zmij | 1.0.23 | MIT | serde_json |
 
-License-field check: **every external crate declares an SPDX license
-expression**; none are missing or nonstandard enough to block parsing.
+License-field check: **every external crate declares a license field**;
+none are missing or ambiguous enough to block parsing. 4 crates
+(`fallible-iterator`, `fallible-streaming-iterator`, `vcpkg`,
+`version_check`) use the legacy `MIT/Apache-2.0` slash spelling rather
+than an SPDX-valid `MIT OR Apache-2.0` — the intent is clear, but a
+strict SPDX parser must tolerate the legacy form.
 Package-content check: every crate ships its license text file(s) inside
 the published package **except `r-efi 6.0.0`** (SPDX expression only;
 UEFI-gated — see §5). **No crate ships a `NOTICE` file.**
@@ -263,7 +270,8 @@ file(s).
 
 **Non-blocking observations:**
 
-- No dependency lacks a declared SPDX license expression.
+- No dependency lacks a declared license field; 4 crates use the legacy
+  `MIT/Apache-2.0` spelling rather than SPDX-valid `OR` syntax (§1).
 - No copyleft obligation reaches any planned build target.
 - The SQLite amalgamation (public domain) is the only third-party code
   physically compiled into the binaries beyond the Rust crates.
