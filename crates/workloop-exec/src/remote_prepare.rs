@@ -265,7 +265,7 @@ fn verify_input(request: &WorkerRequestV2, name: &str, bytes: &[u8]) -> Result<(
 /// finalize is replayed here so a swapped file can never reach the
 /// workspace.
 fn verified_item(dir: &Path, item: &TransferItemV1) -> Result<Vec<u8>, PrepareError> {
-    let path = dir.join("items").join(&item.item_id);
+    let path = crate::remote_transfer::item_path(dir, &item.item_id);
     let meta = std::fs::symlink_metadata(&path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             PrepareError::Incomplete {

@@ -111,8 +111,8 @@ fn fault(detail: impl Into<String>) -> CollectError {
     CollectError::Fault(detail.into())
 }
 
-fn git(repo: &Path, args: &[&str]) -> Result<String, CollectError> {
-    let output = Command::new("git")
+fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output, CollectError> {
+    Command::new("git")
         .arg("-C")
         .arg(repo)
         .arg("-c")
@@ -125,7 +125,11 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, CollectError> {
         .arg("protocol.file.allow=always")
         .args(args)
         .output()
-        .map_err(|e| fault(format!("spawn git: {e}")))?;
+        .map_err(|e| fault(format!("spawn git: {e}")))
+}
+
+fn git(repo: &Path, args: &[&str]) -> Result<String, CollectError> {
+    let output = git_output(repo, args)?;
     if !output.status.success() {
         return Err(fault(format!(
             "git {}: {}",
@@ -139,7 +143,7 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, CollectError> {
 /// One finalized item's whole body, re-verified against the manifest
 /// — the same read-side check prepare runs.
 fn verified_item(dir: &Path, item: &TransferItemV1) -> Result<Vec<u8>, CollectError> {
-    let path = dir.join("items").join(&item.item_id);
+    let path = crate::remote_transfer::item_path(dir, &item.item_id);
     let bytes = std::fs::read(&path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             fault(format!("collected item {:?} is absent", item.item_id))
@@ -156,12 +160,28 @@ fn verified_item(dir: &Path, item: &TransferItemV1) -> Result<Vec<u8>, CollectEr
     Ok(bytes)
 }
 
+/// Why the quarantine import did not complete. `Invalid` is a
+/// deterministic refusal of the declared bytes — terminal
+/// `collection_invalid` material; `Fault` is transient io/git
+/// infrastructure the caller retries instead of recording.
+enum QuarantineRefusal {
+    Invalid(&'static str),
+    Fault(CollectError),
+}
+
+impl From<CollectError> for QuarantineRefusal {
+    fn from(e: CollectError) -> Self {
+        Self::Fault(e)
+    }
+}
+
 /// Import the produced object closure into quarantine and return the
 /// verified produced commit. `bundle` is written to a bounded
 /// scratch path for the fetch; `branch` is the managed work-branch
-/// name the executor bundled. Fails closed: an unverifiable bundle,
-/// a tip that is not the declared produced commit, or a failed
-/// connectivity check is a fault — never imported state.
+/// name the executor bundled. Fails closed: an unverifiable bundle
+/// or a tip that is not the declared produced commit is a semantic
+/// refusal; io and git transport failures are retryable faults —
+/// never imported state either way.
 fn quarantine_import(
     repo: &Path,
     scratch: &Path,
@@ -169,17 +189,30 @@ fn quarantine_import(
     branch: &str,
     produced: &str,
     quarantine: &str,
-) -> Result<(), CollectError> {
+) -> Result<(), QuarantineRefusal> {
     std::fs::create_dir_all(scratch).map_err(|e| fault(format!("create scratch: {e}")))?;
     let bundle_path = scratch.join("export.bundle");
     std::fs::write(&bundle_path, bundle).map_err(|e| fault(format!("write bundle: {e}")))?;
     let bundle_arg = bundle_path.to_string_lossy().into_owned();
-    git(repo, &["bundle", "verify", &bundle_arg])
-        .map_err(|_| fault("collected bundle fails verification"))?;
+    // Repo liveness first: a repository the coordinator cannot even
+    // open is infrastructure — a retryable fault, never a verdict on
+    // the collection bytes.
+    git(repo, &["rev-parse", "--git-dir"])?;
+    // The item's own digest already bound these bytes, so a verify
+    // failure on them is deterministic — a semantic refusal, not a
+    // transient fault.
+    let verified = git_output(repo, &["bundle", "verify", &bundle_arg])?;
+    if !verified.status.success() {
+        return Err(QuarantineRefusal::Invalid(
+            "collected bundle fails verification",
+        ));
+    }
     let heads = git(repo, &["bundle", "list-heads", &bundle_arg])?;
     let expect = format!("{produced} refs/heads/{branch}");
     if !heads.lines().any(|l| l.trim() == expect) {
-        return Err(fault("collected bundle does not pin the produced commit"));
+        return Err(QuarantineRefusal::Invalid(
+            "collected bundle does not pin the produced commit",
+        ));
     }
     // A crashed earlier import may have left the ref; discard and
     // re-import — quarantine is transient transport, never durable.
@@ -192,11 +225,13 @@ fn quarantine_import(
             &format!("+refs/heads/{branch}:{quarantine}"),
         ],
     )?;
-    git(repo, &["fsck", "--connectivity-only"]).map_err(|_| fault("fsck connectivity failed"))?;
+    git(repo, &["fsck", "--connectivity-only"])?;
     let resolved = git(repo, &["rev-parse", "--verify", quarantine])?;
     if resolved != produced {
         let _ = git(repo, &["update-ref", "-d", quarantine]);
-        return Err(fault("quarantine ref does not resolve to produced"));
+        return Err(QuarantineRefusal::Fault(fault(
+            "quarantine ref does not resolve to produced",
+        )));
     }
     Ok(())
 }
@@ -302,25 +337,59 @@ pub fn collect_remote(
         InvocationRole::Coding | InvocationRole::Fix
     );
 
-    // A replayed collect on an already-durable row: identical digest
-    // replays the record byte-for-byte; a different digest for the
-    // same request conflicts at the store and stays a refusal here.
+    // The collection identity: one digest entry per declared item —
+    // the same `item_id`/bytes/content-digest/source form the
+    // executor's `AssembledCollection` digests over the full bodies,
+    // so both sides agree on one collection digest an `acknowledge`
+    // can match. Entries derive from the verified manifest itself:
+    // finalize already proved each staged body equals its declared
+    // digest, and bounded report/log retention below truncates only
+    // the retained copy — the record's flags carry that honestly.
+    let mut entries = Vec::with_capacity(manifest.items.len());
+    for item in &manifest.items {
+        entries.push(CollectionEntry {
+            item_id: item.item_id.clone(),
+            bytes: item.bytes,
+            content_digest: item.digest.clone(),
+            source: if item.item_id == "export-bundle" {
+                "quarantine"
+            } else {
+                "worker"
+            }
+            .into(),
+        });
+    }
+    let digest =
+        collection_digest(&entries).map_err(|e| fault(format!("collection digest: {e}")))?;
+
+    // A replay binds the incoming collection to the durable row:
+    // identical `collection_id` *and* recomputed digest replay the
+    // record byte-for-byte — anything else under one request is the
+    // contract's `conflicting_replay`, refused without effect, never
+    // a silent replay of a different collection.
     if let Some(existing) = store.transact(|tx| tx.executor_collection(request_id))? {
         // The durable row is authoritative and untouched — the
-        // integrity check on read already proved it; a different
-        // collection under the same request is refused by the row's
-        // own `record()` verification only when the caller tries to
-        // commit it, so a replay returns here unchanged.
+        // integrity check on read already proved it.
         existing
             .record()
             .map_err(|e| fault(format!("durable collection is corrupt: {e}")))?;
-        return Ok(CollectedRemote {
-            collection: existing,
-            artifacts: Vec::new(),
-            report: None,
-            log: None,
-            replayed: true,
-        });
+        if existing.collection_id == collection_id && existing.collection_digest == digest {
+            return Ok(CollectedRemote {
+                collection: existing,
+                artifacts: Vec::new(),
+                report: None,
+                log: None,
+                replayed: true,
+            });
+        }
+        return Err(StoreError::ConstraintConflict {
+            detail: format!(
+                "request {request_id} holds collection {:?} (digest {}); \
+                 incoming {:?} (digest {digest}) conflicts",
+                existing.collection_id, existing.collection_digest, collection_id
+            ),
+        }
+        .into());
     }
 
     let branch = format!("work/{}", request.work_id);
@@ -373,7 +442,13 @@ pub fn collect_remote(
                             artifacts.push((required, fact));
                         }
                     }
-                    Err(reason) => invalid_reason = Some(reason),
+                    // A semantic refusal is the durable row's terminal
+                    // `invalid`; an infrastructure fault propagates —
+                    // the collection stays retryable and is never
+                    // persisted as invalid evidence for a retryable
+                    // error.
+                    Err(ProducedRefusal::Invalid(reason)) => invalid_reason = Some(reason),
+                    Err(ProducedRefusal::Fault(e)) => return Err(e),
                 }
             }
             _ => invalid_reason = Some("collection_incomplete".into()),
@@ -398,25 +473,6 @@ pub fn collect_remote(
         &mut report_truncated,
     );
     let log_kept = log_bytes.map(|b| bound(&b, request.budget.max_log_bytes, &mut log_truncated));
-
-    // Every transferred item is a collection-digest entry — the
-    // report/log entries cover the retained bytes, everything else
-    // the exact item.
-    let mut entries = Vec::new();
-    for item in &manifest.items {
-        let (bytes, source) = match item.item_id.as_str() {
-            "report" => (report_kept.clone(), "worker"),
-            "log" => (log_kept.clone().unwrap_or_default(), "worker"),
-            "export-bundle" => (item_body(&item.item_id)?.unwrap_or_default(), "quarantine"),
-            other => (item_body(other)?.unwrap_or_default(), "worker"),
-        };
-        entries.push(CollectionEntry {
-            item_id: item.item_id.clone(),
-            bytes: bytes.len() as u64,
-            content_digest: item_content_digest(&bytes),
-            source: source.into(),
-        });
-    }
 
     // Retain the bounded outputs in the CAS — the durable bodies the
     // acknowledgement's authority rests on. Retention faults are
@@ -459,8 +515,6 @@ pub fn collect_remote(
     };
     let _ = checkpoint_bytes;
 
-    let digest =
-        collection_digest(&entries).map_err(|e| fault(format!("collection digest: {e}")))?;
     let (state, reason) = match invalid_reason {
         Some(reason) => (ExecutorCollectionState::Invalid, Some(reason)),
         None => (ExecutorCollectionState::Collected, None),
@@ -495,10 +549,21 @@ pub fn collect_remote(
     })
 }
 
+/// Why produced-side validation did not yield verdicts. `Invalid` is
+/// a deterministic semantic refusal — the durable row records it as
+/// terminal `invalid`; `Fault` is transient infrastructure (io, git
+/// transport, store) — it propagates to the caller and the collection
+/// stays retryable, never persisted as invalid evidence for a
+/// retryable error.
+enum ProducedRefusal {
+    Invalid(String),
+    Fault(CollectError),
+}
+
 /// The producing-role validation: parse `handoff.json`, import the
 /// produced closure through quarantine, verify base ancestry and the
 /// exact commit, and resolve every required artifact against the
-/// imported objects. `Err(String)` is the closed `invalid_reason` —
+/// imported objects. `Invalid` is the closed `invalid_reason` —
 /// deterministic collection failure, never a transport retry.
 #[allow(clippy::too_many_arguments)]
 fn validate_produced(
@@ -512,25 +577,26 @@ fn validate_produced(
     bundle_raw: &[u8],
     scratch: &Path,
     branch: &str,
-) -> Result<Vec<(RequiredArtifact, ArtifactFact)>, String> {
-    let invalid = |reason: &str| Err(reason.to_string());
-    let handoff = RemoteHandoffV1::parse(handoff_raw, u64::MAX)
-        .map_err(|e| format!("collection_invalid: handoff manifest refused: {e}"))?;
+) -> Result<Vec<(RequiredArtifact, ArtifactFact)>, ProducedRefusal> {
+    let invalid = |reason: &str| ProducedRefusal::Invalid(reason.to_string());
+    let handoff = RemoteHandoffV1::parse(handoff_raw, u64::MAX).map_err(|e| {
+        ProducedRefusal::Invalid(format!("collection_invalid: handoff manifest refused: {e}"))
+    })?;
     if !handoff
         .identity_violations(request_id, &request.invocation_id)
         .is_empty()
     {
-        return invalid("collection_invalid");
+        return Err(invalid("collection_invalid"));
     }
     if handoff.repository.host != request.repository.host
         || handoff.repository.repository != request.repository.repository
     {
-        return invalid("collection_invalid");
+        return Err(invalid("collection_invalid"));
     }
     // The declared base must be the request's pinned base — a Worker
     // naming a different fork point is foreign, not stale.
     if handoff.base_commit != request.base.object {
-        return invalid("collection_invalid");
+        return Err(invalid("collection_invalid"));
     }
     // Descriptor coverage is exact: every required path must be
     // described, and no descriptor may name a path outside the
@@ -542,16 +608,14 @@ fn validate_produced(
             .iter()
             .any(|r| r.path == descriptor.path)
         {
-            return invalid("collection_invalid");
+            return Err(invalid("collection_invalid"));
         }
     }
     let produced = handoff.produced_commit.clone();
 
-    // Quarantine import: transport faults map to invalid here only
-    // when they prove the collection wrong; an io/git failure is
-    // retried by the caller — but inside this pure-validation seam we
-    // surface both as reasons and let the caller classify. The
-    // import itself is idempotent.
+    // Quarantine import: a semantic refusal of the declared bytes is
+    // invalid evidence; an io/git transport fault is transient — it
+    // propagates and the caller retries. The import is idempotent.
     if let Err(e) = quarantine_import(
         &layout.repository,
         scratch,
@@ -560,19 +624,22 @@ fn validate_produced(
         &produced,
         quarantine,
     ) {
-        return Err(format!(
-            "collection_invalid: quarantine import refused: {e}"
-        ));
+        return Err(match e {
+            QuarantineRefusal::Invalid(reason) => ProducedRefusal::Invalid(format!(
+                "collection_invalid: quarantine import refused: {reason}"
+            )),
+            QuarantineRefusal::Fault(e) => ProducedRefusal::Fault(e),
+        });
     }
     let ancestor = handoff::is_ancestor(&layout.repository, &handoff.base_commit, &produced)
-        .map_err(|e| format!("collection_invalid: ancestry check failed: {e}"))?;
+        .map_err(|e| ProducedRefusal::Fault(fault(format!("ancestry check failed: {e}"))))?;
     if !ancestor {
-        return invalid("stale_base");
+        return Err(invalid("stale_base"));
     }
     // A produced commit that never moved past the base produced
     // nothing — same verdict as the local handoff.
     if produced == handoff.base_commit && !invocation.required_artifacts.is_empty() {
-        return invalid("nothing_produced");
+        return Err(invalid("nothing_produced"));
     }
 
     // Per-artifact verification: size and content digest from the
@@ -607,7 +674,7 @@ fn validate_produced(
                 }
                 Ok(None) => ArtifactFact::Missing,
                 Err(e) => {
-                    return Err(format!("collection_invalid: blob read failed: {e}"));
+                    return Err(ProducedRefusal::Fault(e));
                 }
             },
         };
@@ -627,18 +694,21 @@ fn validate_produced(
         let reference = handoff::artifact_ref(&artifact_id);
         match git(&layout.repository, &["rev-parse", "--verify", &reference]) {
             Ok(current) if current == produced => {}
-            Ok(_) => return invalid("ref_conflict"),
+            Ok(_) => return Err(invalid("ref_conflict")),
             Err(_) => {
-                if git(
+                // Absent — claim it. A concurrent claim that landed
+                // this same produced commit is fine; a different one
+                // is a deterministic conflict; an unresolved ref is
+                // the failed update's fault, retried.
+                if let Err(e) = git(
                     &layout.repository,
                     &["update-ref", &reference, &produced, ""],
-                )
-                .is_err()
-                    && git(&layout.repository, &["rev-parse", "--verify", &reference])
-                        .map(|c| c != produced)
-                        .unwrap_or(true)
-                {
-                    return invalid("ref_conflict");
+                ) {
+                    match git(&layout.repository, &["rev-parse", "--verify", &reference]) {
+                        Ok(current) if current == produced => {}
+                        Ok(_) => return Err(invalid("ref_conflict")),
+                        Err(_) => return Err(ProducedRefusal::Fault(e)),
+                    }
                 }
             }
         }
@@ -648,7 +718,7 @@ fn validate_produced(
             &handoff.base_commit,
             &produced,
         )
-        .map_err(|e| format!("collection_invalid: manifest derive failed: {e}"))?;
+        .map_err(ProducedRefusal::Fault)?;
         let digest = sha256_hex(
             "artifact-manifest-v1",
             &workloop_core::domain::canonical_json(&manifest),
@@ -691,7 +761,7 @@ fn validate_produced(
             })
         });
         if let Err(e) = upsert {
-            return Err(format!("collection_invalid: artifact record refused: {e}"));
+            return Err(ProducedRefusal::Fault(e.into()));
         }
     }
     Ok(verdicts)

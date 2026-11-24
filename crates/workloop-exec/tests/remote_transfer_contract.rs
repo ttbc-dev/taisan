@@ -21,7 +21,7 @@ use workloop_core::executor::{
 };
 use workloop_core::identity::*;
 use workloop_core::observation::ArtifactFact;
-use workloop_core::store::{Effect, Store};
+use workloop_core::store::{Effect, Store, StoreError};
 use workloop_core::work::{HostTemplate, WorkloopConfig, handle_command};
 use workloop_core::worker_v2::*;
 use workloop_exec::bodies::{BodyStore, CAS_CATEGORY};
@@ -602,9 +602,11 @@ fn a_coding_request_roundtrips_coordinator_to_executor_and_back() {
     assert_eq!(row.state, HandoffState::Acknowledged);
     assert_eq!(row.produced.as_deref(), Some(produced.as_str()));
 
-    // The durable collection record: digest over the exact retained
-    // set, stop proof bound, no truncation.
+    // The durable collection record: the digest is one identity both
+    // sides agree on — the coordinator's durable row equals the
+    // executor's assembled digest, so an `acknowledge` can match it.
     let record = collected.collection.record().unwrap();
+    assert_eq!(record.collection_digest, assembled.digest);
     assert_eq!(record.stop_proof, "stop-proof-digest");
     assert!(!record.report_truncated);
     assert_eq!(record.artifact_ids, vec![artifact_id]);
@@ -757,7 +759,11 @@ fn missing_and_corrupt_items_are_refused() {
             .unwrap();
     }
     let dir = receiver.finalize(&exported.manifest).unwrap();
-    std::fs::write(dir.join("items/request"), b"{\"forged\":true}").unwrap();
+    std::fs::write(
+        remote_transfer::item_path(&dir, "request"),
+        b"{\"forged\":true}",
+    )
+    .unwrap();
     let err = remote_prepare::prepare_remote(
         &rig.exec_prepare,
         &dir,
@@ -811,8 +817,8 @@ fn traversal_paths_and_symlinks_are_refused() {
     let dir = ship(&exported, &rig.exec_transfers);
     // Plant a symlink where the staged item sat — prepare's
     // symlink_metadata check refuses it, never follows it.
-    std::fs::remove_file(dir.join("items/request")).unwrap();
-    std::os::unix::fs::symlink("/etc/passwd", dir.join("items/request")).unwrap();
+    std::fs::remove_file(remote_transfer::item_path(&dir, "request")).unwrap();
+    std::os::unix::fs::symlink("/etc/passwd", remote_transfer::item_path(&dir, "request")).unwrap();
     let err = remote_prepare::prepare_remote(
         &rig.exec_prepare,
         &dir,
@@ -836,8 +842,8 @@ fn traversal_paths_and_symlinks_are_refused() {
         .unwrap()
         .body
         .clone();
-    std::fs::remove_file(dir.join("items/request")).unwrap();
-    std::fs::write(dir.join("items/request"), &request_body).unwrap();
+    std::fs::remove_file(remote_transfer::item_path(&dir, "request")).unwrap();
+    std::fs::write(remote_transfer::item_path(&dir, "request"), &request_body).unwrap();
     let prepared = remote_prepare::prepare_remote(
         &rig.exec_prepare,
         &dir,
@@ -1215,18 +1221,18 @@ fn oversized_report_and_log_truncate_honestly() {
     let retained_log = collected.log.unwrap();
     assert_eq!(retained_log.bytes.len(), 32);
     assert!(retained_log.truncated);
-    // The collection-digest entries record the retained prefix, not
-    // the untruncated claim.
+    // The collection digest binds the full transferred bodies — the
+    // same digest the executor assembled — so the coordinator's
+    // acknowledge can match it; the record's truncation flags carry
+    // the honest account of what retention kept.
+    assert_eq!(record.collection_digest, assembled.digest);
     let report_entry = record
         .entries
         .iter()
         .find(|e| e.item_id == "report")
         .unwrap();
-    assert_eq!(report_entry.bytes, 64);
-    assert_eq!(
-        report_entry.content_digest,
-        item_content_digest(&retained.bytes)
-    );
+    assert_eq!(report_entry.bytes, 200);
+    assert_eq!(report_entry.content_digest, item_content_digest(&report));
 }
 
 /// A foreign handoff manifest — a Worker naming a different request
@@ -1319,5 +1325,213 @@ fn a_foreign_handoff_manifest_is_invalid() {
             .transact(|tx| tx.artifact_handoff(&artifact_id))
             .unwrap()
             .is_none()
+    );
+}
+
+/// A repeated `collect` binds the incoming collection to the durable
+/// row: a different body under the same collection identity, or a
+/// different collection identity under the same request, is the
+/// contract's `conflicting_replay` — refused, never a silent replay
+/// of whatever row happens to be durable.
+#[test]
+fn a_conflicting_collection_does_not_replay_the_durable_row() {
+    let (rig, base) = rig("collect-conflict");
+    let required = vec![RequiredArtifact {
+        kind: "result".into(),
+        path: "dist/result.json".into(),
+        expected_digest: None,
+    }];
+    let seeded = seed_remote_request(
+        &rig.store,
+        &rig.bodies,
+        &rig.source.repository,
+        &base,
+        required,
+        1 << 20,
+        1 << 20,
+    );
+    let (prepared, _exported) = prepare_side(&rig, &seeded, "tr-in-1");
+    worker_produce(&rig, &prepared, "dist/result.json", b"RESULT");
+    let collection_id = format!("col-{}", seeded.request_id);
+    let assembled = remote_custody::assemble_collection(
+        &rig.custody,
+        &prepared.request,
+        &prepared.io_dir,
+        "tr-out-1",
+        &collection_id,
+        CHUNK,
+    )
+    .unwrap();
+    let dir = ship_collection(&assembled, &rig.coord_transfers);
+    let first = remote_collect::collect_remote(
+        &rig.store,
+        &rig.collect_layout,
+        &dir,
+        &assembled.manifest,
+        &seeded.request_id,
+        &collection_id,
+        "stop-proof",
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(first.collection.state, ExecutorCollectionState::Collected);
+
+    // A different body under the same collection identity: the
+    // recomputed digest no longer matches the durable row — conflict,
+    // not a replay.
+    std::fs::write(
+        prepared.out_dir.join("report.json"),
+        b"{\"status\":\"changed\"}",
+    )
+    .unwrap();
+    let changed = remote_custody::assemble_collection(
+        &rig.custody,
+        &prepared.request,
+        &prepared.io_dir,
+        "tr-out-2",
+        &collection_id,
+        CHUNK,
+    )
+    .unwrap();
+    let dir2 = ship_collection(&changed, &rig.coord_transfers);
+    let err = remote_collect::collect_remote(
+        &rig.store,
+        &rig.collect_layout,
+        &dir2,
+        &changed.manifest,
+        &seeded.request_id,
+        &collection_id,
+        "stop-proof",
+        NOW,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            remote_collect::CollectError::Store(StoreError::ConstraintConflict { .. })
+        ),
+        "a different digest under one request conflicts, got {err:?}"
+    );
+
+    // Identical content under a different collection identity: the
+    // collection_id alone mismatches the durable row — conflict too.
+    std::fs::write(prepared.out_dir.join("report.json"), b"{\"status\":\"ok\"}").unwrap();
+    let renamed = remote_custody::assemble_collection(
+        &rig.custody,
+        &prepared.request,
+        &prepared.io_dir,
+        "tr-out-3",
+        "col-other",
+        CHUNK,
+    )
+    .unwrap();
+    let dir3 = ship_collection(&renamed, &rig.coord_transfers);
+    let err = remote_collect::collect_remote(
+        &rig.store,
+        &rig.collect_layout,
+        &dir3,
+        &renamed.manifest,
+        &seeded.request_id,
+        "col-other",
+        "stop-proof",
+        NOW,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            remote_collect::CollectError::Store(StoreError::ConstraintConflict { .. })
+        ),
+        "a different collection id under one request conflicts, got {err:?}"
+    );
+
+    // The durable row is untouched by either conflicting attempt.
+    let row = rig
+        .store
+        .transact(|tx| tx.executor_collection(&seeded.request_id))
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.collection_id, collection_id);
+    assert_eq!(row.collection_digest, first.collection.collection_digest);
+}
+
+/// A transient infrastructure fault inside produced validation —
+/// here the quarantine scratch path is blocked — propagates as a
+/// retryable fault and persists nothing: a retryable git/io failure
+/// never poisons the record with a terminal `invalid` row.
+#[test]
+fn a_transient_fault_does_not_poison_the_collection() {
+    let (rig, base) = rig("transient-fault");
+    let required = vec![RequiredArtifact {
+        kind: "result".into(),
+        path: "dist/result.json".into(),
+        expected_digest: None,
+    }];
+    let seeded = seed_remote_request(
+        &rig.store,
+        &rig.bodies,
+        &rig.source.repository,
+        &base,
+        required,
+        1 << 20,
+        1 << 20,
+    );
+    let (prepared, _exported) = prepare_side(&rig, &seeded, "tr-in-1");
+    worker_produce(&rig, &prepared, "dist/result.json", b"RESULT");
+    let collection_id = format!("col-{}", seeded.request_id);
+    let assembled = remote_custody::assemble_collection(
+        &rig.custody,
+        &prepared.request,
+        &prepared.io_dir,
+        "tr-out-1",
+        &collection_id,
+        CHUNK,
+    )
+    .unwrap();
+    let dir = ship_collection(&assembled, &rig.coord_transfers);
+
+    // Block the quarantine scratch path — a filesystem fault, not a
+    // verdict on the collection bytes.
+    std::fs::write(dir.join("scratch"), b"blocked").unwrap();
+    let err = remote_collect::collect_remote(
+        &rig.store,
+        &rig.collect_layout,
+        &dir,
+        &assembled.manifest,
+        &seeded.request_id,
+        &collection_id,
+        "stop-proof",
+        NOW,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, remote_collect::CollectError::Fault(_)),
+        "a transient io fault propagates, got {err:?}"
+    );
+    assert!(
+        rig.store
+            .transact(|tx| tx.executor_collection(&seeded.request_id))
+            .unwrap()
+            .is_none(),
+        "a retryable fault never persists a collection row"
+    );
+
+    // Clear the fault and the same collection collects cleanly — the
+    // retry is the contract's recovery path.
+    std::fs::remove_file(dir.join("scratch")).unwrap();
+    let collected = remote_collect::collect_remote(
+        &rig.store,
+        &rig.collect_layout,
+        &dir,
+        &assembled.manifest,
+        &seeded.request_id,
+        &collection_id,
+        "stop-proof",
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(
+        collected.collection.state,
+        ExecutorCollectionState::Collected
     );
 }

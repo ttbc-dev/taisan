@@ -5,15 +5,16 @@
 //!
 //! A declared manifest lands in `staging/<transfer_id>/manifest.json`
 //! before any data frame is accepted. Each chunk writes into
-//! `staging/<transfer_id>/items/<item_id>` at its declared offset and
-//! advances a small per-item offset journal only after the body bytes
-//! are durable — a crash mid-write resumes at the journaled offset,
-//! never at a torn file length. A chunk replayed with the same
-//! transfer, collection, item, offset, and digest is idempotent; a
-//! different digest at an occupied offset is `conflicting_replay`.
-//! Finalization re-verifies every item's whole body against the
-//! declared content digest and publishes `complete/<transfer_id>` by
-//! rename — the Worker only ever sees a fully validated set.
+//! `staging/<transfer_id>/items/` under the item's *encoded* name at
+//! its declared offset and advances a small per-item offset journal
+//! only after the body bytes are durable — a crash mid-write resumes
+//! at the journaled offset, never at a torn file length. A chunk
+//! replayed with the same transfer, collection, item, offset, and
+//! digest is idempotent; a different digest at an occupied offset is
+//! `conflicting_replay`. Finalization re-verifies every item's whole
+//! body against the declared content digest and publishes
+//! `complete/<transfer_id>` by rename — the Worker only ever sees a
+//! fully validated set.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -100,6 +101,31 @@ fn fsync_dir(path: &Path) -> Result<(), TransferError> {
         .map_err(|e| fault(format!("sync dir {}: {e}", path.display())))
 }
 
+/// The on-disk name one item's staged body occupies — a fixed
+/// 64-hex digest of the item_id, never the raw identifier. A valid
+/// identifier may contain '.' and run to 256 characters, so a
+/// verbatim name can collide with another item's `<id>.offset`
+/// journal (item `a.offset` versus the journal of item `a`) or
+/// overflow the filename limit; a bounded dot-free digest keeps the
+/// body name and its `<name>.offset` journal unambiguous for every
+/// legal id.
+fn item_file_name(item_id: &str) -> String {
+    workloop_core::domain::sha256_hex("taisan.executor.item-name.v1", item_id.as_bytes())
+}
+
+/// The path one item's staged body occupies inside a transfer dir —
+/// the encoded name the receiver writes and the importers re-read.
+pub fn item_path(dir: &Path, item_id: &str) -> PathBuf {
+    dir.join("items").join(item_file_name(item_id))
+}
+
+/// The per-item offset journal: one 8-byte big-endian counter
+/// naming the next expected offset — the durable resume position.
+fn journal_path(dir: &Path, item_id: &str) -> PathBuf {
+    dir.join("items")
+        .join(format!("{}.offset", item_file_name(item_id)))
+}
+
 /// One transfer area: `staging/` holds in-flight sessions,
 /// `complete/` holds finalized ones. The transport never exposes a
 /// staging directory to the Worker.
@@ -131,17 +157,28 @@ impl TransferStore {
         if dir.is_dir() { Some(dir) } else { None }
     }
 
-    /// The path one item's staged body occupies inside `dir` —
-    /// `item_id` was validated a safe identifier at manifest parse,
-    /// so it is a single path component.
-    fn item_path(dir: &Path, item_id: &str) -> PathBuf {
-        dir.join("items").join(item_id)
-    }
-
-    /// The per-item offset journal: one 8-byte big-endian counter
-    /// naming the next expected offset — the durable resume position.
-    fn journal_path(dir: &Path, item_id: &str) -> PathBuf {
-        dir.join("items").join(format!("{item_id}.offset"))
+    /// The completed directory when this transfer finalized under a
+    /// byte-identical manifest — the idempotent finalize replay the
+    /// contract requires. A completed transfer under a different
+    /// manifest is `conflicting_replay`, mirroring `declare`.
+    fn completed_match(
+        &self,
+        transfer_id: &str,
+        canonical: &[u8],
+    ) -> Result<Option<PathBuf>, TransferError> {
+        let Some(done) = self.completed(transfer_id) else {
+            return Ok(None);
+        };
+        let recorded = self.completed_manifest(transfer_id)?;
+        if recorded == canonical {
+            Ok(Some(done))
+        } else {
+            Err(TransferError::ConflictingReplay {
+                detail: format!(
+                    "transfer {transfer_id:?} already completed under a different manifest"
+                ),
+            })
+        }
     }
 
     /// The journaled resume position: the offset file if present and
@@ -149,7 +186,7 @@ impl TransferStore {
     /// item. A journal naming more than the staged file holds is
     /// corrupt — the file would have to have lost durable bytes.
     fn next_offset(dir: &Path, item_id: &str, declared_bytes: u64) -> Result<u64, TransferError> {
-        let body_path = Self::item_path(dir, item_id);
+        let body_path = item_path(dir, item_id);
         let body_len = match std::fs::symlink_metadata(&body_path) {
             Ok(m) if m.is_file() => m.len(),
             Ok(_) => {
@@ -160,7 +197,7 @@ impl TransferStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
             Err(e) => return Err(e.into()),
         };
-        let journal = Self::journal_path(dir, item_id);
+        let journal = journal_path(dir, item_id);
         let offset = match std::fs::read(&journal) {
             Ok(raw) if raw.len() == 8 => u64::from_be_bytes(raw.try_into().expect("8 bytes")),
             Ok(_) => {
@@ -236,18 +273,13 @@ impl TransferStore {
 
         // A completed session replays as already done: the receipt
         // layer reports the immutable final state rather than
-        // reopening staging.
-        if self.completed(&manifest.transfer_id).is_some() {
-            let recorded = self.completed_manifest(&manifest.transfer_id)?;
-            if recorded == canonical {
-                return Ok(Vec::new());
-            }
-            return Err(TransferError::ConflictingReplay {
-                detail: format!(
-                    "transfer {:?} already completed under a different manifest",
-                    manifest.transfer_id
-                ),
-            });
+        // reopening staging — under a different manifest it is
+        // `conflicting_replay`.
+        if self
+            .completed_match(&manifest.transfer_id, &canonical)?
+            .is_some()
+        {
+            return Ok(Vec::new());
         }
 
         let dir = self.staging_dir(&manifest.transfer_id);
@@ -377,7 +409,7 @@ impl TransferStore {
             // the staged bytes re-digest to the declared chunk digest —
             // the receiver's own bytes are the comparison, never the
             // sender's claim alone.
-            let mut file = std::fs::File::open(Self::item_path(&dir, &chunk.item_id))
+            let mut file = std::fs::File::open(item_path(&dir, &chunk.item_id))
                 .map_err(|e| fault(format!("open staged item: {e}")))?;
             file.seek(SeekFrom::Start(chunk.offset))
                 .map_err(|e| fault(format!("seek staged item: {e}")))?;
@@ -399,7 +431,7 @@ impl TransferStore {
         // Partially occupied range: the already-staged prefix must
         // match, and only the tail beyond `staged` appends.
         if chunk.offset < staged {
-            let mut file = std::fs::File::open(Self::item_path(&dir, &chunk.item_id))
+            let mut file = std::fs::File::open(item_path(&dir, &chunk.item_id))
                 .map_err(|e| fault(format!("open staged item: {e}")))?;
             file.seek(SeekFrom::Start(chunk.offset))
                 .map_err(|e| fault(format!("seek staged item: {e}")))?;
@@ -421,7 +453,7 @@ impl TransferStore {
         // the body, then advance the journal — a crash between them
         // resumes at the old offset and the rewritten suffix is an
         // identical replay.
-        let body_path = Self::item_path(&dir, &chunk.item_id);
+        let body_path = item_path(&dir, &chunk.item_id);
         std::fs::create_dir_all(body_path.parent().expect("items dir"))
             .map_err(|e| fault(format!("create items dir: {e}")))?;
         let skip = (staged - chunk.offset) as usize;
@@ -439,7 +471,7 @@ impl TransferStore {
             file.sync_all()
                 .map_err(|e| fault(format!("sync {}: {e}", body_path.display())))?;
         }
-        let journal = Self::journal_path(&dir, &chunk.item_id);
+        let journal = journal_path(&dir, &chunk.item_id);
         let next = staged + (body.len() - skip) as u64;
         std::fs::write(&journal, next.to_be_bytes())
             .map_err(|e| fault(format!("write journal: {e}")))?;
@@ -454,8 +486,18 @@ impl TransferStore {
     /// re-digest to its manifest identity, then the staged directory
     /// publishes under `complete/` by rename — atomic, so a finalized
     /// set is never partially visible. Idempotent: an already-completed
-    /// transfer under the same manifest returns its directory.
+    /// transfer under the same manifest returns its directory, so a
+    /// retried finalize after a lost response is the replay, never an
+    /// `Incomplete` or a fault.
     pub fn finalize(&self, manifest: &ExecutorTransferV1) -> Result<PathBuf, TransferError> {
+        let canonical = manifest
+            .to_canonical_bytes()
+            .map_err(|e| fault(format!("manifest canonicalization: {e}")))?;
+        // The completed set is the durable answer: an identical
+        // manifest replays it, a different one conflicts.
+        if let Some(done) = self.completed_match(&manifest.transfer_id, &canonical)? {
+            return Ok(done);
+        }
         let dir = self.staging_dir(&manifest.transfer_id);
         for item in &manifest.items {
             let staged = Self::next_offset(&dir, &item.item_id, item.bytes)?;
@@ -467,7 +509,7 @@ impl TransferStore {
                     ),
                 });
             }
-            let bytes = std::fs::read(Self::item_path(&dir, &item.item_id))
+            let bytes = std::fs::read(item_path(&dir, &item.item_id))
                 .map_err(|e| fault(format!("read finalized item: {e}")))?;
             if bytes.len() as u64 != item.bytes || item_content_digest(&bytes) != item.digest {
                 return Err(TransferError::DigestMismatch {
@@ -491,14 +533,15 @@ impl TransferStore {
         }
         fsync_dir(&items_dir)?;
         fsync_dir(&dir)?;
-        std::fs::rename(&dir, &target).map_err(|e| {
-            // A racing finalizer may have won the rename; the result
-            // is identical only when the completed set matches.
-            if self.completed(&manifest.transfer_id).is_some() {
-                return fault(format!("finalize raced: {e}"));
+        if let Err(e) = std::fs::rename(&dir, &target) {
+            // A racing finalizer may have won the rename: when the
+            // completed set matches this manifest the race resolved
+            // to the same answer — return it rather than a fault.
+            if let Some(done) = self.completed_match(&manifest.transfer_id, &canonical)? {
+                return Ok(done);
             }
-            fault(format!("rename {}: {e}", dir.display()))
-        })?;
+            return Err(fault(format!("rename {}: {e}", dir.display())));
+        }
         fsync_dir(target.parent().expect("complete root"))?;
         Ok(target)
     }
@@ -579,9 +622,74 @@ mod tests {
         }
         let done = store.finalize(&m).unwrap();
         assert_eq!(
-            std::fs::read(done.join("items/a")).unwrap(),
+            std::fs::read(item_path(&done, "a")).unwrap(),
             body,
             "the finalized item is the exact body"
+        );
+    }
+
+    /// An item_id ending in `.offset` is legal per the wire grammar,
+    /// so on-disk names must be encoded: item `a.offset`'s body must
+    /// never collide with item `a`'s `<id>.offset` journal.
+    #[test]
+    fn an_item_named_like_a_journal_does_not_collide() {
+        let store = TransferStore::new(root("collision"));
+        let body_a = b"aaaa".repeat(30);
+        let body_j = b"journal-looking".repeat(10);
+        let m = manifest(
+            "t-1",
+            60,
+            vec![
+                item("a", "a.bin", &body_a),
+                item("a.offset", "a-offset.bin", &body_j),
+            ],
+        );
+        store.declare(&m).unwrap();
+        // Interleave so `a`'s journal exists while `a.offset` is
+        // mid-flight — the journal must not read as `a.offset`'s
+        // body nor be clobbered by its chunks.
+        let fa = item_chunks(&m, "a", &body_a);
+        let fj = item_chunks(&m, "a.offset", &body_j);
+        store.accept_chunk(&m, &fa[0].0, fa[0].1).unwrap();
+        store.accept_chunk(&m, &fj[0].0, fj[0].1).unwrap();
+        let progress = store.progress(&m).unwrap();
+        assert_eq!(
+            progress,
+            vec![("a".to_string(), 60), ("a.offset".to_string(), 60)]
+        );
+        for (chunk, bytes) in &fa[1..] {
+            store.accept_chunk(&m, chunk, bytes).unwrap();
+        }
+        for (chunk, bytes) in &fj[1..] {
+            store.accept_chunk(&m, chunk, bytes).unwrap();
+        }
+        let done = store.finalize(&m).unwrap();
+        assert_eq!(std::fs::read(item_path(&done, "a")).unwrap(), body_a);
+        assert_eq!(std::fs::read(item_path(&done, "a.offset")).unwrap(), body_j);
+    }
+
+    /// `finalize` is contracted idempotent: after the staging rename
+    /// wins, a retried finalize — the lost-response replay — returns
+    /// the completed directory, never `Incomplete` or a rename fault.
+    /// A different manifest under the same transfer id conflicts.
+    #[test]
+    fn finalize_replays_the_completed_result() {
+        let store = TransferStore::new(root("finalize-idem"));
+        let body = b"payload".repeat(20);
+        let m = manifest("t-1", 40, vec![item("a", "a.bin", &body)]);
+        store.declare(&m).unwrap();
+        for (chunk, bytes) in item_chunks(&m, "a", &body) {
+            store.accept_chunk(&m, &chunk, bytes).unwrap();
+        }
+        let done = store.finalize(&m).unwrap();
+        assert!(!store.staging_dir("t-1").exists());
+        let replayed = store.finalize(&m).unwrap();
+        assert_eq!(replayed, done);
+        let other = manifest("t-1", 40, vec![item("a", "a.bin", b"different!")]);
+        let err = store.finalize(&other).unwrap_err();
+        assert!(
+            matches!(err, TransferError::ConflictingReplay { .. }),
+            "a different manifest under a completed transfer id conflicts, got {err:?}"
         );
     }
 
@@ -657,14 +765,15 @@ mod tests {
         assert!(matches!(err, TransferError::Incomplete { .. }));
         // Whole staged bytes with no journal still read as 0 — a torn
         // file without its journal is never trusted.
-        let staged = dir.join("staging/t-1/items/b");
+        let staging = dir.join("staging/t-1");
+        let staged = item_path(&staging, "b");
         std::fs::write(&staged, b"other").unwrap();
         let err = store.finalize(&m).unwrap_err();
         assert!(matches!(err, TransferError::Incomplete { .. }));
         // Forging the journal to claim completeness hits the whole-body
         // digest re-check instead.
         std::fs::write(&staged, b"WRONG").unwrap();
-        std::fs::write(dir.join("staging/t-1/items/b.offset"), 5u64.to_be_bytes()).unwrap();
+        std::fs::write(journal_path(&staging, "b"), 5u64.to_be_bytes()).unwrap();
         let err = store.finalize(&m).unwrap_err();
         assert!(matches!(err, TransferError::DigestMismatch { .. }));
     }
