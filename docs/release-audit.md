@@ -13,9 +13,15 @@ name, which the name-migration analysis necessarily cites.
 > a map of every remaining leak location; publishing it would hand an
 > adversary the leak index itself. It needs the same disposition as
 > `docs/source-workflow-audit.md` — a disclosure review, or exclusion
-> from the published tree — before the repository goes public (see §6).
-> `AGENTS.md` names it a second owner-controlled exception under the
-> same terms; keeping it tracked still requires that review.
+> from the published tree and its reachable history — before the
+> repository goes public (see §6). `AGENTS.md` names it a second
+> owner-controlled exception under the same terms — but that clause is
+> added by the same pull request that adds this file, so it is a
+> proposed disposition pending owner ratification, not a prior owner
+> decision. Committing the file already places the leak index in
+> reachable history — under route A that history must be rewritten, and
+> under routes B and C the file stays out of the published tree;
+> keeping it tracked still requires the review above.
 
 The audited publication route is the current one: the existing private
 GitHub repository made public in place, exposing the tracked tree, the
@@ -103,6 +109,13 @@ exception does not hold in practice:
   `docs/evidence/u8.1-live-stage-c.md:41` — discloses the worker repo's
   name through a local config path even where the repo itself is not
   named.
+- **Per-run owner state directories**: `~/s1-*` run dirs recorded in
+  `docs/evidence/u8.1-live-stage-c.md:62,71,112,201,211`,
+  `docs/evidence/u8.2.md:48`, `docs/evidence/u8.3.md:59`, and
+  `docs/s1/live-runbook.md:159` — owner-specific operational context;
+  the extracted dir names are all `s1-*` scenario names embedding no
+  source names (see Appendix), and they round out the home-relative
+  `~/` owner-path surface at HEAD.
 - **Identifying runtime configuration**: the dedicated reviewer GitHub
   App's slug, app id, installation id, and bot user id
   (`docs/evidence/u8.1-live-stage-c.md:37-42`,
@@ -217,7 +230,7 @@ A clean HEAD certifies nothing here. Divergence table:
 | Four source repo names | sanctioned audit file (canonical); worker-repo name also leaks via `~/.config/<worker-repo>/` paths and inside the smoke-repo name | pre-scrub blobs of 5+ docs; 40+ commits | milestone #2; ~50 issues/PRs |
 | Smoke repo name | 29 files / 161 hits | 311 occurrences | 5 issues, review comments |
 | Former repo name (self-rename — not a source repo) | `name-migration.md` | 33 occurrences | 28 issues (comments), 4 PRs |
-| Owner-local paths | none at HEAD | 18 `/Users/<owner>` occurrences | `~/.config` and an ops-state dir in issues/PRs |
+| Owner-local paths | no `/Users/<owner>` absolute paths outside the sanctioned audit file (tree scan: only a test literal, see Appendix); `~/`-relative owner paths do occur — the worker-repo config path (counted above) and `~/s1-*` run dirs in `docs/evidence/` and `docs/s1/` | 18 `/Users/<owner>` occurrences | `~/.config` and an ops-state dir in issues/PRs |
 | Ops-adjacent repo names | `extraction-coverage.json` only | +1 file | none found |
 | Author identities | n/a | **all 1,017 commits** | n/a |
 | Real secrets | none | none | none found |
@@ -280,6 +293,12 @@ flags.
 - Tree scans: `rg -l -i '<name patterns>' --hidden -g '!.git'` over the
   worktree; counts via `rg -o | wc -l` (e.g. smoke repo: 161 hits / 29
   files; `s1-reviewer`: 57).
+- Owner-path scans: `rg -n '/Users/'` outside the sanctioned audit
+  files hits only the test literal in
+  `crates/workloop-exec/src/containment.rs:1432` (a pattern string, not
+  an owner path); `rg -o '~/s1-[A-Za-z0-9._-]+'` extracts only `s1-*`
+  scenario names (`s1-stagec-*`, `s1-u82`, `s1-u83`, `s1-success-*`),
+  embedding no source names.
 - History scans: `git log origin/main -S <term> --oneline`,
   `git log -p origin/main | rg -o 'shimpeiws/[A-Za-z0-9._-]+' | sort |
   uniq -c`, `git log --format='%an <%ae>' | sort | uniq -c`.
