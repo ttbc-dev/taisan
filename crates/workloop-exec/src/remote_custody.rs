@@ -18,7 +18,7 @@
 //! from the request identity), bounded (a journaled attempt count),
 //! and retryable (a crash mid-cleanup resumes the journal).
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use workloop_core::executor::{
@@ -407,6 +407,26 @@ fn write_journal(root: &Path, journal: &CleanupJournal) -> Result<(), CustodyErr
     Ok(())
 }
 
+/// The lexical normalization the cleanup scope check runs before
+/// trusting a journaled path: `.` components drop and `..` pops a
+/// component — a `..` that would climb past the root (or a relative
+/// path with more `..` than depth) is refused as `None`.
+fn normalize_scoped(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            component => out.push(component.as_os_str()),
+        }
+    }
+    Some(out)
+}
+
 /// What one cleanup pass resolved.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CleanupOutcome {
@@ -469,27 +489,39 @@ pub fn cleanup_after_ack(
     journal.attempts += 1;
     // Every pending path must resolve inside the custody or workspace
     // root — the scope check is the only thing standing between a
-    // recorded list and arbitrary removal.
+    // recorded list and arbitrary removal. `Path::starts_with` is a
+    // raw component prefix, so normalize first: `root/../outside`
+    // and the root itself must never reach remove_dir_all.
     let roots = [layout.custody_root.clone(), layout.workspace_root.clone()];
     let mut still_pending = Vec::new();
     for path in &journal.pending {
-        let under_root = roots.iter().any(|root| path.starts_with(root));
-        if !under_root || path.as_os_str().is_empty() {
+        // Remove the normalized path — the exact target the scope
+        // check validated — so a `..` riding behind a symlinked
+        // intermediate cannot redirect removal outside the roots.
+        let Some(normalized) = normalize_scoped(path) else {
+            return Err(CustodyError::Conflict {
+                detail: format!("cleanup path {:?} is outside the managed roots", path),
+            });
+        };
+        let under_root = roots
+            .iter()
+            .any(|root| normalized != *root && normalized.starts_with(root));
+        if !under_root {
             return Err(CustodyError::Conflict {
                 detail: format!("cleanup path {:?} is outside the managed roots", path),
             });
         }
-        match std::fs::symlink_metadata(path) {
+        match std::fs::symlink_metadata(&normalized) {
             Ok(_) => {
-                if std::fs::remove_dir_all(path).is_err() {
-                    let _ = std::fs::remove_file(path);
+                if std::fs::remove_dir_all(&normalized).is_err() {
+                    let _ = std::fs::remove_file(&normalized);
                 }
-                if path.exists() {
-                    still_pending.push(path.clone());
+                if normalized.exists() {
+                    still_pending.push(normalized);
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => still_pending.push(path.clone()),
+            Err(_) => still_pending.push(normalized),
         }
     }
     journal.pending = still_pending;

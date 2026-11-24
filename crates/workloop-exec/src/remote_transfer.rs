@@ -20,8 +20,68 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use workloop_core::executor::{
-    ExecutorChunkV1, ExecutorTransferV1, item_content_digest, transfer_id_is_valid,
+    ExecutorChunkV1, ExecutorLimits, ExecutorTransferV1, item_content_digest, transfer_id_is_valid,
 };
+
+/// The immutable per-request bound the receiver enforces before
+/// accepting any chunk (contract §6): the direction's byte ceiling
+/// and the item-count bound from the bound request's
+/// [`ExecutorLimits`] — never the sender's declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransferBound {
+    /// `total_bytes` may not exceed this — the declared extent is the
+    /// most the session can ever stage.
+    pub max_total_bytes: u64,
+    /// `item_count` may not exceed this.
+    pub max_item_count: u64,
+}
+
+impl TransferBound {
+    /// The input direction's bound: what the receiver may stage for a
+    /// `prepare` transfer.
+    pub fn input(limits: &ExecutorLimits) -> Self {
+        Self {
+            max_total_bytes: limits.max_input_bytes,
+            max_item_count: limits.max_item_count,
+        }
+    }
+
+    /// The output direction's bound: what the receiver may stage for
+    /// a `collect` transfer.
+    pub fn output(limits: &ExecutorLimits) -> Self {
+        Self {
+            max_total_bytes: limits.max_output_bytes,
+            max_item_count: limits.max_item_count,
+        }
+    }
+}
+
+/// A declared manifest's extent must fit the bound before any body
+/// byte is staged — the receiver-side `limit_exceeded` the contract
+/// requires before each accepted chunk.
+fn enforce_bound(
+    manifest: &ExecutorTransferV1,
+    bound: &TransferBound,
+) -> Result<(), TransferError> {
+    if manifest.total_bytes > bound.max_total_bytes {
+        return Err(TransferError::LimitExceeded {
+            detail: format!(
+                "transfer total {} exceeds the bound {}",
+                manifest.total_bytes, bound.max_total_bytes
+            ),
+        });
+    }
+    if manifest.items.len() as u64 > bound.max_item_count {
+        return Err(TransferError::LimitExceeded {
+            detail: format!(
+                "{} items exceed the bound {}",
+                manifest.items.len(),
+                bound.max_item_count
+            ),
+        });
+    }
+    Ok(())
+}
 
 /// Outcome of one accepted chunk frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,11 +316,14 @@ impl TransferStore {
     /// writes the canonical manifest; a replayed declare with
     /// byte-identical canonical bytes is the contract's resume — a
     /// different manifest under a live transfer id conflicts.
-    /// Returns the per-item resume positions the `pending` receipt
-    /// carries.
+    /// `bound` is the bound request's immutable limit for this
+    /// direction: an over-bound manifest is refused before it lands,
+    /// so no chunk can ever stage bytes for it. Returns the per-item
+    /// resume positions the `pending` receipt carries.
     pub fn declare(
         &self,
         manifest: &ExecutorTransferV1,
+        bound: &TransferBound,
     ) -> Result<Vec<(String, u64)>, TransferError> {
         if !transfer_id_is_valid(&manifest.transfer_id) {
             return Err(TransferError::Foreign {
@@ -281,6 +344,7 @@ impl TransferStore {
         {
             return Ok(Vec::new());
         }
+        enforce_bound(manifest, bound)?;
 
         let dir = self.staging_dir(&manifest.transfer_id);
         match self.staged_manifest(&manifest.transfer_id)? {
@@ -331,15 +395,20 @@ impl TransferStore {
         Ok(offsets)
     }
 
-    /// Accept one chunk frame. The header must match the declared
+    /// Accept one chunk frame. `bound` is the bound request's
+    /// immutable limit for this direction — enforced before any body
+    /// is accepted (contract §6), so an over-bound manifest can never
+    /// stage a single byte. The header must match the declared
     /// session and item, the body must satisfy `bytes` +
     /// `chunk_digest`, and the write lands at the journaled offset —
     /// an identical replay at an occupied offset is idempotent, a
     /// different digest there is `conflicting_replay`, a gap is
-    /// `pending`.
+    /// `pending`. A chunk for an already-finalized session replays
+    /// against the completed set: the final state is immutable.
     pub fn accept_chunk(
         &self,
         manifest: &ExecutorTransferV1,
+        bound: &TransferBound,
         chunk: &ExecutorChunkV1,
         body: &[u8],
     ) -> Result<ChunkOutcome, TransferError> {
@@ -395,9 +464,24 @@ impl TransferStore {
                 detail: "chunk body fails its declared digest".into(),
             });
         }
-
-        let dir = self.staging_dir(&manifest.transfer_id);
-        let staged = Self::next_offset(&dir, &chunk.item_id, item.bytes)?;
+        // A finalized session is the immutable final answer: under
+        // the same manifest a replayed chunk re-verifies against the
+        // completed bytes and reports the item as whole — the staging
+        // directory is never reopened. Under a different manifest the
+        // replay is `conflicting_replay` — the same answer `declare`
+        // gives, so the bound check runs only for a live session.
+        let canonical = manifest
+            .to_canonical_bytes()
+            .map_err(|e| fault(format!("manifest canonicalization: {e}")))?;
+        let (dir, staged) = match self.completed_match(&manifest.transfer_id, &canonical)? {
+            Some(done) => (done, item.bytes),
+            None => {
+                enforce_bound(manifest, bound)?;
+                let dir = self.staging_dir(&manifest.transfer_id);
+                let staged = Self::next_offset(&dir, &chunk.item_id, item.bytes)?;
+                (dir, staged)
+            }
+        };
         if chunk.offset > staged {
             return Err(TransferError::OutOfOrder {
                 next_offset: staged,
@@ -610,6 +694,13 @@ mod tests {
     use super::*;
     use workloop_core::executor::TransferItemV1;
 
+    /// The bound these unit tests stage under — far above any body
+    /// they declare.
+    const BOUND: TransferBound = TransferBound {
+        max_total_bytes: 64 * 1024 * 1024,
+        max_item_count: 64,
+    };
+
     fn root(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "remote-transfer-{tag}-{}-{}",
@@ -645,9 +736,9 @@ mod tests {
         let store = TransferStore::new(root("full"));
         let body = b"hello world".repeat(100);
         let m = manifest("t-1", 64, vec![item("a", "a.bin", &body)]);
-        store.declare(&m).unwrap();
+        store.declare(&m, &BOUND).unwrap();
         for (chunk, bytes) in item_chunks(&m, "a", &body) {
-            store.accept_chunk(&m, &chunk, bytes).unwrap();
+            store.accept_chunk(&m, &BOUND, &chunk, bytes).unwrap();
         }
         let done = store.finalize(&m).unwrap();
         assert_eq!(
@@ -673,24 +764,24 @@ mod tests {
                 item("a.offset", "a-offset.bin", &body_j),
             ],
         );
-        store.declare(&m).unwrap();
+        store.declare(&m, &BOUND).unwrap();
         // Interleave so `a`'s journal exists while `a.offset` is
         // mid-flight — the journal must not read as `a.offset`'s
         // body nor be clobbered by its chunks.
         let fa = item_chunks(&m, "a", &body_a);
         let fj = item_chunks(&m, "a.offset", &body_j);
-        store.accept_chunk(&m, &fa[0].0, fa[0].1).unwrap();
-        store.accept_chunk(&m, &fj[0].0, fj[0].1).unwrap();
+        store.accept_chunk(&m, &BOUND, &fa[0].0, fa[0].1).unwrap();
+        store.accept_chunk(&m, &BOUND, &fj[0].0, fj[0].1).unwrap();
         let progress = store.progress(&m).unwrap();
         assert_eq!(
             progress,
             vec![("a".to_string(), 60), ("a.offset".to_string(), 60)]
         );
         for (chunk, bytes) in &fa[1..] {
-            store.accept_chunk(&m, chunk, bytes).unwrap();
+            store.accept_chunk(&m, &BOUND, chunk, bytes).unwrap();
         }
         for (chunk, bytes) in &fj[1..] {
-            store.accept_chunk(&m, chunk, bytes).unwrap();
+            store.accept_chunk(&m, &BOUND, chunk, bytes).unwrap();
         }
         let done = store.finalize(&m).unwrap();
         assert_eq!(std::fs::read(item_path(&done, "a")).unwrap(), body_a);
@@ -706,9 +797,9 @@ mod tests {
         let store = TransferStore::new(root("finalize-idem"));
         let body = b"payload".repeat(20);
         let m = manifest("t-1", 40, vec![item("a", "a.bin", &body)]);
-        store.declare(&m).unwrap();
+        store.declare(&m, &BOUND).unwrap();
         for (chunk, bytes) in item_chunks(&m, "a", &body) {
-            store.accept_chunk(&m, &chunk, bytes).unwrap();
+            store.accept_chunk(&m, &BOUND, &chunk, bytes).unwrap();
         }
         let done = store.finalize(&m).unwrap();
         assert!(!store.staging_dir("t-1").exists());
@@ -727,26 +818,30 @@ mod tests {
         let store = TransferStore::new(root("resume"));
         let body = b"abcdef".repeat(50);
         let m = manifest("t-1", 60, vec![item("a", "a.bin", &body)]);
-        store.declare(&m).unwrap();
+        store.declare(&m, &BOUND).unwrap();
         let frames = item_chunks(&m, "a", &body);
         // Two chunks in, then an interruption — resume reports the
         // journaled offset and accepts only from there.
-        store.accept_chunk(&m, &frames[0].0, frames[0].1).unwrap();
-        store.accept_chunk(&m, &frames[1].0, frames[1].1).unwrap();
+        store
+            .accept_chunk(&m, &BOUND, &frames[0].0, frames[0].1)
+            .unwrap();
+        store
+            .accept_chunk(&m, &BOUND, &frames[1].0, frames[1].1)
+            .unwrap();
         let progress = store.progress(&m).unwrap();
         assert_eq!(progress, vec![("a".to_string(), 120)]);
         let gap = store
-            .accept_chunk(&m, &frames[4].0, frames[4].1)
+            .accept_chunk(&m, &BOUND, &frames[4].0, frames[4].1)
             .unwrap_err();
         assert!(
             matches!(gap, TransferError::OutOfOrder { next_offset: 120 }),
             "a gap reports the resume offset, got {gap:?}"
         );
         // Re-declaring resumes the same session and reports progress.
-        let resumed = store.declare(&m).unwrap();
+        let resumed = store.declare(&m, &BOUND).unwrap();
         assert_eq!(resumed, vec![("a".to_string(), 120)]);
         for (chunk, bytes) in &frames[2..] {
-            store.accept_chunk(&m, chunk, bytes).unwrap();
+            store.accept_chunk(&m, &BOUND, chunk, bytes).unwrap();
         }
         store.finalize(&m).unwrap();
     }
@@ -756,11 +851,15 @@ mod tests {
         let store = TransferStore::new(root("replay"));
         let body = b"xy".repeat(40);
         let m = manifest("t-1", 40, vec![item("a", "a.bin", &body)]);
-        store.declare(&m).unwrap();
+        store.declare(&m, &BOUND).unwrap();
         let frames = item_chunks(&m, "a", &body);
-        store.accept_chunk(&m, &frames[0].0, frames[0].1).unwrap();
+        store
+            .accept_chunk(&m, &BOUND, &frames[0].0, frames[0].1)
+            .unwrap();
         // Identical replay: nothing moves.
-        let replayed = store.accept_chunk(&m, &frames[0].0, frames[0].1).unwrap();
+        let replayed = store
+            .accept_chunk(&m, &BOUND, &frames[0].0, frames[0].1)
+            .unwrap();
         assert!(matches!(
             replayed,
             ChunkOutcome::Replayed { next_offset: 40 }
@@ -769,7 +868,7 @@ mod tests {
         let mut forged = frames[0].0.clone();
         let bad = vec![b'z'; 40];
         forged.chunk_digest = workloop_core::executor::chunk_body_digest(&bad);
-        let err = store.accept_chunk(&m, &forged, &bad).unwrap_err();
+        let err = store.accept_chunk(&m, &BOUND, &forged, &bad).unwrap_err();
         assert!(
             matches!(err, TransferError::ConflictingReplay { .. }),
             "a different digest at an occupied offset is conflicting_replay, got {err:?}"
@@ -786,9 +885,9 @@ mod tests {
             40,
             vec![item("a", "a.bin", &body), item("b", "b.bin", b"other")],
         );
-        store.declare(&m).unwrap();
+        store.declare(&m, &BOUND).unwrap();
         for (chunk, bytes) in item_chunks(&m, "a", &body) {
-            store.accept_chunk(&m, &chunk, bytes).unwrap();
+            store.accept_chunk(&m, &BOUND, &chunk, bytes).unwrap();
         }
         let err = store.finalize(&m).unwrap_err();
         assert!(matches!(err, TransferError::Incomplete { .. }));
@@ -822,13 +921,13 @@ mod tests {
                 item("full", "full.bin", b"body"),
             ],
         );
-        store.declare(&m).unwrap();
+        store.declare(&m, &BOUND).unwrap();
         assert!(
             item_chunks(&m, "empty", b"").is_empty(),
             "an empty item produces no frames"
         );
         for (chunk, bytes) in item_chunks(&m, "full", b"body") {
-            store.accept_chunk(&m, &chunk, bytes).unwrap();
+            store.accept_chunk(&m, &BOUND, &chunk, bytes).unwrap();
         }
         let done = store.finalize(&m).unwrap();
         assert_eq!(
@@ -844,9 +943,9 @@ mod tests {
         let store = TransferStore::new(root("redeclare"));
         let body = b"q".repeat(10);
         let m1 = manifest("t-1", 40, vec![item("a", "a.bin", &body)]);
-        store.declare(&m1).unwrap();
+        store.declare(&m1, &BOUND).unwrap();
         let m2 = manifest("t-1", 40, vec![item("a", "a.bin", b"different!")]);
-        let err = store.declare(&m2).unwrap_err();
+        let err = store.declare(&m2, &BOUND).unwrap_err();
         assert!(matches!(err, TransferError::ConflictingReplay { .. }));
     }
 
@@ -855,15 +954,135 @@ mod tests {
         let store = TransferStore::new(root("foreign"));
         let body = b"n".repeat(20);
         let m = manifest("t-1", 40, vec![item("a", "a.bin", &body)]);
-        store.declare(&m).unwrap();
+        store.declare(&m, &BOUND).unwrap();
         let frames = item_chunks(&m, "a", &body);
         let mut foreign = frames[0].0.clone();
         foreign.transfer_id = "t-other".into();
-        let err = store.accept_chunk(&m, &foreign, frames[0].1).unwrap_err();
+        let err = store
+            .accept_chunk(&m, &BOUND, &foreign, frames[0].1)
+            .unwrap_err();
         assert!(matches!(err, TransferError::Foreign { .. }));
         let mut unknown = frames[0].0.clone();
         unknown.item_id = "nope".into();
-        let err = store.accept_chunk(&m, &unknown, frames[0].1).unwrap_err();
+        let err = store
+            .accept_chunk(&m, &BOUND, &unknown, frames[0].1)
+            .unwrap_err();
         assert!(matches!(err, TransferError::UnknownItem { .. }));
+    }
+
+    /// A chunk that arrives after the staging rename — the
+    /// lost-response replay the sender retries — re-verifies against
+    /// the finalized bytes and reports the item as whole. It never
+    /// recreates `staging/`, and a different body or a different
+    /// manifest under the same transfer id conflicts.
+    #[test]
+    fn a_chunk_replayed_after_finalize_is_idempotent() {
+        let store = TransferStore::new(root("post-finalize"));
+        let body = b"tail".repeat(30);
+        let m = manifest("t-1", 40, vec![item("a", "a.bin", &body)]);
+        store.declare(&m, &BOUND).unwrap();
+        let frames = item_chunks(&m, "a", &body);
+        for (chunk, bytes) in &frames {
+            store.accept_chunk(&m, &BOUND, chunk, bytes).unwrap();
+        }
+        store.finalize(&m).unwrap();
+
+        // The same first chunk replays as Replayed with the item's
+        // full extent — the completed set is the answer, and no
+        // staging directory reappears.
+        let replayed = store
+            .accept_chunk(&m, &BOUND, &frames[0].0, frames[0].1)
+            .unwrap();
+        assert_eq!(
+            replayed,
+            ChunkOutcome::Replayed {
+                next_offset: body.len() as u64
+            }
+        );
+        assert!(
+            !store.staging_dir("t-1").exists(),
+            "a post-finalize chunk never reopens staging"
+        );
+
+        // A different body at the occupied offset still conflicts —
+        // the finalized bytes are the comparison.
+        let mut forged = frames[0].0.clone();
+        let bad = vec![b'z'; frames[0].1.len()];
+        forged.chunk_digest = workloop_core::executor::chunk_body_digest(&bad);
+        let err = store.accept_chunk(&m, &BOUND, &forged, &bad).unwrap_err();
+        assert!(
+            matches!(err, TransferError::ConflictingReplay { .. }),
+            "a different digest at a finalized offset conflicts, got {err:?}"
+        );
+
+        // A chunk under a different manifest for the same transfer id
+        // conflicts the same way a re-declare does — even when the
+        // foreign manifest also exceeds the session's bound, the
+        // completed replay verdict wins, matching `declare`'s order.
+        let other = manifest("t-1", 40, vec![item("a", "a.bin", b"different!")]);
+        let other_frames = item_chunks(&other, "a", b"different!");
+        let err = store
+            .accept_chunk(&other, &BOUND, &other_frames[0].0, other_frames[0].1)
+            .unwrap_err();
+        assert!(matches!(err, TransferError::ConflictingReplay { .. }));
+        let tight = TransferBound {
+            max_total_bytes: 1,
+            max_item_count: 1,
+        };
+        let err = store
+            .accept_chunk(&other, &tight, &other_frames[0].0, other_frames[0].1)
+            .unwrap_err();
+        assert!(
+            matches!(err, TransferError::ConflictingReplay { .. }),
+            "a completed session answers conflicting_replay before the bound, got {err:?}"
+        );
+    }
+
+    /// The receiver's immutable bound gates staging: a manifest whose
+    /// declared extent exceeds it is refused at `declare` — and at
+    /// `accept_chunk` for a session that never declared — so no body
+    /// byte is ever staged for an over-limit transfer.
+    #[test]
+    fn an_over_limit_manifest_is_refused_before_staging() {
+        let store = TransferStore::new(root("bound"));
+        let body = b"x".repeat(100);
+        let tight = TransferBound {
+            max_total_bytes: 50,
+            max_item_count: 1,
+        };
+        let m = manifest("t-1", 40, vec![item("a", "a.bin", &body)]);
+        let err = store.declare(&m, &tight).unwrap_err();
+        assert!(
+            matches!(err, TransferError::LimitExceeded { .. }),
+            "an over-bound declare refuses, got {err:?}"
+        );
+        let frames = item_chunks(&m, "a", &body);
+        let err = store
+            .accept_chunk(&m, &tight, &frames[0].0, frames[0].1)
+            .unwrap_err();
+        assert!(
+            matches!(err, TransferError::LimitExceeded { .. }),
+            "an over-bound chunk refuses before any write, got {err:?}"
+        );
+        assert!(
+            !store.staging_dir("t-1").exists(),
+            "no staging ever exists for an over-limit transfer"
+        );
+
+        let too_many = manifest(
+            "t-2",
+            40,
+            vec![item("a", "a.bin", b"1"), item("b", "b.bin", b"2")],
+        );
+        let err = store.declare(&too_many, &tight).unwrap_err();
+        assert!(matches!(err, TransferError::LimitExceeded { .. }));
+
+        // Within the bound the same flow still completes.
+        let ok = manifest("t-3", 40, vec![item("a", "a.bin", &body)]);
+        store.declare(&ok, &BOUND).unwrap();
+        for (chunk, bytes) in item_chunks(&ok, "a", &body) {
+            store.accept_chunk(&ok, &BOUND, &chunk, bytes).unwrap();
+        }
+        store.finalize(&ok).unwrap();
     }
 }

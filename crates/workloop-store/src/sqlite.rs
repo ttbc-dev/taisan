@@ -358,9 +358,10 @@ impl SqliteStore {
             // except the v5, v8, and v9 additions (v4 adds a column,
             // not a table), a v5–v7 file everything except the v8 and
             // v9 additions (v6 and v7 each add a column, not a table),
-            // and a v8 file everything except the v9 addition, and a
-            // v9–v14 file everything except the additions landed
-            // after it — v15's collection table among them. A
+            // and a v8 file everything except the v9 addition, a
+            // v9–v13 file everything except the v13 and v14
+            // additions, and a v14 file everything except v15's
+            // collection table. A
             // foreign or
             // truncated stamped file fails this check untouched, and
             // the accepted difference is a previous release's store: it
@@ -438,10 +439,18 @@ impl SqliteStore {
                             && !V14_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
-            } else {
+            } else if version < 14 {
                 EXPECTED_TABLES
                     .iter()
                     .filter(|t| !V13_ADDED_TABLES.contains(t) && !V14_ADDED_TABLES.contains(t))
+                    .all(|t| present.contains(*t))
+            } else {
+                // A v14 file holds every table the v13 → v14
+                // migration installed; only the v15 addition may be
+                // absent.
+                EXPECTED_TABLES
+                    .iter()
+                    .filter(|t| !V14_ADDED_TABLES.contains(t))
                     .all(|t| present.contains(*t))
             };
             if !required_complete {

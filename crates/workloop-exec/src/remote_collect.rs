@@ -83,11 +83,25 @@ pub struct RetainedOutput {
 
 /// Why collection could not commit. `Invalid` is a deterministic
 /// validation outcome the durable row records as `invalid`;
-/// `Conflict` is the store's identity/CAS refusal; `Fault` is
-/// infrastructure — the pass retries.
+/// `Conflict` is the store's identity/CAS refusal; `Foreign` is a
+/// deterministic identity mismatch — the contract's
+/// `request_identity_mismatch`/`collection_invalid` refusal, terminal
+/// and unrecorded; `Fault` is infrastructure — the pass retries.
 #[derive(Debug)]
 pub enum CollectError {
     Store(StoreError),
+    /// The collection names a different collection or request than
+    /// the operation's — a terminal refusal, never retried and never
+    /// persisted (the row's identity belongs to the honest
+    /// collection that may still land).
+    Foreign {
+        /// The contract refusal token: `collection_invalid` when the
+        /// manifest names another collection,
+        /// `request_identity_mismatch` when the durable request body
+        /// names another request.
+        token: &'static str,
+        detail: String,
+    },
     Fault(String),
 }
 
@@ -95,6 +109,7 @@ impl std::fmt::Display for CollectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Store(e) => write!(f, "{e}"),
+            Self::Foreign { token, detail } => write!(f, "{token}: {detail}"),
             Self::Fault(d) => write!(f, "remote collect fault: {d}"),
         }
     }
@@ -313,11 +328,19 @@ pub fn collect_remote(
     stop_proof: &str,
     now_unix_seconds: i64,
 ) -> Result<CollectedRemote, CollectError> {
+    // A manifest naming another collection — or a durable request
+    // body naming another request — is a deterministic identity
+    // mismatch: the contract's terminal `request_identity_mismatch` /
+    // `collection_invalid` refusal, never a retryable fault and never
+    // recorded (a later honest collection must still land).
     if manifest.collection_id != collection_id {
-        return Err(fault(format!(
-            "collection manifest names {:?}, expected {collection_id:?}",
-            manifest.collection_id
-        )));
+        return Err(CollectError::Foreign {
+            token: "collection_invalid",
+            detail: format!(
+                "collection manifest names {:?}, expected {collection_id:?}",
+                manifest.collection_id
+            ),
+        });
     }
     let body = store
         .transact(|tx| tx.worker_request_body(request_id))?
@@ -328,7 +351,10 @@ pub fn collect_remote(
     let request = WorkerRequestV2::parse(&body.canonical_body)
         .map_err(|e| fault(format!("durable request body does not parse: {e}")))?;
     if request.request_id != request_id {
-        return Err(fault("collection names a different request"));
+        return Err(CollectError::Foreign {
+            token: "request_identity_mismatch",
+            detail: "collection names a different request".into(),
+        });
     }
     let invocation = store
         .transact(|tx| tx.invocation_for_request(request_id))?

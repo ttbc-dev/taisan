@@ -30,7 +30,9 @@ use workloop_exec::remote_collect::{self, RemoteCollectLayout};
 use workloop_exec::remote_custody::{self, AckTombstone, CustodyLayout};
 use workloop_exec::remote_export::{self, ExportedItem, ExportedTransfer};
 use workloop_exec::remote_prepare::{self, PrepareError, RemotePrepareLayout};
-use workloop_exec::remote_transfer::{self, TransferError, TransferStore, item_chunks};
+use workloop_exec::remote_transfer::{
+    self, TransferBound, TransferError, TransferStore, item_chunks,
+};
 use workloop_exec::workspace::RepositorySource;
 use workloop_store::sqlite::SqliteStore;
 
@@ -147,6 +149,16 @@ fn limits() -> ExecutorLimits {
         max_item_count: 32,
         operation_timeout_ms: 3_600_000,
     }
+}
+
+/// The receiver-side bound each direction stages under — the same
+/// immutable `ExecutorLimits` the bound request carries.
+fn in_bound() -> TransferBound {
+    TransferBound::input(&limits())
+}
+
+fn out_bound() -> TransferBound {
+    TransferBound::output(&limits())
 }
 
 /// The durable identities of one seeded remote request: work +
@@ -405,11 +417,11 @@ fn rig(tag: &str) -> (Rig, String) {
 /// Move every item of a declared transfer through the wire — chunked
 /// frames through the receiver's staging.
 fn ship(sender: &ExportedTransfer, receiver: &TransferStore) -> PathBuf {
-    receiver.declare(&sender.manifest).unwrap();
+    receiver.declare(&sender.manifest, &in_bound()).unwrap();
     for item in &sender.items {
         for (chunk, body) in item_chunks(&sender.manifest, &item.item_id, &item.body) {
             receiver
-                .accept_chunk(&sender.manifest, &chunk, body)
+                .accept_chunk(&sender.manifest, &in_bound(), &chunk, body)
                 .unwrap();
         }
     }
@@ -421,11 +433,11 @@ fn ship_collection(
     assembled: &remote_custody::AssembledCollection,
     receiver: &TransferStore,
 ) -> PathBuf {
-    receiver.declare(&assembled.manifest).unwrap();
+    receiver.declare(&assembled.manifest, &out_bound()).unwrap();
     for item in &assembled.items {
         for (chunk, body) in item_chunks(&assembled.manifest, &item.item_id, &item.body) {
             receiver
-                .accept_chunk(&assembled.manifest, &chunk, body)
+                .accept_chunk(&assembled.manifest, &out_bound(), &chunk, body)
                 .unwrap();
         }
     }
@@ -841,7 +853,7 @@ fn interruption_resume_and_conflicting_replay() {
     )
     .unwrap();
     let receiver = &rig.exec_transfers;
-    receiver.declare(&exported.manifest).unwrap();
+    receiver.declare(&exported.manifest, &in_bound()).unwrap();
 
     // Send only part of the bundle, then "crash" — re-declare and
     // resume; the pending set reports the journaled offsets.
@@ -853,7 +865,7 @@ fn interruption_resume_and_conflicting_replay() {
     let frames = item_chunks(&exported.manifest, "source-bundle", &bundle_item.body);
     assert!(frames.len() > 2, "the bundle spans several chunks");
     receiver
-        .accept_chunk(&exported.manifest, &frames[0].0, frames[0].1)
+        .accept_chunk(&exported.manifest, &in_bound(), &frames[0].0, frames[0].1)
         .unwrap();
     let progress = receiver.progress(&exported.manifest).unwrap();
     let bundle_offset = progress
@@ -866,13 +878,13 @@ fn interruption_resume_and_conflicting_replay() {
     // A gap is reported with next_offset — the pending receipt's
     // payload.
     let err = receiver
-        .accept_chunk(&exported.manifest, &frames[2].0, frames[2].1)
+        .accept_chunk(&exported.manifest, &in_bound(), &frames[2].0, frames[2].1)
         .unwrap_err();
     assert!(matches!(err, TransferError::OutOfOrder { next_offset } if next_offset == CHUNK));
 
     // Identical replay of the occupied chunk is idempotent.
     let replayed = receiver
-        .accept_chunk(&exported.manifest, &frames[0].0, frames[0].1)
+        .accept_chunk(&exported.manifest, &in_bound(), &frames[0].0, frames[0].1)
         .unwrap();
     assert!(matches!(
         replayed,
@@ -884,15 +896,15 @@ fn interruption_resume_and_conflicting_replay() {
     let bad = vec![b'x'; frames[0].1.len()];
     forged.chunk_digest = workloop_core::executor::chunk_body_digest(&bad);
     let err = receiver
-        .accept_chunk(&exported.manifest, &forged, &bad)
+        .accept_chunk(&exported.manifest, &in_bound(), &forged, &bad)
         .unwrap_err();
     assert!(matches!(err, TransferError::ConflictingReplay { .. }));
 
     // Resume completes and finalizes; prepare still validates fully.
-    receiver.declare(&exported.manifest).unwrap();
+    receiver.declare(&exported.manifest, &in_bound()).unwrap();
     for item in &exported.items {
         for (chunk, body) in item_chunks(&exported.manifest, &item.item_id, &item.body) {
-            let _ = receiver.accept_chunk(&exported.manifest, &chunk, body);
+            let _ = receiver.accept_chunk(&exported.manifest, &in_bound(), &chunk, body);
         }
     }
     let dir = receiver.finalize(&exported.manifest).unwrap();
@@ -934,14 +946,14 @@ fn missing_and_corrupt_items_are_refused() {
     )
     .unwrap();
     let receiver = &rig.exec_transfers;
-    receiver.declare(&exported.manifest).unwrap();
+    receiver.declare(&exported.manifest, &in_bound()).unwrap();
 
     // Ship everything except the request item — finalize refuses
     // incomplete.
     for item in exported.items.iter().filter(|i| i.item_id != "request") {
         for (chunk, body) in item_chunks(&exported.manifest, &item.item_id, &item.body) {
             receiver
-                .accept_chunk(&exported.manifest, &chunk, body)
+                .accept_chunk(&exported.manifest, &in_bound(), &chunk, body)
                 .unwrap();
         }
     }
@@ -957,7 +969,7 @@ fn missing_and_corrupt_items_are_refused() {
         .unwrap();
     for (chunk, body) in item_chunks(&exported.manifest, "request", &good.body) {
         receiver
-            .accept_chunk(&exported.manifest, &chunk, body)
+            .accept_chunk(&exported.manifest, &in_bound(), &chunk, body)
             .unwrap();
     }
     let dir = receiver.finalize(&exported.manifest).unwrap();
@@ -3102,10 +3114,10 @@ fn a_stale_journal_temp_does_not_wedge_or_publish() {
         }],
     )
     .unwrap();
-    receiver.declare(&manifest).unwrap();
+    receiver.declare(&manifest, &in_bound()).unwrap();
     let frames = item_chunks(&manifest, "item-1", &body);
     receiver
-        .accept_chunk(&manifest, &frames[0].0, frames[0].1)
+        .accept_chunk(&manifest, &in_bound(), &frames[0].0, frames[0].1)
         .unwrap();
 
     // The crash window: the new journal's temp was written but the
@@ -3126,7 +3138,9 @@ fn a_stale_journal_temp_does_not_wedge_or_publish() {
     let progress = receiver.progress(&manifest).unwrap();
     assert_eq!(progress[0].1, CHUNK);
     for (chunk, chunk_body) in &frames[1..] {
-        receiver.accept_chunk(&manifest, chunk, chunk_body).unwrap();
+        receiver
+            .accept_chunk(&manifest, &in_bound(), chunk, chunk_body)
+            .unwrap();
     }
     let dir = receiver.finalize(&manifest).unwrap();
     assert!(
@@ -3148,4 +3162,218 @@ fn a_stale_journal_temp_does_not_wedge_or_publish() {
         body,
         "the finalized item is byte-exact"
     );
+}
+
+/// A deterministic identity mismatch is the contract's terminal
+/// `request_identity_mismatch`/`collection_invalid` refusal — never a
+/// retryable `Fault` and never a durable row. A manifest naming
+/// another collection and a durable request body naming another
+/// request both refuse the same way, and the unrecorded refusal
+/// leaves the honest collection free to land later.
+#[test]
+fn an_identity_mismatch_is_a_terminal_refusal() {
+    let (rig, base) = rig("identity-mismatch");
+    let seeded = seed_remote_request(
+        &rig.store,
+        &rig.bodies,
+        &rig.source.repository,
+        &base,
+        vec![RequiredArtifact {
+            kind: "result".into(),
+            path: "dist/result.json".into(),
+            expected_digest: None,
+        }],
+        1 << 20,
+        1 << 20,
+    );
+    let (prepared, _exported) = prepare_side(&rig, &seeded, "tr-in-1");
+    worker_produce(&rig, &prepared, "dist/result.json", b"RESULT");
+    let collection_id = format!("col-{}", seeded.request_id);
+    let assembled = remote_custody::assemble_collection(
+        &rig.custody,
+        &prepared.request,
+        &prepared.io_dir,
+        "tr-out-1",
+        &collection_id,
+        CHUNK,
+    )
+    .unwrap();
+    let dir = ship_collection(&assembled, &rig.coord_transfers);
+
+    // The operation names a different collection than the manifest
+    // declares — a foreign transfer, refused without retry or record.
+    let err = remote_collect::collect_remote(
+        &rig.store,
+        &rig.collect_layout,
+        &dir,
+        &assembled.manifest,
+        &limits(),
+        &seeded.request_id,
+        "col-other",
+        "stop-proof",
+        NOW,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, remote_collect::CollectError::Foreign { .. }),
+        "a collection_id mismatch is terminal, got {err:?}"
+    );
+
+    // The durable-body arm is guarded twice: collect's
+    // `request.request_id != request_id` refuses Foreign, and the
+    // store's own integrity gate refuses to even persist a body whose
+    // embedded request_id disagrees with its key — proven here.
+    let other_request = "other-request";
+    rig.store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertRequest {
+                request: InvocationRequest {
+                    request_id: other_request.into(),
+                    work_id: seeded.work_id.clone(),
+                    execution_id: ExecutionId(seeded.request.execution_id.clone()),
+                    role: InvocationRole::Coding,
+                    spec_revision: 1,
+                    payload: serde_json::json!({}),
+                    adapter_binding: None,
+                },
+            })
+        })
+        .unwrap();
+    let err = rig
+        .store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertWorkerRequestBody {
+                body: WorkerRequestBody {
+                    request_id: other_request.into(),
+                    format_version: WORKER_REQUEST_V2_FORMAT.into(),
+                    canonical_body: seeded.request.to_canonical_bytes(),
+                    body_digest: seeded.request.digest(),
+                },
+            })
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::ConstraintConflict { .. }),
+        "a mismatched durable body is unwritable, got {err:?}"
+    );
+
+    // Neither refusal recorded a row — the honest collection still
+    // lands on the right request.
+    assert!(
+        rig.store
+            .transact(|tx| tx.executor_collection(&seeded.request_id))
+            .unwrap()
+            .is_none(),
+        "a foreign refusal never persists a collection row"
+    );
+    let collected = remote_collect::collect_remote(
+        &rig.store,
+        &rig.collect_layout,
+        &dir,
+        &assembled.manifest,
+        &limits(),
+        &seeded.request_id,
+        &collection_id,
+        "stop-proof",
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(
+        collected.collection.state,
+        ExecutorCollectionState::Collected
+    );
+}
+
+/// A journaled cleanup path that only *lexically* prefixes a managed
+/// root — `<custody_root>/../escapee`, or the root itself — is
+/// refused before any removal: `Path::starts_with` is a raw prefix
+/// match, so normalization is the scope check's job, and a root is
+/// never its own descendant.
+#[test]
+fn cleanup_refuses_paths_escaping_the_managed_roots() {
+    let (rig, base) = rig("cleanup-escape");
+    let seeded = seed_remote_request(
+        &rig.store,
+        &rig.bodies,
+        &rig.source.repository,
+        &base,
+        vec![],
+        1 << 20,
+        1 << 20,
+    );
+
+    // A sentinel tree OUTSIDE the managed roots — the sibling the
+    // traversal path resolves to.
+    let escapee = rig
+        .custody
+        .custody_root
+        .parent()
+        .expect("custody root has a parent")
+        .join("escapee");
+    std::fs::create_dir_all(&escapee).unwrap();
+    std::fs::write(escapee.join("sentinel"), b"keep").unwrap();
+    let managed = rig.custody.custody_root.join("managed");
+    std::fs::create_dir_all(&managed).unwrap();
+
+    // The recorded journal carries the traversal path and the root
+    // itself — both must refuse before either removal runs.
+    let collection_id = "col-escape";
+    let journal_dir = rig.custody.custody_root.join("cleanup");
+    std::fs::create_dir_all(&journal_dir).unwrap();
+    let journal = serde_json::json!({
+        "request_id": seeded.request_id,
+        "collection_id": collection_id,
+        "pending": [
+            rig.custody.custody_root.join("..").join("escapee"),
+            rig.custody.custody_root,
+        ],
+        "attempts": 0,
+    });
+    std::fs::write(
+        journal_dir.join(format!("{collection_id}.json")),
+        serde_json::to_vec(&journal).unwrap(),
+    )
+    .unwrap();
+    let err =
+        remote_custody::cleanup_after_ack(&rig.custody, &seeded.request_id, collection_id, &[])
+            .unwrap_err();
+    assert!(
+        matches!(err, remote_custody::CustodyError::Conflict { .. }),
+        "an escaping journaled path refuses, got {err:?}"
+    );
+    assert!(
+        escapee.join("sentinel").exists(),
+        "nothing outside was removed"
+    );
+    assert!(managed.exists(), "the custody root itself was not removed");
+
+    // The root-as-pending-path alone refuses too.
+    let journal = serde_json::json!({
+        "request_id": seeded.request_id,
+        "collection_id": collection_id,
+        "pending": [rig.custody.custody_root],
+        "attempts": 0,
+    });
+    std::fs::write(
+        journal_dir.join(format!("{collection_id}.json")),
+        serde_json::to_vec(&journal).unwrap(),
+    )
+    .unwrap();
+    let err =
+        remote_custody::cleanup_after_ack(&rig.custody, &seeded.request_id, collection_id, &[])
+            .unwrap_err();
+    assert!(matches!(err, remote_custody::CustodyError::Conflict { .. }));
+    assert!(managed.exists());
+
+    // In-scope paths still clean up: the managed dir is removed and
+    // the journal closes.
+    let outcome = remote_custody::cleanup_after_ack(
+        &rig.custody,
+        &seeded.request_id,
+        "col-fine",
+        std::slice::from_ref(&managed),
+    )
+    .unwrap();
+    assert_eq!(outcome, remote_custody::CleanupOutcome::Complete);
+    assert!(!managed.exists());
 }

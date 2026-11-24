@@ -729,3 +729,29 @@ fn a_v13_store_upgrades_through_v14_and_v15() {
     drop(store);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A file stamped v14 must hold every table the v13 → v14 migration
+/// installed: an `executor_bindings`/`executor_operations`-less v14
+/// file is a truncated or foreign store, refused untouched — never
+/// silently upgraded past the missing evidence.
+#[test]
+fn a_v14_store_missing_executor_tables_is_refused() {
+    let root = temp_root("upgrade-v14-truncated");
+    let db = root.join("store.db");
+    {
+        let store = SqliteStore::open(&db, 1).unwrap();
+        drop(store);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "DROP TABLE executor_collections; DROP TABLE executor_operations; \
+             DROP TABLE executor_bindings; PRAGMA user_version=14;",
+        )
+        .unwrap();
+    }
+    match SqliteStore::open(&db, 1) {
+        Err(StoreError::UnsupportedFormat { .. }) => {}
+        Err(e) => panic!("expected UnsupportedFormat, got {e:?}"),
+        Ok(_) => panic!("a v14 file missing executor tables must not upgrade"),
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
