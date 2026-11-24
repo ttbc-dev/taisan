@@ -7,6 +7,13 @@ file:line and leak class; no secret value or private repository name is
 reproduced here — names are described by role using the legend in
 `AGENTS.md` / `docs/source-workflow-audit.md`.
 
+> **Owner-controlled record — not publication-facing.** This document is
+> a map of every remaining leak location; publishing it would hand an
+> adversary the leak index itself. It needs the same disposition as
+> `docs/source-workflow-audit.md` — a disclosure review, or exclusion
+> from the published tree — before the repository goes public (see §6).
+> If it stays, `AGENTS.md`'s exception list needs amending to name it.
+
 The audited publication route is the current one: the existing private
 GitHub repository made public in place, exposing the tracked tree, the
 full reachable history of every pushed ref, and all tracker metadata.
@@ -72,11 +79,13 @@ exception does not hold in practice:
   - a private scheduled GitHub Actions workflow name describing a
     nightly runtime job (lines ~3035, ~5386, ~6695, ~26558 —
     owner-specific ops context).
-- **`docs/name-migration.md:15,29`** — records the former repository
-  name verbatim. Judgment call for the owner: once published, GitHub's
-  rename redirect discloses the former name anyway, but the milestone
-  text requires public material to be free of private-repository
-  references.
+- **`docs/name-migration.md:15,29`** — records this repository's own
+  former name verbatim (`shimpeiws/agent-workloop` →
+  `shimpeiws/taisan`). This is the repository's self-rename, not a
+  private source repository, and GitHub's rename redirect discloses it
+  the moment the repo goes public — so it is an owner judgment call,
+  not a source-name leak. Recorded for completeness, not counted as a
+  release blocker.
 - **The smoke repo is pervasive**: its `<owner>/<smoke-repo>` name
   appears 161 times across 29 files — `docs/s1/*` (9 files),
   `docs/evidence/u3.6d.md`, `u3.6e.md`, `u8.1*.md`, `u8.2`–`u8.5`,
@@ -156,8 +165,9 @@ longer exist at HEAD:
 - **Issue bodies** (261 issues; counts are per-issue, overlapping):
   selector repo name 29, worker repo name 21, ops repo name 12, infra
   repo 9, former name 6, smoke repo 5, container-manager references 1,
-  reviewer-App slug 1, provider-specific ops context (`mimo`/`opencode`)
-  5, the infra repo's CLI name 1; owner-home paths (`~/.config/…` and
+  reviewer-App slug 1, provider-specific ops context (a private model
+  provider name and a public agent runtime) 5, the infra repo's CLI
+  name 1; owner-home paths (`~/.config/…` and
   an ops-state directory) in 7 issues. Examples: infra-repo and
   ops-repo issue links, remote-run evidence-bundle paths under the
   ops-state directory, container names prefixed with the worker-repo
@@ -203,7 +213,7 @@ A clean HEAD certifies nothing here. Divergence table:
 | --- | --- | --- | --- |
 | Four source repo names | sanctioned audit file (canonical); worker-repo name also leaks via `~/.config/<worker-repo>/` paths and inside the smoke-repo name | pre-scrub blobs of 5+ docs; 40+ commits | milestone #2; ~50 issues/PRs |
 | Smoke repo name | 29 files / 161 hits | 311 occurrences | 5 issues, review comments |
-| Former repo name | `name-migration.md` | 33 occurrences | 28 issues (comments), 4 PRs |
+| Former repo name (self-rename — not a source repo) | `name-migration.md` | 33 occurrences | 28 issues (comments), 4 PRs |
 | Owner-local paths | none at HEAD | 18 `/Users/<owner>` occurrences | `~/.config` and an ops-state dir in issues/PRs |
 | Ops-adjacent repo names | `extraction-coverage.json` only | +1 file | none found |
 | Author identities | n/a | **all 1,017 commits** | n/a |
@@ -222,11 +232,17 @@ A clean HEAD certifies nothing here. Divergence table:
    (`~/.config/<worker-repo>/…`).
 4. `docs/extraction-coverage.json` retains partially-redacted and
    unredacted private names (§2.1).
-5. `docs/name-migration.md` names the former repository (§2.1).
-6. Milestone #2's description and tracker bodies/comments preserve the
+5. `docs/name-migration.md` names the former repository (§2.1) —
+   owner judgment call, not a source-name leak: the rename redirect
+   discloses it on publication regardless.
+6. **This document itself** is a publication blocker: it is a map of
+   every remaining leak location and must be excluded from the
+   published tree or dispositioned with `source-workflow-audit.md`
+   (§6).
+7. Milestone #2's description and tracker bodies/comments preserve the
    private names even if the tree and history were fully cleaned —
    metadata cleanup is required under any publication route.
-7. `docs/s1/live-authorization.md`, `docs/u3.6e-authorization.md`, and
+8. `docs/s1/live-authorization.md`, `docs/u3.6e-authorization.md`, and
    the u8 live-evidence records are owner-operations documents; useful
    as requirements/invariants but drafted as personal ops records.
 
