@@ -50,15 +50,15 @@ Under the current publication route, everything below becomes public:
 ### 2.1 Current tree — the sanctioned exception holds, but leaks exist outside it
 
 `docs/source-workflow-audit.md` is the owner-controlled audit record and
-the single permitted exception per `AGENTS.md`. Verified: the real names
-of the ops, worker, selector, and infra repos, plus two ops-side tool
-names (a terminal multiplexer and a container manager), one
-ops-adjacent repo name, and `/Users/<owner>` checkout paths, occur
-**only** inside that file. It correctly self-declares that publication requires a
-disclosure review covering it and the git history
-(`docs/source-workflow-audit.md:23-33`).
+the single permitted exception per `AGENTS.md`. It correctly self-declares
+that publication requires a disclosure review covering it and the git
+history (`docs/source-workflow-audit.md:23-33`).
 
-Violations outside the exception:
+The scan confirms the real names of the ops, worker, selector, and infra
+repos, two ops-side tool names (a terminal multiplexer and a container
+manager), and `/Users/<owner>` checkout paths appear inside that file as
+permitted — **but the same identifiers also leak outside it**, so the
+exception does not hold in practice:
 
 - **`docs/extraction-coverage.json`** — the generated coverage manifest
   redacts source identifiers as `[source-symbol]`/`[source-file]`, but
