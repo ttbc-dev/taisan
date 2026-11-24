@@ -4485,6 +4485,22 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
             &execution.id,
             "artifact_unfulfillable",
         )? {
+            // The deferred settle is decided, not recovering: an
+            // Execution still parked on `artifact_recovery` would keep
+            // being selected by the recovery pass — charging attempts —
+            // and could be settled by the sweep as
+            // `artifact_recovery_exhausted` ahead of the outbox. The
+            // refused slot never consumes the bounded-recovery policy,
+            // so the wait re-reasons to the outbox like every other
+            // deferred terminal outcome.
+            if execution.waiting_reason == Some(WaitingReason::ArtifactRecovery) {
+                let mut next = execution.clone();
+                next.waiting_reason = Some(WaitingReason::Reconciliation);
+                tx.apply(&Effect::UpdateExecution {
+                    execution: next,
+                    expected_state: execution.state.clone(),
+                })?;
+            }
             return Ok(());
         }
         return fail_terminal(tx, execution, "artifact_unfulfillable", &reason);

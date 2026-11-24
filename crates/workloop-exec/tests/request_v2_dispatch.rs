@@ -6479,6 +6479,185 @@ fn an_unfulfillable_settle_defers_until_the_outstanding_write_reconciles() {
     );
 }
 
+/// A collision detected on the bounded-recovery lane that defers for
+/// an outstanding host write is no longer a recovery wait: the
+/// refused slot can never hold the bound evidence, so the deferred
+/// settle takes the Execution off `artifact_recovery` at once. The
+/// recovery pass stops charging attempts and the sweep can never
+/// settle the slot as `artifact_recovery_exhausted` — the reconciling
+/// receipt lands `artifact_unfulfillable`, the same terminal outcome
+/// the finish path records.
+#[test]
+fn a_deferred_unfulfillable_refusal_leaves_the_recovery_lane() {
+    let root = tmp_root("unfulfillable-defer-recovery");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut cfg = config();
+    cfg.allowed_effects.host_write = true;
+    cfg.lanes = LanePolicy {
+        invariant_check: false,
+        code_review: false,
+    };
+    let (_w, e, rid) = admit_ex_cfg(
+        &store,
+        "v2-unfulfillable-defer-recovery",
+        vec![],
+        vec![],
+        &cfg,
+    );
+    insert_writer(&store, &e, "inv-current", &rid, InvocationState::Done);
+    park_waiting(&store, &e);
+
+    // The recovery lane: a Missing fact parks the Execution in
+    // `artifact_recovery` exactly as a finish-time recoverable absence
+    // does.
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-current".into()),
+        ArtifactFact::Missing,
+        NOW,
+    );
+    assert_eq!(
+        execution(&store, &e).waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "the missing artifact parked the Execution on the recovery lane"
+    );
+
+    // The publish chain records a `push_ref` intent that stays
+    // `pending` — the delivery-bound effect the settle must wait on.
+    authorize_push(&store);
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-current".into()),
+        ArtifactFact::Present {
+            digest: "ab".repeat(32),
+        },
+        NOW + 1,
+    );
+    let pending = store
+        .transact(|tx| tx.action_intents())
+        .unwrap()
+        .into_iter()
+        .find(|i| matches!(i.action, HostAction::PushRef { .. }))
+        .expect("the publish chain recorded a push_ref intent");
+    assert_eq!(pending.status, HostActionStatus::Pending);
+
+    // The artifact is lost again while the write drains: the Execution
+    // re-enters the recovery lane with the intent still outstanding.
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-current".into()),
+        ArtifactFact::Missing,
+        NOW + 2,
+    );
+    assert_eq!(
+        execution(&store, &e).waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "the re-lost artifact re-parked the Execution on the recovery lane"
+    );
+
+    // The recovery pass reports the structural refusal while the write
+    // is outstanding: the settle defers — and the Execution leaves the
+    // recovery lane at once, waiting on the outbox like every other
+    // deferred terminal outcome.
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-current".into()),
+        ArtifactFact::Unfulfillable {
+            reason: "required artifact path is tracked repository content".into(),
+        },
+        NOW + 3,
+    );
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.state,
+        ExecutionState::Waiting,
+        "the outstanding host write defers the terminal failure: {exec:?}"
+    );
+    assert_eq!(
+        exec.waiting_reason,
+        Some(WaitingReason::Reconciliation),
+        "the deferred settle waits on the outbox, not on recovery: {exec:?}"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.deferrals())
+            .unwrap()
+            .iter()
+            .any(|d| d.execution_id == e && d.reason == "outbox_reconciliation"),
+        "the deferred settle explains itself as outbox reconciliation"
+    );
+
+    // The recovery pass no longer selects it: the refused slot never
+    // consumes the bounded-recovery budget.
+    let sup = Supervisor::new(
+        PosixProcessControl,
+        root.join("workspaces"),
+        vec!["true".into()],
+        config(),
+    );
+    sup.run_recovery(&store, NOW + 4).unwrap();
+    assert_eq!(
+        execution(&store, &e).recovery_attempts_used,
+        0,
+        "a decided refusal is never charged a recovery attempt"
+    );
+
+    // Even fully spent, the lane no longer applies: the sweep cannot
+    // settle the refused slot as exhausted recovery.
+    store
+        .transact(|tx| {
+            let mut next = tx.execution(&e)?.expect("execution exists");
+            let expected = next.state.clone();
+            next.recovery_attempts_used = next.budget.artifact_recovery_attempts;
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: expected,
+            })
+        })
+        .unwrap();
+    sweep(&store, &config(), NOW + 5).unwrap();
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.state,
+        ExecutionState::Waiting,
+        "a refused slot never settles as artifact_recovery_exhausted: {exec:?}"
+    );
+
+    // The reconciling receipt lands the deferred refusal: same
+    // terminal outcome as the finish path.
+    handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(exec.work_id.clone()),
+            subject_execution_id: None,
+            fact: ObservationFact::HostActionResult {
+                action_id: pending.action_id.clone(),
+                authenticated_actor: None,
+                status: HostActionStatus::Failed {
+                    reason: "transport lost".into(),
+                },
+                effects: vec![],
+            },
+            observed_unix_seconds: NOW + 6,
+        },
+        NOW + 6,
+    )
+    .unwrap();
+    let exec = execution(&store, &e);
+    assert_eq!(exec.state, ExecutionState::Failed);
+    assert_eq!(
+        exec.terminal_code.as_deref(),
+        Some("artifact_unfulfillable"),
+        "the deferred refusal, never recovery exhaustion: {exec:?}"
+    );
+}
+
 /// A cancel committed while declared verification work is pending
 /// does not skip the owned child: the bounded verification run still
 /// executes and records its result while the Execution is stopping,
