@@ -4453,6 +4453,15 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
     if invocations.iter().any(|i| i.state.is_unresolved_writer()) {
         return Ok(());
     }
+    // The producing writer for both the refusal and the declared-set
+    // gate below: the latest Coding/Fix Invocation that resolved
+    // `Done`. A successor that never reached `Done` produced nothing,
+    // so it supersedes nothing — the last Done writer's evidence and
+    // obligations remain current.
+    let producing_done = invocations.iter().rposition(|i| {
+        matches!(i.role, InvocationRole::Coding | InvocationRole::Fix)
+            && i.state == InvocationState::Done
+    });
     // A recorded artifact collision is structural for the Invocation
     // that produced it: the declared artifact can never become
     // `Present` under that Invocation, so bounded recovery would only
@@ -4461,10 +4470,7 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
     // Invocation is stale fact, never this writer's outcome. The
     // writer is resolved above, so settle the request now with the
     // collision spelled out instead of retrying it.
-    if let Some(writer) = invocations
-        .iter()
-        .rposition(|i| matches!(i.role, InvocationRole::Coding | InvocationRole::Fix))
-        .map(|i| &invocations[i])
+    if let Some(writer) = producing_done.map(|i| &invocations[i])
         && let Some(reason) = unfulfillable_artifact(tx, &execution.id, writer)?
     {
         // The terminal-settle rule every other failure path applies:
@@ -4489,11 +4495,22 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
     }) {
         return Ok(());
     }
-    for invocation in &invocations {
+    // Only the latest resolved writer's declared set gates: a
+    // superseded writer's declared set is stale exactly like its facts
+    // (WC-REV-01) — the obligation moved to the successor that
+    // replaced it, and a collision or absence bound to its own
+    // identity can never be re-reported, so gating on it would park
+    // the Execution in `waiting` until the runtime bound.
+    for (index, invocation) in invocations.iter().enumerate() {
         // Only declared artifacts gate completion: a read-only role
         // (the invariant check) records an explicitly empty required
         // set — its lifecycle and receipts are the evidence.
+        let superseded_writer = matches!(
+            invocation.role,
+            InvocationRole::Coding | InvocationRole::Fix
+        ) && Some(index) != producing_done;
         if invocation.state == InvocationState::Done
+            && !superseded_writer
             && !invocation.required_artifacts.is_empty()
             && artifact_digests(tx, &execution.id, invocation)?.is_empty()
         {
@@ -4819,7 +4836,9 @@ pub struct SweepReport {
     pub examined: usize,
     /// Executions moved to `stopping` by a runtime or time bound.
     pub stops_recorded: usize,
-    /// Executions settled terminal by an exhausted bound.
+    /// Executions settled terminal: by an exhausted bound, or by a
+    /// structural refusal (e.g. `artifact_unfulfillable`) the
+    /// level-triggered re-assessment settled on this pass.
     pub terminal_failures: usize,
     /// Waiting Executions whose recorded evidence already satisfied
     /// every completion gate and were settled `succeeded` by the
