@@ -11,22 +11,45 @@ repository* and private counterpart systems are named by role only.
 Issue/PR numbers and revision SHAs appear throughout as
 owner-verifiable evidence locators.
 
+Record history: first recorded 2026-11-23 against candidate `ca45ac8`;
+refreshed 2026-11-25 against `119dcb7` (§1). The refresh re-dispositions
+every tracked defect against the new candidate and adds the issue-state
+ledger (§8); the §3–§5 evidence citations are retained unchanged —
+the delta admits no re-exercise, and the reuse caveat in §3 applies.
+
 ## 1. Candidate commit
 
 ```text
 git log -1 origin/main
-ca45ac8fbf5647df7dbdcac59185b8442c9e4890
-Merge pull request #417 from shimpeiws/issue-416-decide-handoff-manifest-custody
+119dcb72ce047bdcc4c44fb4a7915ffe2d7fd6ee
+Merge pull request #435 from shimpeiws/issue-376-agent
 ```
 
-The candidate is `origin/main` HEAD at record time (2026-11-23). Its
-history contains every change the acceptance evidence depends on:
+The candidate is `origin/main` HEAD at record time (2026-11-25) —
+**provisional**: it moves as remaining PRs merge (at record time PR
+#427 for #323 and PR #431 for #419 are open). Its history contains
+every change the acceptance evidence depends on:
 
 | Content | Merge | What it carries |
 | --- | --- | --- |
 | Live-run finding fixes | `bfa0412` (PR #413) | `artifact.json` manifest from the worker shim (#410), git-push transport for remote ref writes (#411), declared CA trust store and commit identity (#412) |
 | Publish-leg fix | `4464c4f` (PR #421) | git-transport push authenticated as `Basic x-access-token` (#420) |
 | Design docs | `9e01af1` (PR #414, #372), `f410092` (PR #415, #373), `ca45ac8` (PR #417, #416) | remote executor boundary, reference environment selection, handoff manifest custody |
+
+Admitted since the previous record (`ca45ac8` → `119dcb7`, oldest
+first):
+
+| Content | Merge | What it carries |
+| --- | --- | --- |
+| Bounded Worker report ingestion | `ddf92fe` (PR #418, #262) | bounded v2 Worker `report.json` ingested as validated evidence; lost-`Running` report ingestion and pending-report cleanup |
+| Remote executor transport contract | `4b41907` (PR #423, #374) | versioned remote execution / custody contract design |
+| This ledger | `29db0f7` (PR #424) | the first record of this document (#365) |
+| Spent-deadline ordering fix | `84525a0` (PR #426, #363) | bound check before paid enforcement cost; dedicated `deadline` marker digest |
+| Runtime-auth cleanup | `4df7087` (PR #425, #364) | staged credential removed on refusal, re-resolve, stage failure, and drop |
+| Bounded absence proofs | `d81f064` (PR #428, #344) | launch-group clearance, bounded `absence_unprovable` escalation, recoverable outcome |
+| Remote bindings; verdict bounds | `5ba0b4b` (PR #429, #375), `8465cb9` (PR #430, #338) | versioned executor wire types and durable remote bindings; bounded verdict-report member sets |
+| License prep; exposure audit | `aff8721` (PR #433, #369), `b0b81f6` (PR #432, #368) | dependency license inventory and selection prep; public-release exposure audit report |
+| Remote executor surface | `2c271f0` (PR #436, #377), `119dcb7` (PR #435, #376) | public remote executor reference endpoint; bounded remote input transfer and quarantined artifact collection |
 
 ## 2. Evidence classes and record locations
 
@@ -80,6 +103,20 @@ Owner checklist scenario IDs (M-1…M-7, M-8/M-9, S-1…S-6) refer to
 | Republished head (H2) | Owner-run live | Run 1: `35ce3cb` (merge keeping non-fast-forward) pushed and reflected on the change request |
 | Fresh reassessment to Outcome | Owner-run live | Run 1: post-republish verify/review checks and `assess_completion` recorded Execution `e-6` `succeeded` against the verified head `35ce3cb`; no unresolved writer, gate, or effect remained |
 
+Refresh note (`119dcb7`): every row's retained owner-run evidence
+predates the `ca45ac8` → `119dcb7` delta. The delta touched the
+supervisor's launch-absence proof (#428), the boundary's staged-
+credential lifecycle (#425), the verification ordering on a spent
+deadline (#426), and the remote-executor surface (#375–#377) — paths
+the live runs exercised. Contract tests cover each change on the
+candidate (§9), but no live re-run exists on it: the rows above remain
+the best retained evidence for the manual capabilities, and whether a
+bounded re-exercise on the final candidate is required is #270's call,
+not assumed here. All rows also remain **pending #270** for the
+sanitized public evidence record and the explicit authorization
+record (§4) — the runs happened; the public record of them does not
+yet exist.
+
 ## 4. Attention and restart/recovery evidence (#270)
 
 | Variant | Evidence (class) | Locators |
@@ -93,7 +130,9 @@ Residual gaps against #270: the owner-facing sanitized public evidence
 record and the explicit authorization record the issue requires are
 held owner-side with the run records rather than in this repository;
 a fully restart-clean store-recovery variant is not yet evidenced (the
-one attempt was inconsistent).
+one attempt was inconsistent). #267 (real-Worker stop/restart/recovery
+integration), which feeds this row, remains open and in flight at
+record time.
 
 ## 5. Scheduled processing (#271) — not exercised on this candidate
 
@@ -141,20 +180,38 @@ manual `submit` and driven by `taisan run`/`run --work`. Therefore:
 
 Each open defect and unresolved review-finding set named by #365 was
 re-checked against the candidate's code — an issue number or label is
-not treated as a confirmed defect.
+not treated as a confirmed defect. Dispositions were verified on
+`119dcb7` by re-reading the cited code; rows carried over from the
+`ca45ac8` record were re-confirmed at their cited code on the new
+candidate (locator drift only, no behavior change found).
 
-| Issue | Disposition | Reason (verified on `ca45ac8`) |
+| Issue | Disposition | Reason (verified on `119dcb7`) |
 | --- | --- | --- |
-| #344 — absence proof can stall or conclude falsely | **Release-blocking** | Partially fixed by PR #406 (kernel-thread exclusion by structural property, `/proc` fallback, root-run test panic fixed). Still open: (a) a persistently unmappable non-kernel cwd keeps a launch `uncertain` forever — no bounded escalation to a distinct "absence unprovable" outcome (`launch_dir_clear` fails closed into `report_unidentified_unknown` each pass, `supervisor.rs:3926-3949`); (b) Finding 2's third check is absent — the absence proof still verifies only signature matches plus directory occupancy (`resolve_unidentified_launch`, `supervisor.rs:3871-3913`); the recorded-leader process-group membership check exists only in `proof_identities` for stop proofs (`supervisor.rs:4019-4041`). A chdir + argv-change escapee keeping the group can still be abandoned as "absent", enabling a second writer on resume — this defeats the no-duplicate-writer guarantee the release claims. |
+| #344 — absence proof can stall or conclude falsely | **Fixed** | Closed 2026-11-24 via PR #428 (`d81f064`). Both gaps from the previous record are closed: (a) a bounded count of consecutive unprovable scans now escalates to the distinct `LaunchAbsenceUnprovable` outcome (`observation.rs:107-112`; streak handling `supervisor.rs:4200-4232`) instead of holding `uncertain` forever — the launch is marked `unknown`, resolution continues, and a later provable answer still settles it (contract test `an_escalated_unprovable_launch_recovers_when_absence_becomes_provable`, `shim_contract.rs:784`); (b) absence now requires the third check — no live unrecorded member of the recorded launch group (`launch_group_clearance`, `supervisor.rs:4307+`), so a chdir+argv escapee keeping the group holds absence unproven instead of being abandoned as "absent". Residual tracked separately: #313 (below). |
 | #347 — canary reachable under bound system mounts | **Fixed** | Closed 2026-11-21. Verified: `invisible_canary` derives probe-canary placement from the rendered mount plan (skips candidates beneath declared binds, falls back to host temp dir, then `/sys/kernel`), and `plan_denial` refuses plans whose binds cover the sandbox surface (`containment.rs:362-397`). |
 | #358 — over-budget request classified as retryable Fault | **Fixed** (issue open; recommend close) | `build_request_body` now maps spec-reachable validation failures (e.g. `verification_argv` over `max_verification_commands`) to `DispatchRefusal::RequestInvalid`, a typed refusal the consume path records against the request instead of a pass-aborting `ExecError::Fault` (`request_v2.rs:1018-1025`, `supervisor.rs:2700-2708`). Only builder-impossible failures stay faults, matching the launch layer's `BodyCorrupt` classification. |
 | #359 — re-retained reclaimed body never resolvable | **Fixed core; explicitly deferred residual** | `SqliteStore::register_body` restores a non-`present` row to `present` on identical-metadata replay (`retention.rs:3116-3118`, commit `19a91e5`). Deferred edges (issue stays open for them): a non-`present` row aliased under a different path still hits `ConstraintConflict` → `Fault` in `finish_invocation`; a `present` row is trusted without a file re-stat (resolves later, honestly, as `missing-file`/`Corrupt`). Narrow triggers, honest downstream failure — recorded, not release-blocking. |
-| #361 — 13 unresolved review threads from PR #343 | **Fixed as filed** (recommend close) | All 13 unresolved non-outdated threads verified fixed on the candidate: bodies retain/reclaim revival (#1, #8) via `restore_body_presence`; catalogue-path root unified to the state root (#3, commit `ed4a576`); production composition root installs `V2Dispatch` (#2, `main.rs:2126-2149`); `/` toolchain/cache and provider-config mounts refused by `plan_denial` (#4, #5, `containment.rs:362-378`); v2 out-directory evidence collected in `finish_invocation` via `report_v2::collect` (#6 and the duplicate thread, `supervisor.rs:4162-4178`); `workspace_read_only` capability emitted for check/review roles (#7, `request_v2.rs:959-965`); probe-canary temp dir reclaimed (#9, commit `19a91e5`); provider-config digest covers member content and `ensure` re-proves on edit (#10, `boundary.rs:155-170,305-397`); contract-harness profile refused in production installs (`workloop-config` lib.rs:690-696); declared verification egress without a sandbox refused (`handoff.rs:949-962`). The `isOutdated` threads were superseded by follow-up commits on/after PR #343 (spot-verified: read-only `/workspace` for check/review roles, `supervisor.rs:2550-2555`; char-boundary-safe probe detail). |
-| #363 — spent-deadline check runs after paid work | **Explicitly deferred** | Confirmed present: `verify_with_timeout` still runs `prepare_enforcement` (digest of toolchain/caches, `handoff.rs:1391`) and `git worktree prune`/`remove_dir_all` (`handoff.rs:1439-1440`) before the `timeout.is_zero()` short-circuit (`handoff.rs:1444`). Consequence is bounded wasted cost on a spent deadline; the recorded `Inconclusive` evidence is honest (the `environment_digest` reflects enforcement that did run — no fabricated success). The early-return + dedicated marker-digest fix remains tracked by the open issue. |
-| #364 — staged runtime-auth never cleaned up | **Release-blocking** | Confirmed present: `resolve()` stages `<runtime_dir>/runtime-auth` before `validate_provider_config`/proxy start and returns `Err` with the file left behind (`boundary.rs:190-223`); `Drop` shuts down only the proxy (`boundary.rs:291-300`); no `remove_file`/`unstage` exists for the staged path. Credential material persists at a predictable path past refused resolutions, re-resolves, and process lifetime — contradicting the boundary's own contract that the secret exists in the staged file only while the grant needs it. Residual risk is bounded (0600, owner-only, mounted only for grants carrying `credential_file`) but this is a credential-hygiene defect in the boundary the release advertises; the owner may re-disposition to deferred. |
+| #361 — 13 unresolved review threads from PR #343 | **Fixed as filed** (recommend close; spot re-confirmed on `119dcb7`) | All 13 unresolved non-outdated threads verified fixed on the candidate: bodies retain/reclaim revival (#1, #8) via `restore_body_presence`; catalogue-path root unified to the state root (#3, commit `ed4a576`); production composition root installs `V2Dispatch` (#2, `main.rs:2126-2149`); `/` toolchain/cache and provider-config mounts refused by `plan_denial` (#4, #5, `containment.rs:362-378`); v2 out-directory evidence collected in `finish_invocation` via `report_v2::collect` (#6 and the duplicate thread, `supervisor.rs:4162-4178`); `workspace_read_only` capability emitted for check/review roles (#7, `request_v2.rs:959-965`); probe-canary temp dir reclaimed (#9, commit `19a91e5`); provider-config digest covers member content and `ensure` re-proves on edit (#10, `boundary.rs:155-170,305-397`); contract-harness profile refused in production installs (`workloop-config` lib.rs:690-696); declared verification egress without a sandbox refused (`handoff.rs:949-962`). The `isOutdated` threads were superseded by follow-up commits on/after PR #343 (spot-verified: read-only `/workspace` for check/review roles, `supervisor.rs:2550-2555`; char-boundary-safe probe detail). |
+| #363 — spent-deadline check runs after paid work | **Fixed** | Closed 2026-11-23 via PR #426 (`84525a0`). The `timeout.is_zero()` short-circuit now runs before enforcement resolution, toolchain/cache hashing, and worktree maintenance, and records the dedicated `deadline_bound_marker()` digest rather than a digest of enforcement that never ran (`handoff.rs:1418-1444`; enforcement resolves at `handoff.rs:1450`). Contract coverage added in `handoff_contract.rs`. |
+| #364 — staged runtime-auth never cleaned up | **Fixed** | Closed 2026-11-23 via PR #425 (`4df7087`). `unstage_credential` removes both `runtime-auth` and the `runtime-auth.tmp` staging sibling on refusal (`boundary.rs:218-224`), stage failure (`boundary.rs:277-281`), re-resolve and no-credential resolve (`boundary.rs:174-207`), and `Drop` (`boundary.rs:341-352`); removal failure refuses the resolve that asks for it. Regression test: `dropping_the_boundary_removes_the_staged_credential` (`boundary.rs:816`). |
 | #422 — preflight does not probe `gh` version/features | **Explicitly deferred** | Environment-provisioning gap surfaced by run 3, not a code defect in the candidate: the guest's apt-default `gh` 2.45.0 lacks `gh api --slurp`, collapsing adapter list calls into opaque `read_indeterminate` skips; upgrading to `gh` 2.105.0 unblocked the run. Documented environment requirement and a design-TBD follow-up (preflight version probe and/or fail-loud transport errors); not release-blocking. |
 | #420 — git push `Bearer` auth 401 for `gho_` tokens | **Fixed and verified live** | Closed via PR #421 (merged `4464c4f`): push authenticates as `Basic x-access-token:<token>` and unencodable credentials refuse before spawn. Run 3 verified live: `push_ref` applied, `ref_published` recorded, PR #64 opened, where the same credential under `Bearer` had deterministically 401'd in run 2. |
 | Run-1 review finding — `greet(name)` with `name=None` raised `AttributeError` | **Fixed** (verified via the loop's own fix path) | The operator-posted inline finding on the isolated repository's PR #62 entered as a real review occurrence, was judged `fix`, and the bounded Fix Invocation produced `5c5cc6e`; republished head `35ce3cb` passed verification/review and `assess_completion` recorded `succeeded`. A defect in the produced change — not a taisan defect — dispositioned by the workflow itself; it is also the §3 real-review-finding → Fix → H2 → reassessment evidence, so it needs no separate repair issue. |
+
+Other open defects re-checked on the candidate (beyond the list #365
+names):
+
+| Issue | Disposition | Reason (verified on `119dcb7`) |
+| --- | --- | --- |
+| #313 — unidentified launch cannot converge with ≥2 unrecorded same-signature processes | **Open defect — disposition pending owner call (deferred vs blocking)** | Confirmed present and adjacent to the fixed #344 class: an ambiguous match restarts the unprovable streak and reports `Unknown` (`supervisor.rs:4220-4232`) — correct never-guess behavior, but the convergence gap persists: two same-signature lost-identity launches can hold capacity indefinitely. Honest-uncertain wedge, not a false-absence or duplicate-writer violation. |
+| #398 — contained verification leaves `masked_files` empty | **Open defect — flag for owner release-blocking review** | Confirmed present: the contained-verification `MountPlan`s carry `masked_files: vec![]` (`handoff.rs:1119`, `handoff.rs:1277`) while `contained_exec` pushes `grant.credential_source` into the mask (`supervisor.rs:1474-1475`); a `file:` credential source under a system-bind prefix stays readable inside contained verification. Same credential-hygiene class for which #364 was release-blocking before #425. |
+| #399 — credential mask only under system-bind prefixes | **Open defect — flag with #398** | Confirmed present: the `/dev/null` shadow renders only when `system_bind_covers(file)` (`containment.rs:562-567`); a credential source outside `/usr`/`/bin`/`/sbin`/`/lib`/`/lib64` (e.g. `/etc`, `/run`) gets no mask and can still be bound read-only by the argv-derived own-path `extra_binds`. |
+| #400 — v2 `report.json` retention dropped by #360 merge resolution | **Open defect — retention regression** | Confirmed present: `retain_report` does not exist in `handoff.rs` on the candidate — the body-store retention implemented in `706b8e1` was dropped by the merge-conflict resolution `630e53b`; the per-Invocation io tree reclaim can lose the report body the assessment layer expects. |
+| #437 — `remote_collect` reports zero-byte required artifact `Present` where local reports `Missing` | **Open defect (new since the previous record)** | Shadow finding on #435, merged with the finding open: `remote_collect.rs` treats `blob_at` → `Some(empty)` as `Present` (size and claimed-digest checks pass at `bytes=0`) while the local supervisor returns `Missing`. v0.4 remote path — outside this release's exercised surface but on the candidate's shipped code; no repair PR yet. |
+| #419 — tracked `artifact.json` collision burns ArtifactRecovery | **Open defect — repair in flight** | PR #431 is open against it at record time; the candidate is provisional until it resolves. |
+| #409 — #405 follow-ups (watchdog gap, ppid edges, docs, regression test) | **Open — deferred, not release-blocking** | Residual test-harness/observability coverage items; the merged core fix stands. |
+| #353 — `workloop-fixture-worker` orphans leak past test exit | **Open — deferred, not release-blocking** | Test-infrastructure defect; it does not touch production behavior. |
+| #302, #306, #139 | **Open — backlog, not re-verified this pass** | Older defects (v2 negotiation capability identifiers, workspace-prepare direct fetch deviating from the rejected transport design, deferred PR #128 shadow findings); recorded open — no disposition claimed. |
 
 ## 7. Live-run findings tracked to repair
 
@@ -168,6 +225,15 @@ status on the candidate:
 | #412 — contained sandbox lacked CA trust/commit identity | PR #413 | Run 2: declared CA binds mounted read-only; TLS to the model API worked inside the sandbox with no `--runtime-arg` bind; commit authored by the profile `commit_identity` — PASS |
 | #420 — push auth scheme rejected by github.com | PR #421 (merged `4464c4f`) | Run 3: `push_ref` + `open_change_request` both `applied`; corroborating `GIT_CURL_VERBOSE` probe under the identical environment returned HTTP 200 vs the previous 401 — PASS |
 | #422 — `gh` version/features unprobed by preflight | None (open, deferred) | — |
+| #344 — unmappable cwd forced permanent `Err`; escaped descendants invisible | PR #428 (merged `d81f064`) | Contract tests on the candidate: consecutive unprovable scans converge to `LaunchAbsenceUnprovable`, an escalated launch still settles when absence becomes provable or a rebind succeeds, and recorded group clearance holds absence unproven for chdir+argv escapees (`shim_contract.rs`) — PASS |
+| #363 — spent-deadline check ran after paid work | PR #426 (merged `84525a0`) | `handoff.rs:1424` short-circuits before enforcement/worktree cost with the `deadline_bound_marker()` digest; `handoff_contract.rs` covers the marker path — PASS |
+| #364 — staged runtime-auth never cleaned up | PR #425 (merged `4df7087`) | `boundary.rs` unstages the credential and its staging sibling on refusal, re-resolve, stage failure, and `Drop`; `dropping_the_boundary_removes_the_staged_credential` — PASS |
+| #437 — `remote_collect` zero-byte artifact reported `Present` | None (open) | — |
+
+Repairs in flight at record time: PR #427 (sibling-PR conflict
+detection, #323) and PR #431 (`artifact.json` collision, #419) are
+open against the candidate; the candidate is provisional until they
+resolve.
 
 Recorded observations not yet filed as issues (kept visible, not
 silently dropped):
@@ -182,18 +248,43 @@ silently dropped):
 - macOS cannot host containment natively (no bubblewrap); the tracked
   answer is the minimal on-demand Linux guest (#373 design).
 
-## 8. Verification baseline on the candidate
+## 8. Issue-state ledger — open issues already implemented
+
+The milestone's open-issue count overstates remaining work: several
+open issues are already implemented by merged PRs whose footers did
+not carry `Closes`, and two release tasks delivered their documents
+while their owner decisions remain open. States verified 2026-11-25:
+
+| Issue | State on the candidate | Implementing merge | Residual |
+| --- | --- | --- | --- |
+| #263 — connect produced commits to handoff/verification | Implemented | PR #348 (`d7f5a9f`) | None found; recommend owner close |
+| #264 — real invariant/code-review assessments | Implemented | PR #349 (`b93b72d`) | recommend close |
+| #266 — production host effects/reconciliation | Implemented | PR #351 (`9642c2a`) | recommend close |
+| #269 — clean-install + real-Worker acceptance docs | Implemented | PR #356 (`9a79664`) | reproduction tracked by #367 — pending owner run |
+| #410 / #411 / #412 — live-run finding fixes | Implemented | PR #413 (`bfa0412`) | verified live in runs 2–3 (§7); recommend close |
+| #366 — pluggable public Selector/Worker references | Closed | PR #404 (`f883d6e`) | done |
+| #368 — public-content/history/metadata audit | Audit delivered | PR #432 (`b0b81f6`) | `release-audit.md` §5 blockers stay gated on the publication-route decision — an open owner choice, not picked here |
+| #369 — license selection prep | Prep delivered | PR #433 (`aff8721`) | license selection, `LICENSE`, and package metadata pending owner choice |
+| #270 — manual real-Worker acceptance | Partial | runs 1–3 retained owner-side | sanitized public evidence record, explicit authorization record, restart-clean store-recovery variant — pending owner run |
+| #271 — scheduled pilot acceptance | Not started | — | pending owner run (§5) |
+| #367 — clean-Linux-install reproduction | Not started | — | pending owner run; reuses #269 runbook and #270/#271 evidence where it qualifies |
+| #370 / #371 — candidate freeze; go/no-go | Not started | — | gated on this ledger, the route decision, and the license selection |
+| #267 — stop/restart/recovery integration | In flight (`agent:running`) | — | feeds the §4 restart/recovery row |
+
+## 9. Verification baseline on the candidate
 
 This change adds documentation only; no code, test, or configuration
-changed since the last green baseline. The candidate nevertheless had
-the full baseline rerun as #365 requires (build before test — contract
-tests spawn `target/debug/workloop-fixture-worker`):
+changed since the last green baseline. The refreshed candidate
+`119dcb7` nevertheless had the full baseline rerun as #365 requires —
+the previous record's run covered `ca45ac8`, not this candidate
+(build before test — contract tests spawn
+`target/debug/workloop-fixture-worker`):
 
 | Gate | Result |
 | --- | --- |
 | `cargo fmt --check` | Passed |
 | `cargo build --workspace` | Passed |
-| `cargo test --workspace` | Passed — 1594 tests, 0 failures (fixture-selector/fixture-worker contract tests ran against `target/debug/` binaries produced by the build gate) |
+| `cargo test --workspace` | Passed — 1753 tests, 0 failures (fixture-selector/fixture-worker contract tests ran against `target/debug/` binaries produced by the build gate; one timing-sensitive deadline assertion in `gh_cli_transport` failed under full-suite load on the first run and passed on rerun — recorded, not hidden) |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
 
 Scope honesty: the earlier green runs on merged PRs cover the code
@@ -203,15 +294,19 @@ not on `cargo test`. Conversely the cargo baseline exercises fixture
 and contract paths only; it is not evidence for any live-run claim in
 this document.
 
-## 9. Known limitations
+## 10. Known limitations
 
 - **Single Linux host**: containment requires bubblewrap namespaces;
   the reference deployment is one Linux environment (the runs used a
   single OrbStack guest on one macOS machine). No multi-host or
   distributed execution is claimed.
-- **No remote execution**: the remote executor boundary is designed
-  (#372/#373 docs) but not implemented for this release; all live
-  evidence is local-host.
+- **Remote execution landed but unexercised**: the remote executor
+  surface (contract #374, wire types/bindings #375, reference endpoint
+  #377, bounded transfer/collection #376) is on the candidate as v0.4
+  groundwork — with one open defect (#437). No end-to-end remote run
+  exists and none is claimed or required for this release; all live
+  evidence is local-host, and remote execution stays outside this
+  release gate.
 - **No automatic merge or deploy**: publication ends at a reviewed
   change request; merge and deploy remain human acts. Every run
   finished with the PR open and nothing merged.
@@ -225,6 +320,11 @@ this document.
   H1.
 - **One recovered-store attempt was internally inconsistent** (§4):
   restart/recovery evidence is partial.
-- **Release-blocking dispositions open** (§6): #344 and #364 are
-  assessed as gating defects; #365's checklist row for defect
-  disposition records them rather than closing them.
+- **Defect dispositions refreshed** (§6): the defects previously
+  assessed release-blocking (#344, #364) and deferred (#363) are fixed
+  on this candidate by #428/#425/#426; no issue named by #365 carries
+  a release-blocking disposition now. New flags for owner review:
+  #398/#399 (credential masking — the same class #364 gated on) and
+  #313 (ambiguous-match convergence wedge). The `release-audit.md` §5
+  exposure blockers remain gated on the publication-route decision,
+  which stays an open owner choice.
