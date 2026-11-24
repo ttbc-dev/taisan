@@ -24,7 +24,7 @@ full reachable history of every pushed ref, and all tracker metadata.
 
 Under the current publication route, everything below becomes public:
 
-- **Tracked tree**: 11 Cargo crates under `crates/` (~150 source/test
+- **Tracked tree**: 14 Cargo crates under `crates/` (~150 source/test
   files), `docs/` (~130 Markdown files including `docs/evidence/` and
   `docs/s1/`), `fixtures/` (s1, v0.3-doc, rui-evidence-v1; `store.db` is
   a 0-byte placeholder), `scripts/` (Python checkers, `scripts/s1/`
@@ -47,7 +47,7 @@ Under the current publication route, everything below becomes public:
 
 ## 2. Private-source scan
 
-### 2.1 Current tree — the sanctioned exception holds, but leaks exist outside it
+### 2.1 Current tree — the sanctioned file exists, but leaks occur outside it
 
 `docs/source-workflow-audit.md` is the owner-controlled audit record and
 the single permitted exception per `AGENTS.md`. It correctly self-declares
@@ -201,7 +201,7 @@ A clean HEAD certifies nothing here. Divergence table:
 
 | Leak class | HEAD tree | `origin/main` history | Tracker metadata |
 | --- | --- | --- | --- |
-| Four source repo names | only the sanctioned audit file | pre-scrub blobs of 5+ docs; 40+ commits | milestone #2; ~50 issues/PRs |
+| Four source repo names | sanctioned audit file (canonical); worker-repo name also leaks via `~/.config/<worker-repo>/` paths and inside the smoke-repo name | pre-scrub blobs of 5+ docs; 40+ commits | milestone #2; ~50 issues/PRs |
 | Smoke repo name | 29 files / 161 hits | 311 occurrences | 5 issues, review comments |
 | Former repo name | `name-migration.md` | 33 occurrences | 28 issues (comments), 4 PRs |
 | Owner-local paths | none at HEAD | 18 `/Users/<owner>` occurrences | `~/.config` and an ops-state dir in issues/PRs |
