@@ -58,7 +58,7 @@ use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
 
 use crate::api::{
-    ApiError, GitHubApi, RemoteMergeability, RemoteReview, RemoteReviewFinding,
+    ApiError, GitHubApi, RemoteMergeability, RemotePull, RemoteReview, RemoteReviewFinding,
     RepositoryPermissions,
 };
 use crate::credential::{
@@ -78,7 +78,7 @@ enum ProbeCredential {
 use crate::fixture::{
     AttemptOutcome, CredentialBlock, OutboxReport, ReconcileReport, SkippedIntent,
     SourceRefreshReport, declared_sources, latest_recorded_head, latest_recorded_issue,
-    latest_recorded_merge, recorded_change_pairs,
+    latest_recorded_merge, latest_recorded_mergeability, recorded_change_pairs,
 };
 
 /// One delivered GitHub webhook: the transport GUID GitHub assigned,
@@ -1528,9 +1528,13 @@ impl<C: GitHubApi> GitHubAdapter<C> {
     /// target per pass; it is bounded by the pass deadline, by
     /// [`MAX_MERGE_RECHECKS_PER_PASS`] over the whole pass, and by
     /// [`MAX_CONFLICT_RECHECKS_PER_PASS`] shared across every merge.
-    /// The remainder waits for the next pass. Every observation carries
-    /// the exact `(head, new base)` pair, and its stable delivery
-    /// identity makes a steady conflicted pair one trigger.
+    /// The bound orders the candidates, not just their count: siblings
+    /// with no recorded verdict for the current `(head, base)` pair and
+    /// siblings whose recorded verdict is still provisional are checked
+    /// first, so the remainder waits for — and is reached by — the next
+    /// pass. Every observation carries the exact `(head, new base)`
+    /// pair, and its stable delivery identity makes a steady conflicted
+    /// pair one trigger.
     #[allow(clippy::too_many_arguments)]
     fn recheck_after_recorded_merges(
         &mut self,
@@ -1693,15 +1697,17 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 // The sibling list was unavailable: no fact is invented.
                 Err(_) => continue,
             };
+            // Candidate order is what makes the bound fair: a sibling
+            // whose current `(head, base)` pair already has a settled
+            // recorded verdict is final for that episode — any real
+            // change moves the head or base and mints a new pair — so
+            // it is never re-read. Unrecorded pairs and provisional
+            // `Unknown` verdicts are read first, least recently
+            // recorded first, so the pass-wide bound reaches the
+            // deferred tail on a later pass instead of spending every
+            // pass re-reading the same leading set.
+            let mut candidates: Vec<(i64, RemotePull, WorkId, ChangeRequestRef)> = Vec::new();
             for sibling in siblings {
-                if rechecked >= MAX_CONFLICT_RECHECKS_PER_PASS {
-                    report.deferred.push(format!("merge-siblings:{change}"));
-                    break;
-                }
-                if deadline.is_some_and(|d| clock() >= d) {
-                    report.deferred.push(format!("merge-siblings:{change}"));
-                    break;
-                }
                 if sibling.merged || sibling.id == change.change_request.as_str() {
                     continue;
                 }
@@ -1728,6 +1734,30 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     // unscoped driver.
                     continue;
                 }
+                let recorded = latest_recorded_mergeability(
+                    store,
+                    &sibling_work,
+                    &sibling_change,
+                    &sibling.head_sha,
+                    &base,
+                )?;
+                let key = match recorded {
+                    Some((MergeabilityState::Unknown, observed)) => observed,
+                    Some(_) => continue,
+                    None => i64::MIN,
+                };
+                candidates.push((key, sibling, sibling_work, sibling_change));
+            }
+            candidates.sort_by_key(|candidate| candidate.0);
+            for (_, sibling, sibling_work, sibling_change) in candidates {
+                if rechecked >= MAX_CONFLICT_RECHECKS_PER_PASS {
+                    report.deferred.push(format!("merge-siblings:{change}"));
+                    break;
+                }
+                if deadline.is_some_and(|d| clock() >= d) {
+                    report.deferred.push(format!("merge-siblings:{change}"));
+                    break;
+                }
                 let verdict = match self
                     .client
                     .read_mergeability(&sibling_change.repository, &sibling_change.change_request)
@@ -1744,8 +1774,8 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     },
                 };
                 // Every remote verdict read consumes the pass-wide
-                // sibling bound — a re-read of an already-recorded pair
-                // is still a re-check.
+                // sibling bound — re-reading a provisional `Unknown`
+                // pair is still a re-check.
                 rechecked += 1;
                 let head_object = if verdict.head_sha.is_empty() {
                     sibling.head_sha.clone()

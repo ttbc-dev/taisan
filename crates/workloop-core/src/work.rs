@@ -3285,6 +3285,35 @@ fn escalate_conflict(
         return Ok(());
     };
     if let Some(active) = tx.active_execution(work_id)? {
+        // A human-held pause is never overwritten by an automatic
+        // repair — but the escalation must still be recorded, or the
+        // new conflict episode drops silently: an identical
+        // re-observation dedupes at ingest, so nothing would ever mint
+        // the hold the contract requires. The decision ledger carries
+        // the same reason and paths the moved-state pause would write.
+        if matches!(
+            active.state,
+            ExecutionState::Paused | ExecutionState::Stopping
+        ) {
+            let usage = tx
+                .work_usage(work_id)?
+                .unwrap_or_else(|| WorkUsage::new(work_id));
+            let seq = tx.alloc_seq()?;
+            tx.apply(&Effect::InsertRecoveryDecision {
+                decision: RecoveryDecision {
+                    id: new_id("rd"),
+                    work_id: work_id.clone(),
+                    execution_id: Some(active.id.clone()),
+                    classification: "conflict_unresolvable".into(),
+                    signature: None,
+                    prerequisites: vec![RepairPrerequisite::OperatorDecision],
+                    detail: reason,
+                    usage_after: serde_json::to_value(&usage).unwrap_or_default(),
+                    seq,
+                },
+            })?;
+            return Ok(());
+        }
         pause_for_repair(
             tx,
             &active,

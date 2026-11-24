@@ -7,8 +7,8 @@ use std::collections::BTreeSet;
 
 use workloop_core::command::{CommandBody, CommandDecision, CommandRequest};
 use workloop_core::domain::{
-    Actor, ActorKind, AllowedEffects, ExecutionBudget, ExecutionState, InvocationRole, LanePolicy,
-    Origin, WorkPolicy, WorkUsage,
+    Actor, ActorKind, AllowedEffects, DesiredAction, ExecutionBudget, ExecutionState,
+    InvocationRole, LanePolicy, Origin, RepairPrerequisite, WorkPolicy, WorkUsage,
 };
 use workloop_core::identity::{
     ActorRole, AdapterId, ChangeRequestId, ChangeRequestRef, CommitRevision, CredentialRef,
@@ -441,4 +441,138 @@ fn an_automatic_time_exhausted_work_escalates_a_conflict_instead_of_failing_term
     let reason = current.pause_reason.as_deref().unwrap_or_default();
     assert!(reason.contains("automatic time"), "{reason}");
     assert!(reason.contains("src/a.rs"), "{reason}");
+}
+
+#[test]
+fn a_conflict_while_the_active_execution_is_paused_is_recorded_not_dropped() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let config = config();
+    let work_id = submit(&store, &config, "conflict-paused");
+    // A human-held pause already carries its own recorded reason: the
+    // new conflict episode must not overwrite it — but it must not
+    // drop silently either, since an identical re-observation dedupes
+    // at ingest and could never mint the hold again.
+    store
+        .transact(|tx| {
+            let execution = tx.active_execution(&work_id)?.expect("active execution");
+            let mut next = execution.clone();
+            next.state = ExecutionState::Paused;
+            next.pause_reason = Some("repair: earlier operator hold".into());
+            next.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
+            next.paused_since_unix_seconds = Some(NOW);
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: execution.state,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    let target = DiffTarget {
+        change: change(),
+        head: rev("head-1"),
+        base: Some(rev("base-2")),
+        target_revision: Some(rev("base-2")),
+    };
+    handle_observation(
+        &store,
+        &config,
+        &mergeability(
+            "conflict-paused-1",
+            &work_id,
+            target,
+            MergeabilityState::Conflicting,
+            &["src/c.rs"],
+        ),
+        NOW + 1,
+    )
+    .unwrap();
+
+    // No repair is minted and the held pause keeps its recorded path…
+    let executions = store
+        .transact(|tx| tx.executions_for_work(&work_id))
+        .unwrap();
+    assert_eq!(executions.len(), 1);
+    let current = &executions[0];
+    assert_eq!(current.state, ExecutionState::Paused);
+    assert_eq!(
+        current.pause_reason.as_deref(),
+        Some("repair: earlier operator hold")
+    );
+    assert_eq!(
+        store.transact(|tx| tx.pending_requests()).unwrap().len(),
+        0,
+        "a held Work mints no automatic repair"
+    );
+    // …but the escalation is not dropped: the decision ledger carries
+    // the conflict reason and paths.
+    let decisions = store
+        .transact(|tx| tx.recovery_decisions(&work_id))
+        .unwrap();
+    assert_eq!(decisions.len(), 1, "one recorded escalation: {decisions:?}");
+    let decision = &decisions[0];
+    assert_eq!(decision.classification, "conflict_unresolvable");
+    assert_eq!(
+        decision.prerequisites,
+        vec![RepairPrerequisite::OperatorDecision]
+    );
+    assert!(decision.detail.contains("src/c.rs"), "{}", decision.detail);
+}
+
+#[test]
+fn a_conflict_while_the_active_execution_is_stopping_is_recorded_not_dropped() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let config = config();
+    let work_id = submit(&store, &config, "conflict-stopping");
+    store
+        .transact(|tx| {
+            let execution = tx.active_execution(&work_id)?.expect("active execution");
+            let mut next = execution.clone();
+            next.state = ExecutionState::Stopping;
+            next.desired_action = Some(DesiredAction::Pause);
+            next.pause_reason = Some("repair: earlier operator hold".into());
+            next.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: execution.state,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    let target = DiffTarget {
+        change: change(),
+        head: rev("head-1"),
+        base: Some(rev("base-2")),
+        target_revision: Some(rev("base-2")),
+    };
+    handle_observation(
+        &store,
+        &config,
+        &mergeability(
+            "conflict-stopping-1",
+            &work_id,
+            target,
+            MergeabilityState::Conflicting,
+            &["src/d.rs"],
+        ),
+        NOW + 1,
+    )
+    .unwrap();
+
+    let executions = store
+        .transact(|tx| tx.executions_for_work(&work_id))
+        .unwrap();
+    assert_eq!(executions.len(), 1);
+    let current = &executions[0];
+    assert_eq!(current.state, ExecutionState::Stopping);
+    assert_eq!(
+        current.pause_reason.as_deref(),
+        Some("repair: earlier operator hold")
+    );
+    let decisions = store
+        .transact(|tx| tx.recovery_decisions(&work_id))
+        .unwrap();
+    assert_eq!(decisions.len(), 1, "one recorded escalation: {decisions:?}");
+    let decision = &decisions[0];
+    assert_eq!(decision.classification, "conflict_unresolvable");
+    assert!(decision.detail.contains("src/d.rs"), "{}", decision.detail);
 }

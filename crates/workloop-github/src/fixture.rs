@@ -2367,17 +2367,14 @@ impl FixtureGithub {
             report.merge_rechecks += 1;
             merge_scans += 1;
             scanned_targets.insert(target_branch.clone(), base.clone());
+            // The same candidate ordering the production adapter
+            // applies: a settled recorded verdict for the current
+            // `(head, base)` pair is final for the episode and never
+            // re-read; unrecorded pairs and provisional `Unknown`
+            // verdicts are checked first, least recently recorded
+            // first, so the deferred tail is reached on a later pass.
+            let mut candidates: Vec<(i64, &String, &WorkId, &ChangeRequestRef)> = Vec::new();
             for (sibling_id, (sibling_work, sibling)) in &owners {
-                if rechecked >= MAX_CONFLICT_RECHECKS_PER_PASS {
-                    report.deferred.push(format!("merge-siblings:{change_id}"));
-                    break;
-                }
-                if let Some(d) = deadline
-                    && clock() >= d
-                {
-                    report.deferred.push(format!("merge-siblings:{change_id}"));
-                    break;
-                }
                 if sibling_id == change_id {
                     continue;
                 }
@@ -2394,11 +2391,43 @@ impl FixtureGithub {
                 if sibling_target != target_branch {
                     continue;
                 }
+                if !self.change_mergeability.contains_key(sibling_id) {
+                    continue;
+                }
+                let Some(sibling_head_object) = self.changes.get(sibling_id) else {
+                    continue;
+                };
+                let recorded = latest_recorded_mergeability(
+                    store,
+                    sibling_work,
+                    sibling,
+                    sibling_head_object,
+                    &base,
+                )?;
+                let key = match recorded {
+                    Some((MergeabilityState::Unknown, observed)) => observed,
+                    Some(_) => continue,
+                    None => i64::MIN,
+                };
+                candidates.push((key, sibling_id, sibling_work, sibling));
+            }
+            candidates.sort_by_key(|candidate| candidate.0);
+            for (_, sibling_id, sibling_work, sibling) in candidates {
+                if rechecked >= MAX_CONFLICT_RECHECKS_PER_PASS {
+                    report.deferred.push(format!("merge-siblings:{change_id}"));
+                    break;
+                }
+                if let Some(d) = deadline
+                    && clock() >= d
+                {
+                    report.deferred.push(format!("merge-siblings:{change_id}"));
+                    break;
+                }
                 let Some((state, paths)) = self.change_mergeability.get(sibling_id) else {
                     continue;
                 };
                 // Every verdict read consumes the pass-wide sibling
-                // bound — a re-read of an already-recorded pair is
+                // bound — re-reading a provisional `Unknown` pair is
                 // still a re-check.
                 rechecked += 1;
                 let Some(sibling_head_object) = self.changes.get(sibling_id).cloned() else {
@@ -3445,6 +3474,43 @@ pub(crate) fn latest_recorded_merge(
             _ => None,
         })
         .next_back())
+}
+
+/// The latest recorded `Mergeability` verdict for one exact
+/// `(change, head, base)` pair — its state and the time it was
+/// observed. A settled verdict (mergeable or conflicting) is final for
+/// the pair: the episode model binds both revisions, so any real change
+/// mints a new pair. `Unknown` is a provisional answer a later pass
+/// must resolve. Ordered by observed time then row order — the same
+/// "latest wins" rule the other recorded-fact lookups use.
+pub(crate) fn latest_recorded_mergeability(
+    store: &impl Store,
+    work_id: &WorkId,
+    change: &ChangeRequestRef,
+    head_object: &str,
+    base: &CommitRevision,
+) -> Result<Option<(MergeabilityState, i64)>, StoreError> {
+    let observations = store.transact(|tx| tx.observations_for_work(work_id))?;
+    Ok(observations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, o)| {
+            if let ObservationFact::Mergeability { target, state, .. } = &o.fact {
+                let recorded_base = target
+                    .base
+                    .clone()
+                    .or_else(|| target.target_revision.clone());
+                if target.change == *change
+                    && target.head.object == head_object
+                    && recorded_base.as_ref() == Some(base)
+                {
+                    return Some((o.observed_unix_seconds, index, *state));
+                }
+            }
+            None
+        })
+        .max_by_key(|(observed, index, _)| (*observed, *index))
+        .map(|(observed, _, state)| (state, observed)))
 }
 
 /// The latest recorded `issue` read for one declared source, ordered by

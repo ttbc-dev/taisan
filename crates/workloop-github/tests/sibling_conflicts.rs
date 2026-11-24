@@ -223,12 +223,13 @@ fn a_recorded_merge_rechecks_siblings_and_one_steady_conflict_triggers_once() {
         serde_json::json!(["src/a.rs", "src/b.rs"])
     );
 
-    // A second pass re-observes the same merged state and the same
-    // conflicted pair: no new fact, no second trigger.
+    // A second pass re-observes the same merged state: the conflicted
+    // pair's verdict is already recorded and settled, so it is never
+    // re-read — no new fact, no second trigger.
     let report = fixture
         .refresh_sources(&store, &config, &mut || NOW + 1, None, None)
         .unwrap();
-    assert_eq!(report.sibling_conflicts, 1);
+    assert_eq!(report.sibling_conflicts, 0);
     assert_eq!(mergeability_facts(&store, &sibling_work), 1);
     assert_eq!(fix_requests(&store, &sibling_work), 1);
 }
@@ -307,13 +308,14 @@ fn historical_merges_on_one_target_are_scanned_once() {
     assert_eq!(mergeability_facts(&store, &sibling_work), 1);
     assert_eq!(fix_requests(&store, &sibling_work), 1);
 
-    // A later pass still scans the target once and never mints a second
-    // trigger for the steady conflicted pair.
+    // A later pass still scans the target once, but the steady
+    // conflicted pair's recorded verdict is settled: it is never
+    // re-read, so no second trigger can mint.
     let report = fixture
         .refresh_sources(&store, &config, &mut || NOW + 1, None, None)
         .unwrap();
     assert!(report.merge_rechecks <= 2, "{report:?}");
-    assert_eq!(report.sibling_conflicts, 1);
+    assert_eq!(report.sibling_conflicts, 0);
     assert_eq!(mergeability_facts(&store, &sibling_work), 1);
     assert_eq!(fix_requests(&store, &sibling_work), 1);
 }
@@ -396,7 +398,9 @@ fn the_production_adapter_does_not_rescan_each_historical_merge() {
         second.merge_rechecks <= 2,
         "a recorded merge is not re-read and the target is scanned once: {second:?}"
     );
-    assert_eq!(second.sibling_conflicts, 1);
+    // The steady conflicted pair's recorded verdict is settled, so the
+    // second pass never re-reads it — no new fact, no second trigger.
+    assert_eq!(second.sibling_conflicts, 0);
     assert_eq!(mergeability_facts(&store, &sibling_work), 1);
     assert_eq!(fix_requests(&store, &sibling_work), 1);
 }
@@ -444,32 +448,15 @@ fn siblings_deferred_by_the_per_pass_bound_are_checked_on_a_later_pass() {
         assert_eq!(fix_requests(&store, work), 0, "sibling {index} waits");
     }
 
-    // A steady pass re-reads the leading siblings, and every verdict
-    // read consumes the per-pass bound — duplicates included — so the
-    // deferred tail keeps waiting while the leading set is unchanged.
+    // A steady pass reaches the deferred tail first: the leading
+    // siblings' recorded verdicts are settled for the same pair, so
+    // they are never re-read and the whole bound lands on the
+    // unrecorded remainder.
     let second = fixture
         .refresh_sources(&store, &config, &mut || NOW + 1, None, None)
         .unwrap();
-    assert_eq!(second.sibling_conflicts, MAX_CONFLICT_RECHECKS_PER_PASS);
-    for (index, work) in works
-        .iter()
-        .enumerate()
-        .skip(MAX_CONFLICT_RECHECKS_PER_PASS)
-    {
-        assert_eq!(mergeability_facts(&store, work), 0, "sibling {index} waits");
-    }
-
-    // The tail is reached once the leading set leaves the open list:
-    // the first repairs landed and those changes merged, so the next
-    // pass's bound reaches the deferred siblings.
-    for index in 0..MAX_CONFLICT_RECHECKS_PER_PASS {
-        fixture.set_merged(&change(&format!("cr-progress-sibling-{index}")));
-    }
-    let third = fixture
-        .refresh_sources(&store, &config, &mut || NOW + 2, None, None)
-        .unwrap();
     assert_eq!(
-        third.sibling_conflicts,
+        second.sibling_conflicts,
         siblings - MAX_CONFLICT_RECHECKS_PER_PASS
     );
     for (index, work) in works.iter().enumerate() {
@@ -484,6 +471,76 @@ fn siblings_deferred_by_the_per_pass_bound_are_checked_on_a_later_pass() {
             "sibling {index} triggers exactly once"
         );
     }
+
+    // With every pair recorded and settled, a steady pass reads nothing
+    // at all — re-reading a settled pair could only re-mint a deduped
+    // fact — even when the leading set has since merged away.
+    for index in 0..MAX_CONFLICT_RECHECKS_PER_PASS {
+        fixture.set_merged(&change(&format!("cr-progress-sibling-{index}")));
+    }
+    let third = fixture
+        .refresh_sources(&store, &config, &mut || NOW + 2, None, None)
+        .unwrap();
+    assert_eq!(third.sibling_conflicts, 0);
+}
+
+#[test]
+fn a_settled_pair_is_not_re_read_but_a_provisional_one_is_resolved() {
+    // Two siblings on one target: one settles Conflicting on the first
+    // pass, the other is still provisional. A settled verdict at an
+    // exact `(head, base)` pair is final for the episode — a later
+    // pass never re-reads it, so a same-pair host change mints
+    // nothing — while a provisional `Unknown` verdict is re-read until
+    // it settles.
+    let store = SqliteStore::in_memory(4).unwrap();
+    let config = config();
+    let merged_work = submit(&store, &config, "settle-merged");
+    let settled_work = submit(&store, &config, "settle-sibling");
+    let pending_work = submit(&store, &config, "pending-sibling");
+    let merged = change("cr-settle-merged");
+    let settled = change("cr-settle-sibling");
+    let pending = change("cr-pending-sibling");
+    record_change(&store, &merged_work, &merged);
+    record_change(&store, &settled_work, &settled);
+    record_change(&store, &pending_work, &pending);
+
+    let mut fixture = FixtureGithub::new();
+    fixture.set_change_head(&merged, "merged-head", &actor());
+    fixture.set_change_head(&settled, "settled-head", &actor());
+    fixture.set_change_head(&pending, "pending-head", &actor());
+    fixture.set_branch(&repo(), "main", "new-base", &actor());
+    fixture.set_merged(&merged);
+    fixture.set_change_mergeability(&settled, MergeabilityState::Conflicting, &["src/a.rs"]);
+    fixture.set_change_mergeability(&pending, MergeabilityState::Unknown, &[]);
+
+    let first = fixture
+        .refresh_sources(&store, &config, &mut || NOW, None, None)
+        .unwrap();
+    assert_eq!(first.sibling_conflicts, 1);
+    assert_eq!(mergeability_facts(&store, &settled_work), 1);
+    assert_eq!(mergeability_facts(&store, &pending_work), 1);
+    assert_eq!(fix_requests(&store, &pending_work), 0);
+
+    fixture.set_change_mergeability(&settled, MergeabilityState::Mergeable, &[]);
+    fixture.set_change_mergeability(&pending, MergeabilityState::Conflicting, &["src/b.rs"]);
+    let second = fixture
+        .refresh_sources(&store, &config, &mut || NOW + 1, None, None)
+        .unwrap();
+    assert_eq!(
+        second.sibling_conflicts, 1,
+        "only the provisional sibling is re-read"
+    );
+    assert_eq!(
+        mergeability_facts(&store, &settled_work),
+        1,
+        "a settled pair is never re-read"
+    );
+    assert_eq!(
+        mergeability_facts(&store, &pending_work),
+        2,
+        "the provisional verdict resolves to a new fact"
+    );
+    assert_eq!(fix_requests(&store, &pending_work), 1);
 }
 
 #[test]
@@ -701,32 +758,15 @@ fn the_production_adapter_makes_progress_on_deferred_siblings() {
         assert_eq!(mergeability_facts(&store, work), 0, "sibling {index} waits");
     }
 
-    // A steady pass re-reads the leading siblings, and every verdict
-    // read consumes the per-pass bound — duplicates included — so the
-    // deferred tail keeps waiting while the leading set is unchanged.
+    // A steady pass reaches the deferred tail first: the leading
+    // siblings' recorded verdicts are settled for the same pair, so
+    // they are never re-read and the whole bound lands on the
+    // unrecorded remainder.
     let second = adapter
         .refresh_sources(&store, &config, &mut || NOW + 1, None, None)
         .unwrap();
-    assert_eq!(second.sibling_conflicts, MAX_CONFLICT_RECHECKS_PER_PASS);
-    for (index, (work, _)) in works
-        .iter()
-        .enumerate()
-        .skip(MAX_CONFLICT_RECHECKS_PER_PASS)
-    {
-        assert_eq!(mergeability_facts(&store, work), 0, "sibling {index} waits");
-    }
-
-    // The tail is reached once the leading set leaves the open list:
-    // the first repairs landed and those pulls merged, so the next
-    // pass's bound reaches the deferred siblings.
-    for (_, pull_id) in works.iter().take(MAX_CONFLICT_RECHECKS_PER_PASS) {
-        adapter.client_mut().set_pull_merged(&repo(), pull_id);
-    }
-    let third = adapter
-        .refresh_sources(&store, &config, &mut || NOW + 2, None, None)
-        .unwrap();
     assert_eq!(
-        third.sibling_conflicts,
+        second.sibling_conflicts,
         works.len() - MAX_CONFLICT_RECHECKS_PER_PASS
     );
     for (index, (work, _)) in works.iter().enumerate() {
@@ -741,6 +781,17 @@ fn the_production_adapter_makes_progress_on_deferred_siblings() {
             "sibling {index} triggers exactly once"
         );
     }
+
+    // With every pair recorded and settled, a steady pass reads nothing
+    // at all — re-reading a settled pair could only re-mint a deduped
+    // fact — even when the leading set has since merged away.
+    for (_, pull_id) in works.iter().take(MAX_CONFLICT_RECHECKS_PER_PASS) {
+        adapter.client_mut().set_pull_merged(&repo(), pull_id);
+    }
+    let third = adapter
+        .refresh_sources(&store, &config, &mut || NOW + 2, None, None)
+        .unwrap();
+    assert_eq!(third.sibling_conflicts, 0);
 }
 
 #[test]

@@ -21,7 +21,10 @@ use crate::identity::{ChangeRequestRef, CommitRevision, DiffTarget};
 /// the whole pass, not per merge: every merge scanned in a pass shares
 /// it, so accumulated merge history cannot multiply the remote reads.
 /// The remainder is left for the next bounded pass rather than walking
-/// an unbounded open-change list.
+/// an unbounded open-change list — and the next pass does reach it:
+/// unrecorded pairs and provisional `Unknown` verdicts are checked
+/// before any settled re-read, so a steady open set cannot starve the
+/// deferred tail.
 pub const MAX_CONFLICT_RECHECKS_PER_PASS: usize = 5;
 
 /// The most target branches one pass may scan for post-merge sibling
