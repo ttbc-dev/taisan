@@ -5041,11 +5041,19 @@ impl<P: ProcessControlPort> Supervisor<P> {
             }
             // Recover from workspace + checkpoints + worker-runtime store.
             let workspace = self.workspace_of(&execution.work_id);
-            let mut recovered: Vec<(RequiredArtifact, PathBuf)> = Vec::new();
+            let mut recovered: Vec<(RequiredArtifact, String, PathBuf)> = Vec::new();
             for invocation in store.transact(|tx| tx.invocations_for_execution(&execution.id))? {
                 for required in &invocation.required_artifacts {
-                    if let Some(dir) = find_artifact(&workspace, &required.path) {
-                        recovered.push((required.clone(), dir));
+                    // A declared path has an fs effect only as its
+                    // normalized porcelain name — a declaration that
+                    // cannot normalize names nothing inside the
+                    // workspace.
+                    let Some(name) = crate::workspace::declared_porcelain_path(&required.path)
+                    else {
+                        continue;
+                    };
+                    if let Some(dir) = find_artifact(&workspace, &name) {
+                        recovered.push((required.clone(), name, dir));
                     }
                 }
             }
@@ -5067,25 +5075,35 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 let v2_manifest = store
                     .transact(|tx| tx.worker_request_body(&invocation.request_id))?
                     .is_some();
-                for (required, dir) in &recovered {
+                for (required, name, dir) in &recovered {
                     if invocation.required_artifacts.contains(required) {
                         // Promote into the workspace root so downstream
                         // evidence paths are uniform. A hit already in
                         // the root needs no copy (copying a file onto
-                        // itself truncates it), and only a verified
-                        // artifact may be reported present.
+                        // itself truncates it), and a symlinked slot is
+                        // never written through — the fact evaluation
+                        // below reports it on its own.
+                        let dest = workspace.join(name);
+                        let dest_is_symlink = std::fs::symlink_metadata(&dest)
+                            .map(|m| m.file_type().is_symlink())
+                            .unwrap_or(false);
                         if dir != &workspace
-                            && std::fs::copy(
-                                dir.join(&required.path),
-                                workspace.join(&required.path),
-                            )
-                            .is_err()
+                            && !dest_is_symlink
+                            && std::fs::copy(dir.join(name), &dest).is_err()
                         {
                             continue;
                         }
-                        let digest =
+                        // Every fact the evidence path can act on is
+                        // reported, not only `Present`: a structural
+                        // `Unfulfillable` lets Core settle the collision
+                        // instead of charging the bounded-recovery bound
+                        // for a slot that can never hold the bound
+                        // manifest. Thinner states stay unreported —
+                        // recovery is still in flight for them.
+                        let state =
                             match artifact_fact(&workspace, required, &invocation, v2_manifest) {
-                                ArtifactFact::Present { digest } => digest,
+                                fact @ (ArtifactFact::Present { .. }
+                                | ArtifactFact::Unfulfillable { .. }) => fact,
                                 _ => continue,
                             };
                         self.report(
@@ -5094,7 +5112,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                             ObservationFact::Artifact {
                                 invocation_id: invocation.id.clone(),
                                 required_artifact: required.kind.clone(),
-                                state: ArtifactFact::Present { digest },
+                                state,
                             },
                             _now_unix_seconds,
                         )?;
@@ -5327,10 +5345,13 @@ fn find_artifact(workspace: &Path, name: &str) -> Option<PathBuf> {
         workspace.join(".artifact-store"),
     ] {
         let candidate = dir.join(name);
-        if candidate.is_file()
-            && std::fs::metadata(&candidate)
-                .map(|m| m.len() > 0)
-                .unwrap_or(false)
+        // symlink_metadata, never metadata: a link's target may live
+        // outside the workspace, and a found artifact is promoted —
+        // following it would read content the declaration never
+        // named. Only a non-empty regular file counts.
+        if std::fs::symlink_metadata(&candidate)
+            .map(|m| m.is_file() && m.len() > 0)
+            .unwrap_or(false)
         {
             return Some(dir);
         }
@@ -5396,14 +5417,25 @@ fn artifact_fact(
     invocation: &Invocation,
     v2_manifest: bool,
 ) -> ArtifactFact {
-    let candidate = workspace.join(&required.path);
-    let artifact_slot = v2_manifest && Path::new(&required.path) == Path::new("artifact.json");
+    // A declared path earns an fs effect only as its normalized
+    // porcelain name: `.` and `//` fold to the same in-tree spelling
+    // the index reports, and a declaration that cannot normalize to a
+    // workspace-relative path — absolute, prefixed, or
+    // parent-traversing — names nothing inside the workspace and is
+    // never evidence.
+    let Some(declared) = crate::workspace::declared_porcelain_path(&required.path) else {
+        return ArtifactFact::Missing;
+    };
+    let candidate = workspace.join(&declared);
+    // The slot test reads the same normalized name: `./artifact.json`
+    // is the slot the shim refuses to rewrite, never a separate path.
+    let artifact_slot = v2_manifest && declared == "artifact.json";
     // Absence is never a collision — an empty slot holds no provable
     // bytes, and an unreadable entry proves nothing either. Only a
     // present tracked file whose bytes are not the bound manifest is
     // `Unfulfillable`; every thinner state stays `missing` so bounded
     // recovery can promote a store copy into the root.
-    let tracked = artifact_slot && artifact_path_tracked(workspace, &required.path);
+    let tracked = artifact_slot && artifact_path_tracked(workspace, &declared);
     let unfulfillable = || ArtifactFact::Unfulfillable {
         reason: format!(
             "workspace-root {} is tracked repository content; the worker shim \
@@ -5412,7 +5444,23 @@ fn artifact_fact(
             required.path
         ),
     };
-    if !candidate.is_file() {
+    // A symlink is never artifact bytes: its target may live outside
+    // the workspace — following it reads content the declaration
+    // never named, and a promotion copy would write through it. A
+    // tracked symlink at the slot is still repository content the
+    // shim never rewrites, so it is the same structural `Unfulfillable`;
+    // an untracked one is a thinner state recovery may replace.
+    let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
+        return ArtifactFact::Missing;
+    };
+    if meta.file_type().is_symlink() {
+        return if tracked {
+            unfulfillable()
+        } else {
+            ArtifactFact::Missing
+        };
+    }
+    if !meta.is_file() {
         return ArtifactFact::Missing;
     }
     let Ok(bytes) = std::fs::read(&candidate) else {
@@ -5959,6 +6007,154 @@ mod tests {
             artifact_fact(&dir, &required, &invocation, true),
             ArtifactFact::Missing
         ));
+    }
+
+    /// The slot is the normalized name, never the raw spelling: a
+    /// `./artifact.json` declaration names the same tracked slot the
+    /// shim refuses to rewrite, so the collision rule applies to it
+    /// identically. A declaration that cannot normalize to a
+    /// workspace-relative path — absolute or parent-traversing —
+    /// produces no fs effect at all: a file planted at the resolved
+    /// outside location is never read, and the evidence is `missing`.
+    #[test]
+    fn the_slot_test_reads_the_normalized_declared_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "artifact-normalized-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&ws)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        let invocation = Invocation {
+            id: InvocationId("inv-normalized".into()),
+            request_id: "req-normalized".into(),
+            execution_id: ExecutionId("e-normalized".into()),
+            role: InvocationRole::Coding,
+            state: InvocationState::Done,
+            process_identity: None,
+            required_artifacts: vec![],
+            evidence_refs: vec![],
+            descendants: vec![],
+        };
+        // The tracked collision under a `.`-prefixed spelling of the
+        // slot: the normalized name is the same `artifact.json`, so the
+        // tracked repository content is `Unfulfillable`, never
+        // `Present` — a raw `Path` equality would have missed it.
+        std::fs::write(ws.join("artifact.json"), "tracked repository content").unwrap();
+        git(&["add", "artifact.json"]);
+        git(&["commit", "-qm", "track artifact.json"]);
+        let dotted = RequiredArtifact {
+            kind: "artifact.json".into(),
+            path: "./artifact.json".into(),
+            expected_digest: None,
+        };
+        assert!(matches!(
+            artifact_fact(&ws, &dotted, &invocation, true),
+            ArtifactFact::Unfulfillable { .. }
+        ));
+        // The same normalization under the v1 rule reads the identical
+        // file — `./` is a spelling, not a different path.
+        assert!(matches!(
+            artifact_fact(&ws, &dotted, &invocation, false),
+            ArtifactFact::Present { .. }
+        ));
+        // A parent-traversing or absolute declaration names nothing
+        // inside the workspace: the planted outside file is never
+        // read, so it can never surface as artifact evidence.
+        std::fs::write(dir.join("artifact.json"), "outside the workspace").unwrap();
+        let traversal = RequiredArtifact {
+            kind: "artifact.json".into(),
+            path: "../artifact.json".into(),
+            expected_digest: None,
+        };
+        assert!(matches!(
+            artifact_fact(&ws, &traversal, &invocation, true),
+            ArtifactFact::Missing
+        ));
+        assert!(matches!(
+            artifact_fact(&ws, &traversal, &invocation, false),
+            ArtifactFact::Missing
+        ));
+        let absolute = RequiredArtifact {
+            kind: "artifact.json".into(),
+            path: dir.join("artifact.json").to_string_lossy().into_owned(),
+            expected_digest: None,
+        };
+        assert!(matches!(
+            artifact_fact(&ws, &absolute, &invocation, true),
+            ArtifactFact::Missing
+        ));
+        assert!(matches!(
+            artifact_fact(&ws, &absolute, &invocation, false),
+            ArtifactFact::Missing
+        ));
+        // A `..`-containing declaration that would resolve back into
+        // the workspace still names nothing: porcelain can never
+        // report it, so even though `a/../artifact.json` exists as an
+        // fs path it is never the slot and never evidence.
+        std::fs::create_dir_all(ws.join("a")).unwrap();
+        let nested = RequiredArtifact {
+            kind: "artifact.json".into(),
+            path: "a/../artifact.json".into(),
+            expected_digest: None,
+        };
+        assert!(matches!(
+            artifact_fact(&ws, &nested, &invocation, true),
+            ArtifactFact::Missing
+        ));
+        assert!(matches!(
+            artifact_fact(&ws, &nested, &invocation, false),
+            ArtifactFact::Missing
+        ));
+        // A symlink at the slot is never followed: while the path is
+        // still tracked the link is repository content the shim never
+        // rewrites — `Unfulfillable`, with the target never read —
+        // and untracked it is a thinner `missing` recovery may
+        // replace. Neither spelling reads the outside file.
+        std::fs::remove_file(ws.join("artifact.json")).unwrap();
+        std::os::unix::fs::symlink(dir.join("artifact.json"), ws.join("artifact.json")).unwrap();
+        let symlinked = RequiredArtifact {
+            kind: "artifact.json".into(),
+            path: "artifact.json".into(),
+            expected_digest: None,
+        };
+        assert!(matches!(
+            artifact_fact(&ws, &symlinked, &invocation, true),
+            ArtifactFact::Unfulfillable { .. }
+        ));
+        git(&["rm", "--cached", "-q", "artifact.json"]);
+        assert!(matches!(
+            artifact_fact(&ws, &symlinked, &invocation, true),
+            ArtifactFact::Missing
+        ));
+        assert!(matches!(
+            artifact_fact(&ws, &symlinked, &invocation, false),
+            ArtifactFact::Missing
+        ));
+        // The recovery scan applies the same no-follow rule: a
+        // symlinked store entry is never a promotion source.
+        let store_dir = ws.join(".artifact-store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::os::unix::fs::symlink(dir.join("artifact.json"), store_dir.join("artifact.json"))
+            .unwrap();
+        std::fs::remove_file(ws.join("artifact.json")).unwrap();
+        assert!(find_artifact(&ws, "artifact.json").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The tracked-path probe reads the workspace's own index under

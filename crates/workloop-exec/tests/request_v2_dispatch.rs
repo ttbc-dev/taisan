@@ -5964,6 +5964,163 @@ fn an_absent_tracked_artifact_json_stays_on_the_recovery_path() {
     );
 }
 
+/// A store copy bound to another producer, promoted onto a tracked
+/// slot, is the same structural refusal the finish path reports: the
+/// slot can never hold this invocation's bound manifest, so the
+/// recovery pass reports `Unfulfillable` instead of dropping it —
+/// the Execution settles `artifact_unfulfillable` at once rather
+/// than charging the bounded-recovery bound into
+/// `artifact_recovery_exhausted`.
+#[test]
+fn a_promoted_foreign_copy_on_a_tracked_slot_fails_unfulfillable() {
+    let root = tmp_root("tracked-artifact-foreign");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    std::fs::write(src.join("artifact.json"), "repository content\n").unwrap();
+    git(&src, &["add", "artifact.json"]);
+    git(&src, &["commit", "-m", "track artifact.json"]);
+    let (w, e, rid) = admit(&store, "v2-tracked-foreign", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "exit-no-artifact", true);
+    sup.consume_requests(&store, NOW).unwrap();
+
+    // The tracked worktree entry is absent while the index still
+    // tracks it, and the runtime's artifact store holds a manifest
+    // bound to a DIFFERENT producer — the stale copy recovery
+    // promotes onto the tracked slot, where it can never become this
+    // invocation's bound evidence.
+    let ws = sup.workspace_of(&w);
+    std::fs::remove_file(ws.join("artifact.json")).unwrap();
+    let store_dir = ws.join(".artifact-store");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    std::fs::write(
+        store_dir.join("artifact.json"),
+        serde_json::json!({
+            "format_version": "taisan.worker.artifact/1",
+            "worker": "taisan-worker-claude",
+            "request_id": "other-execution:inv:0",
+            "invocation_id": "inv-foreign",
+            "status": "success",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    drive_to_done(&sup, &store, &rid);
+
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.state,
+        ExecutionState::Failed,
+        "the structural refusal settles at once: {exec:?}"
+    );
+    assert_eq!(
+        exec.terminal_code.as_deref(),
+        Some("artifact_unfulfillable"),
+        "the collision code is recorded, never recovery-exhausted: {exec:?}"
+    );
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    assert!(
+        store
+            .transact(|tx| tx.observations_for_execution(&e))
+            .unwrap()
+            .iter()
+            .any(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::Artifact {
+                        invocation_id,
+                        state: workloop_core::observation::ArtifactFact::Unfulfillable { .. },
+                        ..
+                    } if invocation_id == &invocation.id
+                )
+            }),
+        "the recovery pass reported the structural refusal to Core"
+    );
+}
+
+/// A symlinked slot is never written through: the store holds this
+/// invocation's bound manifest and recovery would promote it, but the
+/// destination is a symlink a writer could have planted — copying
+/// onto it would overwrite a file outside the workspace. The
+/// promotion is refused, the target is left untouched, and no
+/// evidence is fabricated: the Execution stays on the bounded
+/// recovery path.
+#[test]
+fn a_symlinked_slot_is_never_written_through_by_recovery() {
+    let root = tmp_root("symlink-slot");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, e, rid) = admit(&store, "v2-symlink-slot", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "exit-no-artifact", true);
+    sup.consume_requests(&store, NOW).unwrap();
+
+    // The slot is a symlink pointing at a file outside the workspace,
+    // while the runtime store holds this invocation's bound manifest —
+    // the promotion copy's destination must never follow the link.
+    let ws = sup.workspace_of(&w);
+    let victim = root.join("victim-outside-workspace.json");
+    std::fs::write(&victim, "original content\n").unwrap();
+    std::os::unix::fs::symlink(&victim, ws.join("artifact.json")).unwrap();
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    let store_dir = ws.join(".artifact-store");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    std::fs::write(
+        store_dir.join("artifact.json"),
+        serde_json::json!({
+            "format_version": "taisan.worker.artifact/1",
+            "worker": "taisan-worker-claude",
+            "request_id": rid,
+            "invocation_id": invocation.id.0,
+            "status": "success",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    drive_to_done(&sup, &store, &rid);
+    for _ in 0..20 {
+        if execution(&store, &e).recovery_attempts_used > 0 {
+            break;
+        }
+        sup.run_once(&store, NOW).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "original content\n",
+        "the symlink target outside the workspace is untouched"
+    );
+    assert!(
+        ws.join("artifact.json").is_symlink(),
+        "the slot symlink is never replaced by a copy"
+    );
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "a symlinked slot reports no fabricated evidence: {exec:?}"
+    );
+    assert!(
+        !store
+            .transact(|tx| tx.observations_for_execution(&e))
+            .unwrap()
+            .iter()
+            .any(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::Artifact {
+                        state: ArtifactFact::Present { .. },
+                        ..
+                    }
+                )
+            }),
+        "no Present fact was ever recorded through the link"
+    );
+}
+
 /// Insert a resolved writer bound to `request_id` requiring the
 /// workspace-root `artifact.json` — the durable shape the artifact
 /// gates read when they pick the producing Invocation.
