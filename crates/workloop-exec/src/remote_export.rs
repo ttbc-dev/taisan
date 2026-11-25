@@ -20,7 +20,7 @@ use workloop_core::executor::{ExecutorTransferV1, TransferItemV1, item_content_d
 use workloop_core::store::{Store, StoreError};
 use workloop_core::worker_v2::{
     DispatchRefusal, FailedEvidenceBody, FixOrigin, InvariantSetBody, IssueSnapshotBody,
-    ReviewSourceBody, TaskBody, WorkerRequestV2, goal_body_digest,
+    ReviewSourceBody, TaskBody, VerificationEvidenceBody, WorkerRequestV2, goal_body_digest,
 };
 
 use crate::bodies::{BodyError, BodyStore, CAS_CATEGORY, content_id};
@@ -206,7 +206,11 @@ fn required_inputs(request: &WorkerRequestV2) -> Vec<InputBody> {
                 }
             }
         }
-        TaskBody::InvariantCheck { invariant_set, .. } => {
+        TaskBody::InvariantCheck {
+            invariant_set,
+            verification_evidence,
+            ..
+        } => {
             let set_ref = invariant_set.clone();
             inputs.push(InputBody {
                 name: "invariant-set.json".into(),
@@ -224,6 +228,27 @@ fn required_inputs(request: &WorkerRequestV2) -> Vec<InputBody> {
                     Ok(())
                 }),
             });
+            for (index, evidence) in verification_evidence.iter().enumerate() {
+                let ev = evidence.clone();
+                inputs.push(InputBody {
+                    name: format!("verification-{index}.json"),
+                    path: format!("bodies/verification-evidence/{}", evidence.digest),
+                    expected_bytes: None,
+                    verify: Box::new(move |bytes| {
+                        let body = VerificationEvidenceBody::parse(bytes)
+                            .map_err(|e| format!("verification evidence malformed: {e}"))?;
+                        if body.wire_digest() != ev.digest
+                            || body.evidence_id != ev.evidence_id
+                            || body.kind != ev.kind
+                        {
+                            return Err(
+                                "verification evidence disagrees with the request ref".into()
+                            );
+                        }
+                        Ok(())
+                    }),
+                });
+            }
         }
         TaskBody::CodeReview { review_source, .. } => {
             let source_ref = review_source.clone();

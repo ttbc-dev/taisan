@@ -53,8 +53,8 @@ use workloop_core::{
     worker_v2::{
         FailedEvidenceBody, InvariantSetBody, IssueSnapshotBody, MAX_MEMBER_KEY, MAX_MEMBER_REFS,
         MAX_MEMBER_SUMMARY, MAX_MEMBER_TAG, MAX_REPORT_MEMBERS, ReviewSourceBody, TaskBody,
-        WORKER_DECLARATION_V1_FORMAT, WORKER_REPORT_V2_FORMAT, WORKER_REQUEST_V2_FORMAT,
-        WorkerRequestV2, report_canonical_body, report_v2_digest,
+        VerificationEvidenceBody, WORKER_DECLARATION_V1_FORMAT, WORKER_REPORT_V2_FORMAT,
+        WORKER_REQUEST_V2_FORMAT, WorkerRequestV2, report_canonical_body, report_v2_digest,
     },
 };
 
@@ -629,12 +629,13 @@ fn build_prompt(request: &WorkerRequestV2, input_dir: &Path) -> Result<String, S
         TaskBody::InvariantCheck {
             artifact,
             invariant_set,
+            verification_evidence,
         } => {
             let bytes = read_input(input_dir, "invariant-set.json")?;
             let set = InvariantSetBody::parse(bytes.as_bytes())
                 .map_err(|e| format!("missing_required_input: invariant set: {e:?}"))?;
             let mut p = String::from(
-                "You are an assessor inside a READ-ONLY managed workspace. Do not modify any file. Assess the artifact against every invariant below and report one verdict per invariant.\n\n",
+                "You are an assessor inside a READ-ONLY managed workspace. Do not modify any file. You cannot execute commands — no shell, test runner, or build tool is available to you, and any attempt is denied by the sandbox. Assess the artifact against every invariant below and report one verdict per invariant, judging only from the workspace contents and the recorded evidence supplied here.\n\n",
             );
             p.push_str(&format!(
                 "## Artifact under check\nid: {}\nproduced commit: {}\nmanifest digest: {}\n\n## Invariant set {} (revision {})\n",
@@ -646,6 +647,36 @@ fn build_prompt(request: &WorkerRequestV2, input_dir: &Path) -> Result<String, S
             ));
             for item in &set.items {
                 p.push_str(&format!("- `{item}`\n"));
+            }
+            if verification_evidence.is_empty() {
+                p.push_str(
+                    "\n## Verification evidence\nNo mechanical verification results are recorded for this artifact.\n",
+                );
+            } else {
+                p.push_str(
+                    "\n## Verification evidence\nThe supervisor mechanically ran these commands on an independent checkout of the exact produced commit and recorded the outcomes. This is the command-execution evidence — you cannot run commands yourself, so judge test/pass-style invariants from these records rather than attempting to rerun them.\n",
+                );
+                for (i, evidence) in verification_evidence.iter().enumerate() {
+                    match read_input(input_dir, &format!("verification-{i}.json"))
+                        .ok()
+                        .and_then(|b| VerificationEvidenceBody::parse(b.as_bytes()).ok())
+                    {
+                        Some(body) => p.push_str(&format!(
+                            "- {}. requirement `{}` ran `{:?}` → {}:\n  {}\n",
+                            i + 1,
+                            body.requirement,
+                            body.argv,
+                            body.result,
+                            body.output.chars().take(2000).collect::<String>()
+                        )),
+                        None => p.push_str(&format!(
+                            "- {}. sealed evidence {} ({})\n",
+                            i + 1,
+                            evidence.evidence_id,
+                            evidence.kind
+                        )),
+                    }
+                }
             }
             p.push_str(&format!(
                 "\nInspect the workspace and, for each invariant id, decide `conforms`, `violates`, or `inconclusive`. Report at most {MAX_REPORT_MEMBERS} invariant_items; a longer claim set is rejected. End your reply with exactly one fenced block:\n\n```{RESULT_BLOCK_TAG}\n{{\"invariant_items\":[{{\"id\":\"<invariant id>\",\"verdict\":\"conforms|violates|inconclusive\"}}]}}\n```\n"

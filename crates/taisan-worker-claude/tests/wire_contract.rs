@@ -1219,6 +1219,81 @@ fn invariant_check_conforms_is_success() {
 }
 
 #[test]
+fn invariant_check_prompt_carries_verification_evidence() {
+    let dir = tmp("inv-ev");
+    let fake = fake_runtime(&dir);
+    let ws = workspace(&dir);
+    let block = "```taisan-result\n{\"invariant_items\":[{\"id\":\"tests-pass\",\"verdict\":\"conforms\"}]}\n```";
+    let events = events_file(&dir, &format!("assessed\n\n{block}"), json!({}));
+    let capture = dir.join("prompt.txt");
+    let req = request_json(
+        "invariant_check",
+        json!({
+            "kind": "invariant_check",
+            "artifact": {"artifact_id": "art-1", "manifest_digest": hex(0x11), "produced": hex(0x12)},
+            "invariant_set": {"id": "set-1", "revision": 2, "digest": hex(0x13)},
+            "verification_evidence": [
+                {"evidence_id": "vr-1", "kind": "verification", "digest": hex(0x14)},
+            ],
+        }),
+        &ws,
+        true,
+    );
+    let set = canonical_json(&json!({
+        "format": "taisan.invariant-set/1",
+        "id": "set-1",
+        "revision": 2,
+        "items": ["tests-pass"],
+    }));
+    let evidence = canonical_json(&json!({
+        "format": "taisan.verification-evidence/1",
+        "work_id": "w-1",
+        "artifact_id": "art-1",
+        "evidence_id": "vr-1",
+        "kind": "verification",
+        "requirement": "verification_argv[0]",
+        "argv": ["python3", "-m", "unittest"],
+        "produced": hex(0x12),
+        "result": "pass",
+        "output": "Ran 4 tests in 0.01s\n\nOK",
+    }));
+    let (request_path, _, out_dir) = dispatch(
+        "inv-ev",
+        &req,
+        &[
+            ("invariant-set.json", std::str::from_utf8(&set).unwrap()),
+            (
+                "verification-0.json",
+                std::str::from_utf8(&evidence).unwrap(),
+            ),
+        ],
+    );
+    let out = run_shim(
+        &fake,
+        &request_path,
+        &out_dir,
+        &ws,
+        &[
+            ("FAKE_EVENTS", events.to_str().unwrap()),
+            ("FAKE_PROMPT_CAPTURE", capture.to_str().unwrap()),
+        ],
+    );
+    assert!(out.status.success(), "{:?}", out.stderr);
+    let prompt = fs::read_to_string(&capture).unwrap();
+    // The prompt forbids command execution outright — the read-only
+    // workspace denies every Bash call — and hands the assessor the
+    // supervisor's recorded run instead.
+    assert!(prompt.contains("cannot execute commands"));
+    assert!(prompt.contains("you cannot run commands yourself"));
+    assert!(prompt.contains("verification_argv[0]"));
+    assert!(prompt.contains("python3"));
+    assert!(prompt.contains("Ran 4 tests in 0.01s"));
+    let r = report(&out_dir);
+    assert_eq!(r["status"], "success");
+    assert_eq!(r["invariant_items"][0]["verdict"], "conforms");
+}
+
+#[test]
 fn reader_role_without_result_block_is_typed_failure() {
     let dir = tmp("no-block");
     let fake = fake_runtime(&dir);

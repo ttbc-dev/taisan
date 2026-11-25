@@ -144,6 +144,16 @@ pub struct FailedEvidence {
     pub digest: String,
 }
 
+/// One recorded mechanical verification run an InvariantCheck binds —
+/// any outcome — referenced by the retained body's type-tagged digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationEvidence {
+    pub evidence_id: String,
+    pub kind: String,
+    pub digest: String,
+}
+
 /// What produced the Fix request: an exact sealed review judgment, or
 /// failed verification/invariant evidence for an unpublished artifact.
 /// Member sets are checked against the closed lists below — internally
@@ -192,6 +202,14 @@ pub enum TaskBody {
         /// The exact artifact under check.
         artifact: ArtifactRef,
         invariant_set: InvariantSetRef,
+        /// The supervisor-recorded mechanical verification results for
+        /// the assessed artifact — the evidence a `tests-pass`-style
+        /// judgment reads, since the read-only check runs no commands
+        /// itself. Absent when nothing was recorded so a pre-upgrade
+        /// body re-serializes to the bytes its recorded digest was
+        /// taken over.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        verification_evidence: Vec<VerificationEvidence>,
     },
     CodeReview {
         target: DiffTarget,
@@ -703,6 +721,65 @@ impl FailedEvidenceBody {
     }
 }
 
+/// The retained verification-evidence format: one recorded mechanical
+/// verification run — any outcome — an InvariantCheck judges from. The
+/// durable `VerificationResult` rendered as immutable evidence; a
+/// passing run never wears the failed-evidence tag.
+pub const VERIFICATION_EVIDENCE_FORMAT: &str = "taisan.verification-evidence/1";
+const VERIFICATION_EVIDENCE_DIGEST_TAG: &str = "verification-evidence-v1";
+
+/// One recorded verification run bound into an InvariantCheck request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationEvidenceBody {
+    /// Always [`VERIFICATION_EVIDENCE_FORMAT`]; readers refuse anything else.
+    pub format: String,
+    pub work_id: String,
+    pub artifact_id: String,
+    /// The durable evidence identity (`VerificationEvidence.evidence_id`).
+    pub evidence_id: String,
+    /// The evidence kind — `verification` today.
+    pub kind: String,
+    /// The declared requirement the run was bound to.
+    pub requirement: String,
+    pub argv: Vec<String>,
+    /// The exact commit the run materialized.
+    pub produced: String,
+    /// The recorded outcome token (`pass`, `fail`, `inconclusive`).
+    pub result: String,
+    /// The bounded captured output tail, verbatim.
+    pub output: String,
+}
+
+impl VerificationEvidenceBody {
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        canonical_json(&serde_json::to_value(self).expect("verification evidence serializes"))
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, RequestInvalid> {
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|e| RequestInvalid::Malformed {
+                detail: format!("verification evidence is not JSON: {e}"),
+            })?;
+        let declared = value
+            .get("format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if declared != VERIFICATION_EVIDENCE_FORMAT {
+            return Err(RequestInvalid::VersionUnknown { declared });
+        }
+        serde_json::from_value(value).map_err(|e| RequestInvalid::Malformed {
+            detail: format!("verification evidence malformed: {e}"),
+        })
+    }
+
+    /// The wire digest a `VerificationEvidence.digest` carries.
+    pub fn wire_digest(&self) -> String {
+        sha256_hex(VERIFICATION_EVIDENCE_DIGEST_TAG, &self.canonical_bytes())
+    }
+}
+
 /// Why a request body is not executable. Codes are the closed set the
 /// dispatch record carries (`docs/v0.3.md` §4.3, §9.2); provider prose
 /// never enters a code.
@@ -982,7 +1059,7 @@ fn check_tagged_members(request: &serde_json::Value) -> Result<(), RequestInvali
             "constraints",
             "verification_argv",
         ],
-        "invariant_check" => &["kind", "artifact", "invariant_set"],
+        "invariant_check" => &["kind", "artifact", "invariant_set", "verification_evidence"],
         "code_review" => &["kind", "target", "review_source"],
         _ => {
             return Err(RequestInvalid::Malformed {
@@ -1202,6 +1279,25 @@ impl WorkerRequestV2 {
                 "request.invalid",
                 format!(
                     "verification_argv has {task_verify} commands, budget allows {}",
+                    self.budget.max_verification_commands
+                ),
+            ));
+        }
+        // The check's evidence list rides the same bound: every entry
+        // is one recorded run of a declared verification argv, so a
+        // request can never name more than the command budget.
+        let evidence_len = match &self.task {
+            TaskBody::InvariantCheck {
+                verification_evidence,
+                ..
+            } => verification_evidence.len() as u64,
+            _ => 0,
+        };
+        if evidence_len > self.budget.max_verification_commands {
+            return Err(invalid(
+                "request.invalid",
+                format!(
+                    "verification_evidence has {evidence_len} entries, budget allows {}",
                     self.budget.max_verification_commands
                 ),
             ));
@@ -1835,6 +1931,11 @@ mod tests {
                         revision: 4,
                         digest: "f".repeat(64),
                     },
+                    verification_evidence: vec![VerificationEvidence {
+                        evidence_id: "vr-1".into(),
+                        kind: "verification".into(),
+                        digest: "e".repeat(64),
+                    }],
                 },
             ),
             (
@@ -2073,6 +2174,89 @@ mod tests {
             body.verifies(),
             "a body minted before the finding summary must keep verifying"
         );
+    }
+
+    /// Bodies minted before `verification_evidence` existed carry no
+    /// member for it; an empty list must serialize as absence or every
+    /// pre-upgrade InvariantCheck body stops verifying and its
+    /// in-flight request reads as corrupt.
+    #[test]
+    fn a_body_minted_before_verification_evidence_still_verifies() {
+        let mut request = WorkerRequestV2::parse(DOC_REQUEST.as_bytes()).expect("valid request");
+        request.role = crate::domain::InvocationRole::InvariantCheck;
+        request.required_capabilities.role = crate::domain::InvocationRole::InvariantCheck;
+        request.workspace.read_only = true;
+        request.task = TaskBody::InvariantCheck {
+            artifact: ArtifactRef {
+                artifact_id: "inv-39/artifact.json".into(),
+                manifest_digest: "c".repeat(64),
+                produced: "0123456789abcdef0123456789abcdef01234567".into(),
+            },
+            invariant_set: InvariantSetRef {
+                id: "invariants-core".into(),
+                revision: 4,
+                digest: "f".repeat(64),
+            },
+            verification_evidence: vec![],
+        };
+        let mut value = serde_json::to_value(&request).expect("request serializes");
+        assert!(
+            value["task"].get("verification_evidence").is_none(),
+            "an empty evidence list stays off the wire"
+        );
+        let digest = request_v2_digest(&canonical_minus(&value, "request_digest"));
+        value["request_digest"] = serde_json::Value::String(digest);
+        let bytes = canonical_json(&value);
+        let parsed = WorkerRequestV2::parse(&bytes).expect("pre-upgrade body parses");
+        let TaskBody::InvariantCheck {
+            verification_evidence,
+            ..
+        } = &parsed.task
+        else {
+            panic!("task kind changed on parse");
+        };
+        assert!(verification_evidence.is_empty());
+        let body = WorkerRequestBody {
+            request_id: parsed.request_id.clone(),
+            format_version: WORKER_REQUEST_V2_FORMAT.into(),
+            canonical_body: bytes,
+            body_digest: parsed.digest(),
+        };
+        assert!(
+            body.verifies(),
+            "a body minted before verification evidence must keep verifying"
+        );
+    }
+
+    /// A passing run never wears the failed-evidence tag: the evidence
+    /// reader refuses any other declared format.
+    #[test]
+    fn verification_evidence_refuses_a_foreign_format() {
+        let body = VerificationEvidenceBody {
+            format: VERIFICATION_EVIDENCE_FORMAT.into(),
+            work_id: "w-7".into(),
+            artifact_id: "inv-39/artifact.json".into(),
+            evidence_id: "vr-1".into(),
+            kind: "verification".into(),
+            requirement: "verification_argv[0]".into(),
+            argv: vec!["cargo".into(), "test".into()],
+            produced: "0".repeat(40),
+            result: "pass".into(),
+            output: "test result: ok".into(),
+        };
+        let parsed =
+            VerificationEvidenceBody::parse(&body.canonical_bytes()).expect("evidence body parses");
+        assert_eq!(parsed.wire_digest(), body.wire_digest());
+
+        let mut foreign: serde_json::Value =
+            serde_json::from_slice(&body.canonical_bytes()).unwrap();
+        foreign["format"] = serde_json::Value::String(FAILED_EVIDENCE_FORMAT.into());
+        match VerificationEvidenceBody::parse(&canonical_json(&foreign)) {
+            Err(RequestInvalid::VersionUnknown { declared }) => {
+                assert_eq!(declared, FAILED_EVIDENCE_FORMAT)
+            }
+            other => panic!("expected version_unknown, got {other:?}"),
+        }
     }
 
     #[test]

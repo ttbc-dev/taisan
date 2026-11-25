@@ -35,8 +35,9 @@ use workloop_core::worker_v2::{
     FixOrigin, GoalRef, GroupedIssue, InvariantSetBody, InvariantSetRef, IssueBodyRef,
     IssueSnapshotBody, RequestBase, RequestBudget, RequiredCapabilities, ReviewSourceBody,
     ReviewSourceJudgment, ReviewSourceOccurrence, ReviewSourceRef, ReviewSourceRound, SpecRef,
-    TaskBody, WORKER_REQUEST_V2_FORMAT, WireIssue, WireRepository, WorkerRequestBody,
-    WorkerRequestV2, goal_body_bytes, goal_body_digest,
+    TaskBody, VERIFICATION_EVIDENCE_FORMAT, VerificationEvidence, VerificationEvidenceBody,
+    WORKER_REQUEST_V2_FORMAT, WireIssue, WireRepository, WorkerRequestBody, WorkerRequestV2,
+    goal_body_bytes, goal_body_digest,
 };
 use workloop_store::retention::CategoryLimits;
 
@@ -447,6 +448,10 @@ struct Durable {
     /// Failed mechanical verification results on the predecessor
     /// artifact — the pre-publication fix evidence.
     failed_verification: Vec<VerificationResult>,
+    /// Every recorded verification result on the assessed artifact —
+    /// pass, fail, and inconclusive alike — the machine evidence an
+    /// InvariantCheck judges from.
+    verification: Vec<VerificationResult>,
 }
 
 fn gather(
@@ -488,8 +493,9 @@ fn gather(
         None
     };
 
-    let (target, latest_round, judged_round, failed_verification) = match request.role {
-        InvocationRole::Coding => (None, None, None, vec![]),
+    let (target, latest_round, judged_round, failed_verification, verification) = match request.role
+    {
+        InvocationRole::Coding => (None, None, None, vec![], vec![]),
         InvocationRole::Fix => {
             let Some(handoff) = &handoff else {
                 return Err(refusal(DispatchRefusal::ArtifactUnavailable {
@@ -530,20 +536,24 @@ fn gather(
                 },
                 None => None,
             };
-            (target, latest_round, judged_round, failed)
+            (target, latest_round, judged_round, failed, vec![])
         }
         InvocationRole::InvariantCheck => {
-            if handoff.is_none() {
+            let Some(handoff) = &handoff else {
                 return Err(refusal(DispatchRefusal::ArtifactUnavailable {
                     detail: "no acknowledged artifact handoff for this work".into(),
                 }));
-            }
-            (None, None, None, vec![])
+            };
+            // The check judges from machine evidence: every recorded
+            // verification run on the assessed artifact — pass, fail,
+            // and inconclusive — never just the failures.
+            let verification = tx.verification_results(&handoff.artifact_id)?;
+            (None, None, None, vec![], verification)
         }
         InvocationRole::Review => {
             let target = workloop_core::work::current_target(tx, &work.id)?;
             let latest_round = tx.latest_round(&work.id)?;
-            (target, latest_round, None, vec![])
+            (target, latest_round, None, vec![], vec![])
         }
     };
 
@@ -557,6 +567,7 @@ fn gather(
         latest_round,
         judged_round,
         failed_verification,
+        verification,
     })
 }
 
@@ -857,6 +868,53 @@ pub fn build_request_body(
                     detail: format!("request inputs exceed {MAX_INPUT_TOTAL_BYTES} bytes total"),
                 }));
             }
+            // The machine evidence the read-only check judges from:
+            // every recorded verification run on the assessed
+            // artifact, retained immutably and bound by digest — the
+            // workspace snapshot alone could never replay a test run.
+            let mut verification_evidence = Vec::new();
+            for result in &durable.verification {
+                let body = VerificationEvidenceBody {
+                    format: VERIFICATION_EVIDENCE_FORMAT.into(),
+                    work_id: durable.work.id.0.clone(),
+                    artifact_id: result.artifact_id.clone(),
+                    evidence_id: result.id.clone(),
+                    kind: "verification".into(),
+                    requirement: result.requirement.clone(),
+                    argv: result.argv.clone(),
+                    produced: result.produced.clone(),
+                    result: match result.result {
+                        VerificationOutcome::Pass => "pass".into(),
+                        VerificationOutcome::Fail => "fail".into(),
+                        VerificationOutcome::Inconclusive => "inconclusive".into(),
+                    },
+                    output: result.output.clone(),
+                };
+                let bytes = body.canonical_bytes();
+                let digest = body.wire_digest();
+                let resolved = retain_derived(
+                    &dispatch.bodies,
+                    catalog,
+                    "verification-evidence",
+                    &digest,
+                    &bytes,
+                    now_unix_seconds,
+                    horizon,
+                )?;
+                input_total = input_total.saturating_add(resolved.bytes.len() as u64);
+                if input_total > MAX_INPUT_TOTAL_BYTES {
+                    return Err(refusal(DispatchRefusal::BodyOversize {
+                        detail: format!(
+                            "request inputs exceed {MAX_INPUT_TOTAL_BYTES} bytes total"
+                        ),
+                    }));
+                }
+                verification_evidence.push(VerificationEvidence {
+                    evidence_id: result.id.clone(),
+                    kind: "verification".into(),
+                    digest,
+                });
+            }
             TaskBody::InvariantCheck {
                 artifact: artifact_ref(handoff)?,
                 invariant_set: InvariantSetRef {
@@ -864,6 +922,7 @@ pub fn build_request_body(
                     revision: set.revision,
                     digest,
                 },
+                verification_evidence,
             }
         }
         InvocationRole::Review => {
@@ -1321,7 +1380,11 @@ pub fn materialize_invocation_io(
             // was proven at build time and the durable request body
             // freezes the identities. Nothing to materialize.
         }
-        TaskBody::InvariantCheck { invariant_set, .. } => {
+        TaskBody::InvariantCheck {
+            invariant_set,
+            verification_evidence,
+            ..
+        } => {
             let path = format!("bodies/invariant-set/{}", invariant_set.digest);
             let resolved = resolve_ref(
                 &dispatch.bodies,
@@ -1353,6 +1416,39 @@ pub fn materialize_invocation_io(
                 .bodies
                 .materialize_input(&input_dir, "invariant-set.json", &resolved)
                 .map_err(|e| mat_fault(e.to_string()))?;
+            // Verification-evidence bodies: each resolves at its own
+            // digest path and re-verifies identity and kind before it
+            // is written.
+            for (index, evidence) in verification_evidence.iter().enumerate() {
+                let path = format!("bodies/verification-evidence/{}", evidence.digest);
+                let resolved = resolve_ref(
+                    &dispatch.bodies,
+                    catalog,
+                    &path,
+                    None,
+                    |bytes| {
+                        let body = VerificationEvidenceBody::parse(bytes)
+                            .map_err(|e| format!("verification evidence malformed: {e}"))?;
+                        if body.wire_digest() != evidence.digest
+                            || body.evidence_id != evidence.evidence_id
+                            || body.kind != evidence.kind
+                        {
+                            return Err(format!(
+                                "verification evidence {} disagrees with the request ref",
+                                evidence.evidence_id
+                            ));
+                        }
+                        Ok(())
+                    },
+                    DispatchRefusal::EvidenceMissing {
+                        detail: format!("verification evidence {}", evidence.evidence_id),
+                    },
+                )?;
+                dispatch
+                    .bodies
+                    .materialize_input(&input_dir, &format!("verification-{index}.json"), &resolved)
+                    .map_err(|e| mat_fault(e.to_string()))?;
+            }
         }
         TaskBody::CodeReview { review_source, .. } => {
             let path = format!("bodies/review-source/{}", review_source.digest);
