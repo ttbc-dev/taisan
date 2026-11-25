@@ -1121,6 +1121,15 @@ fn run_runtime(
             let _ = child.kill();
         }
     }
+    // A runtime that floods output is stopped, not silenced — and a
+    // post-exit detection still counts. When the child exited before
+    // the in-loop check ran, the drain observed the bound crossing,
+    // so the outcome is the output limit even with nothing left to
+    // kill. `limit` is already set on every kill path, so this only
+    // promotes truncation that outlived the child.
+    if limit.is_none() && log_truncated {
+        limit = Some("output_limit_reached");
+    }
     let exit_status = child.wait().map_err(|e| format!("wait: {e}"))?;
     drop(log);
     let log_digest = sha256_hex(
