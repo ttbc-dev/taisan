@@ -3695,17 +3695,21 @@ fn mark_invocation(
 }
 
 /// Roll back the accounting a refused pre-spawn attempt consumed at
-/// admission: the role-scoped ledgers — the Work-wide fix account and
-/// the Execution review-round ledger — refund so a re-issued dispatch
-/// is charged exactly once. `invocations_used` deliberately stays
-/// charged: every request-creation attempt counts against
-/// `max_invocations`, and the counter mints request ids that must
-/// never repeat.
+/// admission. Admission cleared `next_role` into the minted request and
+/// charged the role-scoped ledgers — the Work-wide fix account and the
+/// Execution review-round ledger — so a launch proven never to have
+/// spawned hands both back: `next_role` re-arms so a `resume` re-issues
+/// the recorded role instead of degrading to `Coding`, and the bounded
+/// ledgers refund so the re-issued dispatch is charged exactly once.
+/// `invocations_used` deliberately stays charged: every request-creation
+/// attempt counts against `max_invocations`, and the counter mints
+/// request ids that must never repeat.
 fn refund_refused_attempt(
     tx: &mut dyn TxView,
     next: &mut Execution,
     role: InvocationRole,
 ) -> Result<(), StoreError> {
+    next.next_role = Some(role.clone());
     match role {
         InvocationRole::Fix => {
             let mut usage = tx
