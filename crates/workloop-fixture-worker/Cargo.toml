@@ -1,7 +1,21 @@
 [package]
 name = "workloop-fixture-worker"
 edition.workspace = true
+description = "deterministic fixture Worker for taisan contract tests"
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+# Required while workspace crates carry no `version` field (0.0.0 →
+# publish = false, which dist otherwise skips); see workloop-cli.
+[package.metadata.dist]
+dist = true
+
+# cargo-binstall manifest for cargo-dist prebuilt archives.
+[package.metadata.binstall]
+pkg-url = "{ repo-url }/releases/download/v{ version }/{ name }-v{ version }-{ target }.{ archive-format }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "txz"
 
 [dependencies]
 serde_json = "1"

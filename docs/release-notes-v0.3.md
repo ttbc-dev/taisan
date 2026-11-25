@@ -155,9 +155,11 @@ Build precedes test because contract tests spawn
 `target/debug/workloop-fixture-worker`. **TODO at freeze:** re-run all
 four gates on the recorded candidate commit and replace this table —
 a freeze never inherits a check record from a different commit. The
-supported build/install route is the source-build path above; **TODO:**
-record packaged-artifact checksums here only if binaries are
-distributed (none are planned by this draft; owner decides).
+supported build/install route is the source-build path above; a
+cargo-dist binary route is wired per #441
+([distribution](distribution.md)) but produces artifacts only once a
+tag is cut. **TODO:** record packaged-artifact checksums here once a
+release produces them.
 
 ## Known limitations
 

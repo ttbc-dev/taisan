@@ -64,6 +64,24 @@ To install the CLI from this checkout:
 cargo install --path crates/workloop-cli --bin taisan
 ```
 
+Prebuilt binaries ship on GitHub Releases for x86_64 and aarch64
+Linux and macOS once a release is published (none exists yet — the
+first tag follows the release process in
+[docs/distribution.md](docs/distribution.md)). Three binary routes
+install the same archives:
+
+```sh
+# shell installer -> ~/.cargo/bin
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/ttbc-dev/taisan/releases/latest/download/workloop-cli-installer.sh | sh
+
+# Homebrew (owner's personal tap)
+brew install shimpeiws/tap/taisan
+
+# cargo-binstall (fetches the prebuilt archive, no compile)
+cargo binstall --git https://github.com/ttbc-dev/taisan workloop-cli
+```
+
 Install the agent skill from this checkout with `npx skills add ./skills/taisan` (or from the registry with `npx skills add ttbc-dev/taisan`); the [skill walkthrough](docs/skill-walkthrough.md) documents setup, installation, invocation, and the direct-CLI fallback with captured output. See the [agent interface requirements](docs/agent-interface.md). The existing TUI remains available with `cargo run -p workloop-tui --bin taisan-tui -- --help` and can be installed with `cargo install --path crates/workloop-tui --bin taisan-tui`; it is not required for v0.1.
 
 The Cargo package names retain their existing names for compatibility. See [name migration](docs/name-migration.md) for legacy commands and state paths.
@@ -88,6 +106,7 @@ The Cargo package names retain their existing names for compatibility. See [name
 - [v0.3 installation and operation](docs/v0.3-installation.md) — clean install, the executable Worker wire, pinned delivery, operation with captured non-live output, cutover, drain, and rollback.
 - [v0.3 owner-run checklist](docs/v0.3-owner-acceptance-checklist.md) — real-Worker acceptance scenarios and expected results.
 - [v0.3 evidence template](docs/v0.3-evidence-template.md) — labeled fixture/contract versus owner-run live evidence for the real-Worker run.
+- [Binary distribution](docs/distribution.md) — the cargo-dist release pipeline, shipped packages, binary install routes, and owner-side release prerequisites.
 - [Decisions and open questions](docs/decisions.md) — assumptions to test before expanding the design.
 - [Provenance](docs/provenance.md) — source-system origins by role, implementation status, and the audit-record pointer.
 

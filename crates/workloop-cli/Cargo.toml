@@ -2,8 +2,35 @@
 name = "workloop-cli"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 default-run = "taisan"
 description = "taisan command-line interface"
+
+# dist settings for this package's release app.
+[package.metadata.dist]
+# Required while workspace crates carry no `version` field: cargo
+# reports them as publish = false (0.0.0) and dist skips them. The
+# real version lands with the #370 freeze.
+dist = true
+# The Homebrew formula is named after the shipped CLI, not the
+# crate-internal package name.
+formula = "taisan"
+# This package also builds the s1-bridge scenario bridge and the
+# legacy-named workloop-cli binary; the override keeps only taisan
+# in the release artifacts and installers.
+[package.metadata.dist.binaries]
+x86_64-apple-darwin = ["taisan"]
+aarch64-apple-darwin = ["taisan"]
+x86_64-unknown-linux-gnu = ["taisan"]
+aarch64-unknown-linux-gnu = ["taisan"]
+
+# cargo-binstall manifest so `cargo binstall --git` fetches the
+# cargo-dist prebuilt archives instead of compiling from source.
+[package.metadata.binstall]
+pkg-url = "{ repo-url }/releases/download/v{ version }/{ name }-v{ version }-{ target }.{ archive-format }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "txz"
 
 [dependencies]
 workloop-config = { path = "../workloop-config" }
