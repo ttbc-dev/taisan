@@ -595,6 +595,57 @@ fn failed_verification(store: &SqliteStore, artifact_id: &str, produced: &str) {
         .unwrap();
 }
 
+/// Record passing, failing, and inconclusive verification results
+/// against the acknowledged artifact — the machine evidence an
+/// InvariantCheck binds regardless of outcome. The record order is
+/// deliberately not the ids' lexical order, and one output overflows
+/// the evidence tail bound, so the test can observe both.
+fn recorded_verification(store: &SqliteStore, artifact_id: &str, produced: &str) {
+    store
+        .transact(|tx| {
+            for (id, requirement, argv, outcome, output) in [
+                (
+                    "vr-b",
+                    "verification_argv[0]",
+                    vec!["cargo".to_string(), "test".to_string()],
+                    VerificationOutcome::Pass,
+                    "test result: ok. 4 passed".to_string(),
+                ),
+                (
+                    "vr-a",
+                    "verification_argv[1]",
+                    vec!["cargo".to_string(), "clippy".to_string()],
+                    VerificationOutcome::Fail,
+                    "error: lint `needless_borrow` failed".to_string(),
+                ),
+                (
+                    "vr-0",
+                    "verification_argv[2]",
+                    vec!["cargo".to_string(), "doc".to_string()],
+                    VerificationOutcome::Inconclusive,
+                    format!("{}RUN-TIMEOUT-MARKER", "padding ".repeat(10_000)),
+                ),
+            ] {
+                let seq = tx.alloc_seq()?;
+                tx.apply(&Effect::InsertVerificationResult {
+                    result: VerificationResult {
+                        id: id.into(),
+                        artifact_id: artifact_id.into(),
+                        requirement: requirement.into(),
+                        argv,
+                        produced: produced.into(),
+                        environment_digest: "env-1".into(),
+                        result: outcome,
+                        output,
+                        recorded_seq: seq,
+                    },
+                })?;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
 /// Seal a review round on the Work's current diff target and record
 /// the exact-set judgment a review-origin Fix binds. `occurrences`
 /// are `(source_key, content_digest)` pairs — `None` mirrors a review
@@ -1513,6 +1564,7 @@ fn invariant_check_binds_the_approved_set_read_only() {
     let TaskBody::InvariantCheck {
         artifact,
         invariant_set,
+        verification_evidence,
     } = &wire.task
     else {
         panic!("expected invariant_check task: {:?}", wire.task)
@@ -1520,6 +1572,10 @@ fn invariant_check_binds_the_approved_set_read_only() {
     assert_eq!(artifact.artifact_id, artifact_id);
     assert_eq!(invariant_set.id, "invariants-1");
     assert_eq!(invariant_set.revision, 1);
+    assert!(
+        verification_evidence.is_empty(),
+        "no recorded results means no evidence member"
+    );
 
     let invocation = invocation_for(&store, &rid1).expect("check invocation");
     let input = invocation_io_root(&root.join("ws"))
@@ -1537,6 +1593,186 @@ fn invariant_check_binds_the_approved_set_read_only() {
         invocation_state(&store, &rid1),
         Some(InvocationState::Done),
         "the check worker resolves Done"
+    );
+}
+
+/// The check judges from machine evidence: every recorded
+/// verification result on the assessed artifact — pass and fail —
+/// rides the wire bound by digest and materializes into the
+/// invocation input. A `tests-pass` verdict never needs the
+/// read-only worker to run the commands itself.
+#[test]
+fn invariant_check_binds_recorded_verification_evidence() {
+    let root = tmp_root("ic-ev");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-icev", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+    recorded_verification(&store, &artifact_id, &produced);
+    // The check runs against a snapshot of the producing workspace —
+    // the durable predecessor implies one exists.
+    std::fs::create_dir_all(sup.workspace_of(&w)).unwrap();
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::InvariantCheck,
+        serde_json::json!({"required_artifacts": []}),
+    );
+
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let wire = WorkerRequestV2::parse(&request_body(&store, &rid1).canonical_body).unwrap();
+    assert!(wire.workspace.read_only, "the check grant is read-only");
+    let TaskBody::InvariantCheck {
+        verification_evidence,
+        ..
+    } = &wire.task
+    else {
+        panic!("expected invariant_check task: {:?}", wire.task)
+    };
+    assert_eq!(
+        verification_evidence.len(),
+        3,
+        "every recorded result binds, whatever its outcome"
+    );
+    // recorded_seq order, not the ids' lexical order.
+    assert_eq!(verification_evidence[0].evidence_id, "vr-b");
+    assert_eq!(verification_evidence[1].evidence_id, "vr-a");
+    assert_eq!(verification_evidence[2].evidence_id, "vr-0");
+    assert!(
+        verification_evidence
+            .iter()
+            .all(|e| e.kind == "verification")
+    );
+
+    // Each ref's digest verifies a retained body, and the
+    // materialized input carries the run's argv, outcome, and
+    // bounded output.
+    let invocation = invocation_for(&store, &rid1).expect("check invocation");
+    let input = invocation_io_root(&root.join("ws"))
+        .join(&invocation.id.0)
+        .join("input");
+    let mut outcomes = Vec::new();
+    for (index, ev) in verification_evidence.iter().enumerate() {
+        let body = VerificationEvidenceBody::parse(
+            &std::fs::read(input.join(format!("verification-{index}.json")))
+                .expect("verification evidence materialized"),
+        )
+        .expect("verification evidence body parses");
+        assert_eq!(body.wire_digest(), ev.digest);
+        assert_eq!(body.evidence_id, ev.evidence_id);
+        assert_eq!(body.produced, produced);
+        assert_eq!(body.artifact_id, artifact_id);
+        if body.result == "inconclusive" {
+            // An over-bound recorded output degrades to its tail —
+            // the marker at the end survives, the padding does not.
+            assert!(body.output.len() <= 64 * 1024);
+            assert!(body.output.ends_with("RUN-TIMEOUT-MARKER"));
+        }
+        outcomes.push(body.result);
+    }
+    assert_eq!(
+        outcomes,
+        vec![
+            "pass".to_string(),
+            "fail".to_string(),
+            "inconclusive".to_string()
+        ]
+    );
+}
+
+/// A retained evidence body whose bytes no longer recompute — or
+/// that is gone entirely between build and launch — refuses the
+/// launch before any process exists: the request's evidence refs are
+/// never served from bytes the catalogue cannot vouch for.
+#[test]
+fn a_tampered_verification_evidence_body_is_refused_before_launch() {
+    let root = tmp_root("ic-ev-tamper");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-icet", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+    recorded_verification(&store, &artifact_id, &produced);
+    std::fs::create_dir_all(sup.workspace_of(&w)).unwrap();
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::InvariantCheck,
+        serde_json::json!({"required_artifacts": []}),
+    );
+
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let body = request_body(&store, &rid1);
+    let wire = WorkerRequestV2::parse(&body.canonical_body).unwrap();
+    let TaskBody::InvariantCheck {
+        verification_evidence,
+        ..
+    } = &wire.task
+    else {
+        panic!("expected invariant_check task: {:?}", wire.task)
+    };
+    let file = state_root.join(format!(
+        "bodies/verification-evidence/{}",
+        verification_evidence[0].digest
+    ));
+    let dispatch = dispatch_profile(&state_root, &src);
+    let retry_id = format!("{rid1}:retry");
+
+    // Corrupted bytes: the catalogue still says `present`, the file
+    // no longer recomputes — a body_corrupt refusal.
+    std::fs::write(&file, b"tampered").unwrap();
+    let err = workloop_exec::request_v2::materialize_invocation_io(
+        &store,
+        &dispatch,
+        &invocation_io_root(&root.join("ws")),
+        &retry_id,
+        &body,
+    )
+    .expect_err("a tampered evidence body refuses the launch");
+    assert!(
+        matches!(
+            err,
+            workloop_exec::request_v2::MaterializeError::Refusal(
+                DispatchRefusal::BodyCorrupt { .. }
+            )
+        ),
+        "expected body_corrupt refusal, got {err:?}"
+    );
+
+    // Reclaimed bytes: the catalogue row outlives the file — an
+    // evidence_missing refusal.
+    std::fs::remove_file(&file).unwrap();
+    let err = workloop_exec::request_v2::materialize_invocation_io(
+        &store,
+        &dispatch,
+        &invocation_io_root(&root.join("ws")),
+        &retry_id,
+        &body,
+    )
+    .expect_err("a reclaimed evidence body refuses the launch");
+    assert!(
+        matches!(
+            err,
+            workloop_exec::request_v2::MaterializeError::Refusal(
+                DispatchRefusal::EvidenceMissing { .. }
+            )
+        ),
+        "expected evidence_missing refusal, got {err:?}"
     );
 }
 

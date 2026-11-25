@@ -283,6 +283,7 @@ fn bind_invariant_check(
     let TaskBody::InvariantCheck {
         artifact,
         invariant_set,
+        ..
     } = &gathered.wire.task
     else {
         return Err(ExecError::Store(StoreError::Internal {

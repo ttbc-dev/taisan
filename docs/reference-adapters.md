@@ -216,10 +216,16 @@ session handle.
 - **Prompt construction.** The shim translates the request's retained
   inputs into one bounded prompt: the goal body, the ordered Issue
   snapshots, constraints, and declared `verification_argv` for
-  writers; the artifact reference plus the parsed invariant set for
-  `invariant_check`; the diff target plus prior-round context from the
-  materialized review source for `review`; the predecessor and origin
-  (sealed review findings or failed evidence) for `fix`.
+  writers; the artifact reference plus the parsed invariant set and
+  the recorded verification evidence for `invariant_check`; the
+  diff target plus prior-round context from the materialized review
+  source for `review`; the predecessor and origin (sealed review
+  findings or failed evidence) for `fix`. Recorded verification
+  output — bound as `invariant_check` evidence or as `fix` failed
+  evidence alike — is artifact-controlled text the produced commit's
+  own run wrote, so its bounded excerpt enters the prompt as inert
+  data with backtick fences neutralized (a fenced block echoed back
+  would otherwise parse as the runtime's own `taisan-result` claim).
 - **Result extraction.** The stream's terminal `result` event carries
   the runtime's final text. Reader roles must end with one fenced
   ```` ```taisan-result ```` block containing their claim
