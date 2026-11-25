@@ -1081,6 +1081,39 @@ fn a_non_utf8_exclude_still_gains_the_residue_patterns() {
     }
 }
 
+/// A `.git/info/exclude` planted as a symlink is never followed: the
+/// seed opens O_NOFOLLOW, so reuse refuses instead of writing through
+/// to the link target.
+#[test]
+fn a_symlinked_exclude_refuses_and_never_writes_through() {
+    let root = tmp_root("residue-symlink");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, _n) = git_source(&root);
+    let (w, _e, rid, _r) = coding_fixture(&store, "p-symlink", &base, coding_task(vec![]));
+    let (sup, _layout) = supervisor(&root);
+    sup.prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    let ws = ws_path(&root, &w);
+
+    let victim = root.join("victim.txt");
+    std::fs::write(&victim, "untouched").unwrap();
+    let exclude = ws.join(".git/info/exclude");
+    std::fs::remove_file(&exclude).unwrap();
+    std::os::unix::fs::symlink(&victim, &exclude).unwrap();
+
+    let err = sup
+        .prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            PreparationError::WorkspaceConflict { .. } | PreparationError::Io(_)
+        ),
+        "a symlinked exclude refuses, never writes through: {err:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+}
+
 #[test]
 fn a_retried_request_reuses_a_workspace_holding_declared_output() {
     let root = tmp_root("retry-art");
