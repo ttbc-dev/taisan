@@ -977,6 +977,74 @@ fn declared_untracked_artifacts_are_output_not_dirt() {
     );
 }
 
+/// Issue #449: a worker runtime leaves interpreter caches in the tree
+/// it ran in (`python3 -m unittest` writes `__pycache__/` under every
+/// tested package plus loose `*.pyc`/`*.pyo` files). Residue is
+/// normalized into `.git/info/exclude` — preserved, never deleted — so
+/// reuse proceeds, while genuinely untracked WIP still refuses.
+#[test]
+fn worker_runtime_residue_never_refuses_reuse_but_wip_still_does() {
+    let root = tmp_root("residue");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, _n) = git_source(&root);
+    let (w, _e, rid, _r) = coding_fixture(&store, "p-residue", &base, coding_task(vec![]));
+    let (sup, _layout) = supervisor(&root);
+    sup.prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    let ws = ws_path(&root, &w);
+
+    // A fresh workspace is born carrying the residue excludes.
+    let exclude = std::fs::read_to_string(ws.join(".git/info/exclude")).unwrap();
+    for pattern in ["__pycache__/", "*.pyc", "*.pyo"] {
+        assert!(
+            exclude.lines().any(|line| line == pattern),
+            "{pattern} missing from .git/info/exclude: {exclude}"
+        );
+    }
+
+    // Residue at two package depths plus a loose compiled file: the
+    // same request reuses the tree and nothing is deleted.
+    std::fs::create_dir_all(ws.join("__pycache__")).unwrap();
+    std::fs::write(ws.join("__pycache__/mod.cpython-311.pyc"), "x").unwrap();
+    std::fs::create_dir_all(ws.join("tests/__pycache__")).unwrap();
+    std::fs::write(ws.join("tests/__pycache__/test_mod.cpython-311.pyc"), "x").unwrap();
+    std::fs::write(ws.join("loose.pyc"), "x").unwrap();
+    let prepared = sup
+        .prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    assert_eq!(prepared.path, ws);
+    assert!(
+        ws.join("__pycache__/mod.cpython-311.pyc").exists(),
+        "residue is preserved, never deleted"
+    );
+    assert!(
+        ws.join("tests/__pycache__/test_mod.cpython-311.pyc")
+            .exists()
+    );
+    assert!(ws.join("loose.pyc").exists());
+
+    // A workspace predating the seeded excludes normalizes on the
+    // reuse pass — the upgrade path never needs a rebuild.
+    std::fs::write(ws.join(".git/info/exclude"), "").unwrap();
+    let prepared = sup
+        .prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    assert_eq!(prepared.path, ws);
+    let exclude = std::fs::read_to_string(ws.join(".git/info/exclude")).unwrap();
+    assert!(exclude.lines().any(|line| line == "__pycache__/"));
+
+    // Untracked WIP beside residue still refuses, untouched.
+    std::fs::write(ws.join("wip.txt"), "wip").unwrap();
+    let err = sup
+        .prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap_err();
+    assert!(
+        matches!(err, PreparationError::WorkspaceConflict { .. }),
+        "{err:?}"
+    );
+    assert_eq!(std::fs::read_to_string(ws.join("wip.txt")).unwrap(), "wip");
+}
+
 #[test]
 fn a_retried_request_reuses_a_workspace_holding_declared_output() {
     let root = tmp_root("retry-art");

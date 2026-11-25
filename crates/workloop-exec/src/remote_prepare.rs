@@ -370,6 +370,8 @@ fn build_workspace(
     branch: &str,
 ) -> Result<(), PrepareError> {
     git(staging, &["init"])?;
+    crate::workspace::seed_residue_excludes(&staging.join(".git"))
+        .map_err(|e| fault(format!("seed residue excludes: {e}")))?;
     let src = bundle.to_string_lossy().into_owned();
     git(
         staging,
