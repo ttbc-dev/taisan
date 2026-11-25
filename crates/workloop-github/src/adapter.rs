@@ -48,7 +48,7 @@ use workloop_core::identity::{
 };
 use workloop_core::mergeability::{
     MAX_CONFLICT_RECHECKS_PER_PASS, MAX_MERGE_CHECKS_PER_PASS, MAX_MERGE_RECHECKS_PER_PASS,
-    MergeabilityState,
+    MergeabilityState, bound_conflict_paths,
 };
 use workloop_core::observation::{
     BranchState, CapabilityEntry, CapabilityState, CheckConclusion, Completeness, DeliveryId,
@@ -1524,11 +1524,13 @@ impl<C: GitHubApi> GitHubAdapter<C> {
     }
 
     /// The durable ordering record every issued merge-detection read
-    /// and every consumed merge-scan slot leaves behind: the
-    /// pull-reported or recorded head when it is a usable revision,
-    /// else the last recorded head so the pair still advances the
-    /// least-recently-serviced key. A pair with no usable head at all
-    /// records nothing — there is no truthful head to bind.
+    /// and every consumed merge-scan slot leaves behind: ingest stamps
+    /// the pair's service cursor on the Work's usage row — one bounded
+    /// record per pair, overwritten in place, never a log of services.
+    /// The head is the pull-reported or recorded head when it is a
+    /// usable revision, else the last recorded head so the pair still
+    /// advances the least-recently-serviced key. A pair with no usable
+    /// head at all records nothing — there is no truthful head to bind.
     #[allow(clippy::too_many_arguments)]
     fn record_merge_check(
         &mut self,
@@ -1586,7 +1588,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
     /// [`MAX_MERGE_CHECKS_PER_PASS`] pull reads per pass. Detection
     /// reads and merge scans share one least-recently-serviced
     /// ordering — a consumed detection read and a consumed scan slot
-    /// both leave a durable `MergeCheck` record — so a deferred pair
+    /// both stamp the same durable service cursor — so a deferred pair
     /// is reached on a later pass and a terminal Work's change cannot
     /// re-read unboundedly or starve behind a constant leading set.
     /// The bound orders the candidates, not just their count: siblings
@@ -1622,13 +1624,13 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             /// Sort key: the pair's least-recently-serviced record
             /// position, shared across recorded merges and unmerged
             /// pairs — a consumed detection read and a consumed merge
-            /// scan both leave the same durable `MergeCheck` record, so
+            /// scan both stamp the same durable service record, so
             /// a deferred pair is reached on a later pass (`i64::MIN`
-            /// when never serviced). The observation index breaks the
+            /// when never serviced). The service sequence breaks the
             /// same-second tie, so once every pair is serviced the
             /// rotation keeps moving instead of freezing on a constant
             /// leading set.
-            key: (i64, usize),
+            key: (i64, i64),
             work_id: WorkId,
             change: ChangeRequestRef,
             /// The recorded merge evidence `(head, base, target)` —
@@ -1840,37 +1842,44 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 }
                 continue;
             };
-            self.poll_ingest(
-                store,
-                config,
-                Observation {
-                    delivery: Some(DeliveryId {
-                        scope: DeliveryScope::Host {
-                            host: change.repository.host.clone(),
+            // Only a merge this pass just observed mints evidence: the
+            // recorded fact's base is the target revision observed
+            // immediately after the merge — durable proof that must
+            // never be re-stamped with a later pass's fresh base. The
+            // fresh base still drives the sibling scan below.
+            if newly_detected {
+                self.poll_ingest(
+                    store,
+                    config,
+                    Observation {
+                        delivery: Some(DeliveryId {
+                            scope: DeliveryScope::Host {
+                                host: change.repository.host.clone(),
+                            },
+                            source: "github.merge".into(),
+                            event_id: format!(
+                                "merge:{}:{}@{}:{}",
+                                work_id.0, change, head.object, base.object
+                            ),
+                        }),
+                        subject_work_id: Some(work_id.clone()),
+                        subject_execution_id: None,
+                        fact: ObservationFact::ChangeMerged {
+                            change: change.clone(),
+                            head: head.clone(),
+                            base: base.clone(),
+                            target_branch: target_branch.clone(),
                         },
-                        source: "github.merge".into(),
-                        event_id: format!(
-                            "merge:{}:{}@{}:{}",
-                            work_id.0, change, head.object, base.object
-                        ),
-                    }),
-                    subject_work_id: Some(work_id.clone()),
-                    subject_execution_id: None,
-                    fact: ObservationFact::ChangeMerged {
-                        change: change.clone(),
-                        head: head.clone(),
-                        base: base.clone(),
-                        target_branch: target_branch.clone(),
+                        observed_unix_seconds: now,
                     },
-                    observed_unix_seconds: now,
-                },
-                now,
-            )?;
+                    now,
+                )?;
+            }
             report.merge_rechecks += 1;
             merge_scans += 1;
             scanned_targets.insert(target_branch.clone(), base.clone());
-            // A consumed scan slot leaves the same durable ordering
-            // record a detection read does: the pair sorts behind the
+            // A consumed scan slot stamps the same durable service
+            // cursor a detection read does: the pair sorts behind the
             // never-serviced remainder next pass instead of leading
             // the queue again and starving the deferred tail.
             self.record_merge_check(
@@ -2028,7 +2037,9 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     }
                 };
                 let state = verdict.state;
-                let paths = verdict.conflicting_paths.clone();
+                // The host controls this list: the durable verdict and
+                // any request it mints keep only the bounded leading set.
+                let paths = bound_conflict_paths(&verdict.conflicting_paths);
                 let token = workloop_core::domain::sha256_hex(
                     "mergeability-observation-v1",
                     format!("{:?}:{paths:?}", state).as_bytes(),
@@ -2086,6 +2097,9 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         reason: &str,
         now: i64,
     ) -> Result<(), StoreError> {
+        // The same bound the Conflicting arm applies: the durable fact
+        // keeps only the bounded leading set the host reported.
+        let paths = bound_conflict_paths(&paths);
         let token = workloop_core::domain::sha256_hex(
             "mergeability-unknown-v1",
             format!("{reason}:{paths:?}").as_bytes(),

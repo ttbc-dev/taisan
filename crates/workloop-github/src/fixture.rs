@@ -17,7 +17,7 @@ use workloop_core::identity::{
 };
 use workloop_core::mergeability::{
     MAX_CONFLICT_RECHECKS_PER_PASS, MAX_MERGE_CHECKS_PER_PASS, MAX_MERGE_RECHECKS_PER_PASS,
-    MergeabilityState,
+    MergeabilityState, bound_conflict_paths,
 };
 use workloop_core::observation::{
     BranchState, Completeness, DeliveryId, DeliveryScope, HostActionStatus, IssueState,
@@ -2303,15 +2303,15 @@ impl FixtureGithub {
         // The same bound the production adapter applies to merge
         // detection and merge scans: merged and unmerged recorded
         // changes share one least-recently-serviced ordering — a
-        // consumed detection read and a consumed scan slot both leave
-        // the same durable `MergeCheck` record, so the deferred tail
+        // consumed detection read and a consumed scan slot both stamp
+        // the same durable service cursor, so the deferred tail
         // is reached on a later pass instead of the same leading set
         // re-scanning or re-reading every pass. Scans and detection
         // reads interleave in key order the way the production
         // candidate list does, so a mid-pass deadline defers the same
-        // tail; the observation index breaks the same-second tie so
+        // tail; the service sequence breaks the same-second tie so
         // the rotation keeps moving once every pair is serviced.
-        let mut merge_services: Vec<((i64, usize), WorkId, ChangeRequestRef, bool)> = Vec::new();
+        let mut merge_services: Vec<((i64, i64), WorkId, ChangeRequestRef, bool)> = Vec::new();
         for (owner_work, change) in owners.values() {
             let change_id = change.change_request.as_str();
             let checked =
@@ -2433,44 +2433,51 @@ impl FixtureGithub {
             let Ok(base) = CommitRevision::new(change.repository.clone(), base_object) else {
                 continue;
             };
-            let execution_id = store.transact(|tx| {
-                Ok(tx
-                    .executions_for_work(&owner_work)?
-                    .into_iter()
-                    .max_by_key(|e| e.ordinal)
-                    .map(|e| e.id))
-            })?;
-            self.emit(
-                store,
-                config,
-                Observation {
-                    delivery: Some(DeliveryId {
-                        scope: DeliveryScope::Host {
-                            host: change.repository.host.clone(),
+            // The same rule the production adapter now applies: only a
+            // merge not yet recorded mints evidence. A recorded merge's
+            // base is the durable proof — re-emitting it with this
+            // pass's fresh base would re-stamp the history — but the
+            // fresh base still drives the sibling scan below.
+            if recorded.is_none() {
+                let execution_id = store.transact(|tx| {
+                    Ok(tx
+                        .executions_for_work(&owner_work)?
+                        .into_iter()
+                        .max_by_key(|e| e.ordinal)
+                        .map(|e| e.id))
+                })?;
+                self.emit(
+                    store,
+                    config,
+                    Observation {
+                        delivery: Some(DeliveryId {
+                            scope: DeliveryScope::Host {
+                                host: change.repository.host.clone(),
+                            },
+                            source: "fixture.merge".into(),
+                            event_id: format!(
+                                "merge:{}:{}@{}:{}",
+                                owner_work.0, change_id, head.object, base.object
+                            ),
+                        }),
+                        subject_work_id: Some(owner_work.clone()),
+                        subject_execution_id: execution_id,
+                        fact: ObservationFact::ChangeMerged {
+                            change: change.clone(),
+                            head: head.clone(),
+                            base: base.clone(),
+                            target_branch: target_branch.clone(),
                         },
-                        source: "fixture.merge".into(),
-                        event_id: format!(
-                            "merge:{}:{}@{}:{}",
-                            owner_work.0, change_id, head.object, base.object
-                        ),
-                    }),
-                    subject_work_id: Some(owner_work.clone()),
-                    subject_execution_id: execution_id,
-                    fact: ObservationFact::ChangeMerged {
-                        change: change.clone(),
-                        head: head.clone(),
-                        base: base.clone(),
-                        target_branch: target_branch.clone(),
+                        observed_unix_seconds: now,
                     },
-                    observed_unix_seconds: now,
-                },
-                now,
-            )?;
+                    now,
+                )?;
+            }
             report.merge_rechecks += 1;
             merge_scans += 1;
             scanned_targets.insert(target_branch.clone(), base.clone());
-            // A consumed scan slot leaves the same durable ordering
-            // record a detection read does: the pair sorts behind the
+            // A consumed scan slot stamps the same durable service
+            // cursor a detection read does: the pair sorts behind the
             // never-serviced remainder next pass instead of leading
             // the queue again and starving the deferred tail.
             self.emit(
@@ -2575,6 +2582,9 @@ impl FixtureGithub {
                         .max_by_key(|e| e.ordinal)
                         .map(|e| e.id))
                 })?;
+                // The same bound the production adapter applies: the
+                // durable verdict keeps only the bounded leading set.
+                let paths = bound_conflict_paths(paths);
                 let token = workloop_core::domain::sha256_hex(
                     "fixture-mergeability-v1",
                     format!("{state:?}:{paths:?}").as_bytes(),
@@ -3606,28 +3616,22 @@ pub(crate) fn latest_recorded_merge(
         .next_back())
 }
 
-/// The position of the latest `MergeCheck` observation for one change
-/// — the "least recently serviced" key the bounded merge-detection and
-/// merge-scan sets order by, so the deferred tail is reached. The key
-/// is `(observed time, observation order)`: the time is
-/// second-granular, so the durable append order ties it out and the
-/// servicing rotation keeps moving instead of freezing on a
-/// same-second leading set. Ordered by observed time then row order —
-/// the same "latest wins" rule the other recorded-fact lookups use.
+/// The pair's "last serviced" record — the "least recently serviced"
+/// key the bounded merge-detection and merge-scan sets order by, so
+/// the deferred tail is reached. The key is `(observed time, service
+/// sequence)`: the time is second-granular, so the durable sequence
+/// position ties it out and the servicing rotation keeps moving
+/// instead of freezing on a same-second leading set. The record lives
+/// on the Work's usage row and is overwritten in place on every
+/// service — one bounded record per pair, never a log of services.
 pub(crate) fn latest_recorded_merge_check(
     store: &impl Store,
     work_id: &WorkId,
     change: &ChangeRequestRef,
-) -> Result<Option<(i64, usize)>, StoreError> {
-    let observations = store.transact(|tx| tx.observations_for_work(work_id))?;
-    Ok(observations
-        .iter()
-        .enumerate()
-        .filter_map(|(index, o)| {
-            matches!(&o.fact, ObservationFact::MergeCheck { change: c, .. } if c == change)
-                .then_some((o.observed_unix_seconds, index))
-        })
-        .max_by_key(|(observed, index)| (*observed, *index)))
+) -> Result<Option<(i64, i64)>, StoreError> {
+    Ok(store
+        .transact(|tx| tx.work_usage(work_id))?
+        .and_then(|usage| usage.merge_check_position(change)))
 }
 
 /// The latest recorded `Mergeability` verdict for one exact

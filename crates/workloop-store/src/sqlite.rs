@@ -10,8 +10,8 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `12` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1` through `11`
+//! `PRAGMA user_version` is the format gate: `13` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1` through `12`
 //! must carry the complete recognized schema of its version and
 //! upgrades additively at open; a stamped file whose schema is foreign
 //! or incomplete, an unversioned database with user tables (a slice-0
@@ -48,9 +48,11 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// `10` adds the `recovery_intents.retirement_generation` column (#139);
 /// `11` adds the `worker_request_bodies` canonical-body record for the
 /// versioned executable Worker request (`docs/v0.3.md`, #256);
-/// `12` adds the `finding_occurrences.summary` column (#264).
+/// `12` adds the `finding_occurrences.summary` column (#264);
+/// `13` adds the usage row's per-pair `merge_check_services` cursor,
+/// which replaces the merge-check service record's observation rows.
 /// Older files upgrade additively at open.
-pub(crate) const FORMAT_VERSION: i64 = 12;
+pub(crate) const FORMAT_VERSION: i64 = 13;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -416,7 +418,8 @@ impl SqliteStore {
             // invocation_requests.adapter_binding,
             // work_usage.last_progress_basis,
             // recovery_intents.retirement_generation,
-            // finding_occurrences.summary, and the pin-ledger
+            // finding_occurrences.summary,
+            // work_usage.merge_check_services, and the pin-ledger
             // reconstruction. A crash leaves the old stamp and the
             // migration reruns idempotently (CREATE IF NOT EXISTS; each
             // column check guards a partial ALTER; the ledger insert is
@@ -509,6 +512,18 @@ impl SqliteStore {
                 .map_err(internal)?;
             if !has_occurrence_summary {
                 tx.execute_batch("ALTER TABLE finding_occurrences ADD COLUMN summary TEXT")
+                    .map_err(internal)?;
+            }
+            let has_merge_check_services: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('work_usage') \
+                     WHERE name='merge_check_services')",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(internal)?;
+            if !has_merge_check_services {
+                tx.execute_batch("ALTER TABLE work_usage ADD COLUMN merge_check_services TEXT")
                     .map_err(internal)?;
             }
             // A pre-ledger store recorded protection as the bare
@@ -1358,13 +1373,20 @@ fn usage_from_row(row: &rusqlite::Row<'_>) -> Result<WorkUsage, rusqlite::Error>
         last_progress_basis: row
             .get::<_, Option<String>>(9)?
             .and_then(|s| MaterialProgressBasis::parse(&s)),
+        // NULL on rows migrated from a pre-cursor store — the pair then
+        // sorts least-recently-serviced until its first service lands.
+        merge_check_services: row
+            .get::<_, Option<String>>(10)?
+            .map(|s| de_row(&s))
+            .transpose()?
+            .unwrap_or_default(),
     })
 }
 
 const USAGE_COLS: &str = "work_id, fix_invocations_used, transport_retries_used, \
     equivalent_failure_streak, equivalent_signature, automatic_seconds_used, \
     first_dispatch_unix_seconds, last_progress_unix_seconds, \
-    human_wait_seconds_total, last_progress_basis";
+    human_wait_seconds_total, last_progress_basis, merge_check_services";
 
 fn write_execution(tx: &Tx<'_>, e: &Execution) -> Result<(), StoreError> {
     tx.exec(
@@ -2422,6 +2444,33 @@ impl TxView for Tx<'_> {
         Ok(self.tx.last_insert_rowid())
     }
 
+    fn next_counter(&mut self, name: &str) -> Result<i64, StoreError> {
+        self.exec(
+            "INSERT INTO id_counters (prefix, next) VALUES (?1, 1) \
+             ON CONFLICT(prefix) DO UPDATE SET next = next + 1",
+            params![name],
+        )?;
+        self.tx
+            .query_row(
+                "SELECT next FROM id_counters WHERE prefix=?1",
+                params![name],
+                |r| r.get(0),
+            )
+            .map_err(map_err)
+    }
+
+    fn write_merge_check_services(
+        &mut self,
+        work_id: &WorkId,
+        services: &[MergeCheckService],
+    ) -> Result<(), StoreError> {
+        self.exec(
+            "UPDATE work_usage SET merge_check_services=?2 WHERE work_id=?1",
+            params![work_id.0, json(&services.to_vec())?],
+        )?;
+        Ok(())
+    }
+
     fn alloc_id(&mut self, prefix: &str) -> Result<String, StoreError> {
         self.exec(
             "INSERT INTO id_counters (prefix, next) VALUES (?1, 1) \
@@ -2498,8 +2547,9 @@ impl TxView for Tx<'_> {
                      transport_retries_used, equivalent_failure_streak, \
                      equivalent_signature, automatic_seconds_used, \
                      first_dispatch_unix_seconds, last_progress_unix_seconds, \
-                     human_wait_seconds_total, last_progress_basis) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                     human_wait_seconds_total, last_progress_basis, \
+                     merge_check_services) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                     params![
                         usage.work_id.0,
                         usage.fix_invocations_used,
@@ -2511,6 +2561,7 @@ impl TxView for Tx<'_> {
                         usage.last_progress_unix_seconds,
                         usage.human_wait_seconds_total,
                         usage.last_progress_basis.map(|b| b.as_str()),
+                        json(&usage.merge_check_services)?,
                     ],
                 )?;
             }
@@ -2956,7 +3007,8 @@ impl TxView for Tx<'_> {
                      equivalent_signature=?5, automatic_seconds_used=?6, \
                      first_dispatch_unix_seconds=?7, \
                      last_progress_unix_seconds=?8, \
-                     human_wait_seconds_total=?9, last_progress_basis=?10 \
+                     human_wait_seconds_total=?9, last_progress_basis=?10, \
+                     merge_check_services=?11 \
                      WHERE work_id=?1",
                     params![
                         usage.work_id.0,
@@ -2969,6 +3021,7 @@ impl TxView for Tx<'_> {
                         usage.last_progress_unix_seconds,
                         usage.human_wait_seconds_total,
                         usage.last_progress_basis.map(|b| b.as_str()),
+                        json(&usage.merge_check_services)?,
                     ],
                 )?;
             }

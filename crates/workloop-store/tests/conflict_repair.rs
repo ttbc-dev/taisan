@@ -16,7 +16,8 @@ use workloop_core::identity::{
     RepositoryId, RepositoryRef, RoleBinding, SourceSnapshot,
 };
 use workloop_core::mergeability::{
-    ConflictDisposition, ConflictEpisode, ConflictFixRequest, MergeabilityState, plan_conflict,
+    ConflictDisposition, ConflictEpisode, ConflictFixRequest, MAX_CONFLICT_PATH_CHARS,
+    MAX_CONFLICT_PATHS, MergeabilityState, plan_conflict,
 };
 use workloop_core::observation::{DeliveryId, DeliveryScope, Observation, ObservationFact};
 use workloop_core::projection;
@@ -890,14 +891,18 @@ fn a_resolved_conflict_escalation_does_not_resurface_after_resume() {
     );
 
     // The operator resumes the paused Execution: the hold clears, the
-    // execution requeues. The recorded decision no longer describes an
-    // escalation that could not move the Execution, so it must not
-    // resurface as a ghost Attention for the rest of its lifetime.
+    // execution requeues — production `paused_requeue_effects` also
+    // re-stamps `enqueued_seq`, retiring the queue generation the
+    // escalation was recorded under. The recorded decision no longer
+    // describes an escalation that could not move the Execution, so it
+    // must not resurface as a ghost Attention for the rest of its
+    // lifetime.
     store
         .transact(|tx| {
             let execution = tx.active_execution(&work_id)?.expect("active execution");
             let mut next = execution.clone();
             next.state = ExecutionState::Queued;
+            next.enqueued_seq = tx.alloc_seq()?;
             next.pause_reason = None;
             next.repair_prerequisites = vec![];
             next.paused_since_unix_seconds = None;
@@ -917,5 +922,237 @@ fn a_resolved_conflict_escalation_does_not_resurface_after_resume() {
     assert!(
         value.iter().all(|v| v.reason != "conflict_unresolvable"),
         "a resolved escalation does not resurface after resume: {value:?}"
+    );
+}
+
+#[test]
+fn host_reported_conflict_paths_are_bounded_before_they_reach_durable_state() {
+    // The host controls the path list: an over-limit report must be
+    // trimmed to the same bound the human-facing pause reason applies
+    // before it reaches the request payload, the escalation record, or
+    // the worker prompt — an unbounded report cannot grow durable
+    // state or the prompt without bound.
+    let episode = ConflictEpisode::new(change(), rev("head-1"), rev("base-2")).unwrap();
+    let paths: Vec<String> = (0..40).map(|i| format!("src/path-{i:02}.rs")).collect();
+    let request = ConflictFixRequest::new(episode, paths);
+    assert_eq!(request.paths.len(), MAX_CONFLICT_PATHS);
+    assert_eq!(
+        request.payload["conflicting_paths"],
+        serde_json::json!(request.paths),
+        "the payload carries the same bounded set"
+    );
+
+    // The character cap drops a single over-long entry but keeps the
+    // smaller ones that still fit within the bound.
+    let paths = vec![
+        "x".repeat(MAX_CONFLICT_PATH_CHARS + 1),
+        "src/kept.rs".into(),
+    ];
+    let request = ConflictFixRequest::new(
+        ConflictEpisode::new(change(), rev("head-1"), rev("base-2")).unwrap(),
+        paths,
+    );
+    assert_eq!(request.paths, ["src/kept.rs"]);
+
+    // An unbindable conflict escalates under the same bound.
+    let target = DiffTarget {
+        change: change(),
+        head: rev("head-1"),
+        base: None,
+        target_revision: None,
+    };
+    let paths: Vec<String> = (0..40).map(|i| format!("src/path-{i:02}.rs")).collect();
+    let ConflictDisposition::Escalate(escalation) =
+        plan_conflict(Some(&target), MergeabilityState::Conflicting, &paths, None)
+    else {
+        panic!("missing base must escalate");
+    };
+    assert_eq!(escalation.paths.len(), MAX_CONFLICT_PATHS);
+}
+
+#[test]
+fn a_stored_mergeability_fact_is_bounded_at_the_ingest_boundary() {
+    // The ingest boundary — not the producer — is the choke point: a
+    // Mergeability fact carrying an over-limit path list and a giant
+    // reason must be stored only in bounded form, so any producer that
+    // skips adapter-side construction is still covered.
+    let store = SqliteStore::in_memory(2).unwrap();
+    let config = config();
+    let work_id = submit(&store, &config, "mergeability-sink-bound");
+    let target = DiffTarget {
+        change: change(),
+        head: rev("head-1"),
+        base: Some(rev("base-2")),
+        target_revision: Some(rev("base-2")),
+    };
+    let path_strings: Vec<String> = (0..40).map(|i| format!("src/path-{i:02}.rs")).collect();
+    let path_refs: Vec<&str> = path_strings.iter().map(String::as_str).collect();
+    let mut obs = mergeability(
+        "sink-bound-1",
+        &work_id,
+        target,
+        MergeabilityState::Conflicting,
+        &path_refs,
+    );
+    if let ObservationFact::Mergeability { reason, .. } = &mut obs.fact {
+        *reason = Some("r".repeat(MAX_CONFLICT_PATH_CHARS * 2));
+    }
+    handle_observation(&store, &config, &obs, NOW + 1).unwrap();
+
+    let stored = store
+        .transact(|tx| tx.observations_for_work(&work_id))
+        .unwrap();
+    let ObservationFact::Mergeability {
+        conflicting_paths,
+        reason,
+        ..
+    } = &stored
+        .iter()
+        .find(|o| matches!(o.fact, ObservationFact::Mergeability { .. }))
+        .expect("mergeability observation recorded")
+        .fact
+    else {
+        unreachable!()
+    };
+    assert!(conflicting_paths.len() <= MAX_CONFLICT_PATHS);
+    assert!(
+        conflicting_paths
+            .iter()
+            .map(|p| p.chars().count())
+            .sum::<usize>()
+            <= MAX_CONFLICT_PATH_CHARS
+    );
+    assert_eq!(
+        reason.as_deref().map(|r| r.chars().count()),
+        Some(MAX_CONFLICT_PATH_CHARS),
+        "the stored reason is truncated at the ingest boundary"
+    );
+}
+
+#[test]
+fn a_prior_episode_escalation_does_not_resurface_after_a_later_pause() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let config = config();
+    let work_id = submit(&store, &config, "conflict-ghost-attention");
+    store
+        .transact(|tx| {
+            let execution = tx.active_execution(&work_id)?.expect("active execution");
+            let mut next = execution.clone();
+            next.state = ExecutionState::Paused;
+            next.pause_reason = Some("repair: earlier operator hold".into());
+            next.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
+            next.paused_since_unix_seconds = Some(NOW);
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: execution.state,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    let target = DiffTarget {
+        change: change(),
+        head: rev("head-1"),
+        base: Some(rev("base-2")),
+        target_revision: Some(rev("base-2")),
+    };
+    handle_observation(
+        &store,
+        &config,
+        &mergeability(
+            "conflict-ghost-1",
+            &work_id,
+            target,
+            MergeabilityState::Conflicting,
+            &["src/c.rs"],
+        ),
+        NOW + 1,
+    )
+    .unwrap();
+    let attention = store
+        .transact(|tx| projection::attention(tx, Some(&work_id), NOW + 2))
+        .unwrap();
+    let workloop_core::projection::QueryResult::Found { value, .. } = attention else {
+        panic!("attention projection found");
+    };
+    assert!(
+        value.iter().any(|v| v.reason == "conflict_unresolvable"),
+        "the held escalation surfaces while the Execution stays paused: {value:?}"
+    );
+
+    // The operator resumes: the real resume re-stamps `enqueued_seq`,
+    // so the recorded decision belongs to the hold that just cleared.
+    // A later pause for an unrelated reason is a new episode — the old
+    // decision must not resurface as a ghost Attention on it.
+    store
+        .transact(|tx| {
+            let execution = tx.active_execution(&work_id)?.expect("active execution");
+            let mut next = execution.clone();
+            next.state = ExecutionState::Queued;
+            next.pause_reason = None;
+            next.repair_prerequisites = vec![];
+            next.paused_since_unix_seconds = None;
+            next.enqueued_seq = tx.alloc_seq()?;
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: execution.state,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    store
+        .transact(|tx| {
+            let execution = tx.active_execution(&work_id)?.expect("active execution");
+            let mut next = execution.clone();
+            next.state = ExecutionState::Paused;
+            next.pause_reason = Some("budget exhausted: needs top-up".into());
+            next.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
+            next.paused_since_unix_seconds = Some(NOW + 3);
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: execution.state,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    let attention = store
+        .transact(|tx| projection::attention(tx, Some(&work_id), NOW + 4))
+        .unwrap();
+    let workloop_core::projection::QueryResult::Found { value, .. } = attention else {
+        panic!("attention projection found");
+    };
+    assert!(
+        value.iter().all(|v| v.reason != "conflict_unresolvable"),
+        "a prior-episode escalation does not resurface on a later hold: {value:?}"
+    );
+
+    // A fresh conflict during the new hold is a decision recorded after
+    // the latest queueing: it still surfaces on its own.
+    handle_observation(
+        &store,
+        &config,
+        &mergeability(
+            "conflict-ghost-2",
+            &work_id,
+            DiffTarget {
+                change: change(),
+                head: rev("head-1"),
+                base: Some(rev("base-3")),
+                target_revision: Some(rev("base-3")),
+            },
+            MergeabilityState::Conflicting,
+            &["src/d.rs"],
+        ),
+        NOW + 5,
+    )
+    .unwrap();
+    let attention = store
+        .transact(|tx| projection::attention(tx, Some(&work_id), NOW + 6))
+        .unwrap();
+    let workloop_core::projection::QueryResult::Found { value, .. } = attention else {
+        panic!("attention projection found");
+    };
+    assert!(
+        value.iter().any(|v| v.reason == "conflict_unresolvable"),
+        "a conflict in the current hold still surfaces: {value:?}"
     );
 }

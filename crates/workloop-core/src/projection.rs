@@ -334,9 +334,13 @@ fn attention_views(
     // escalation never surfaces. The derivation only holds while the
     // Execution remains in a state the escalation could not move:
     // resume clears the hold and the recorded decision must not
-    // resurface as a ghost Attention for the rest of its lifetime. A
-    // decision whose detail is already the recorded pause reason is
-    // carried by `paused_judgment` and is not repeated.
+    // resurface as a ghost Attention for the rest of its lifetime.
+    // Every resume/requeue re-stamps `enqueued_seq`, so a decision made
+    // before the current queueing belongs to an already-cleared hold —
+    // only a decision recorded after it can describe the hold the
+    // operator still owes. A decision whose detail is already the
+    // recorded pause reason is carried by `paused_judgment` and is not
+    // repeated.
     if matches!(
         execution.state,
         ExecutionState::Paused | ExecutionState::Stopping
@@ -344,6 +348,7 @@ fn attention_views(
         for decision in tx.recovery_decisions(work_id)? {
             if decision.execution_id.as_ref() != Some(&execution.id)
                 || decision.classification != "conflict_unresolvable"
+                || decision.seq <= execution.enqueued_seq
                 || execution.pause_reason.as_deref() == Some(decision.detail.as_str())
             {
                 continue;

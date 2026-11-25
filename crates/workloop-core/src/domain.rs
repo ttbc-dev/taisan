@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::identity::{HostBinding, IssueRef, RepositoryRef, SourceGate};
+use crate::identity::{
+    ChangeRequestRef, CommitRevision, HostBinding, IssueRef, RepositoryRef, SourceGate,
+};
 use crate::observation::Outcome;
 
 /// Monotonic position in the installation's event log. Orders the queue,
@@ -426,9 +428,79 @@ pub struct WorkUsage {
     /// Total recorded human-decision waiting, subtracted from elapsed
     /// wall time when computing automatic usage.
     pub human_wait_seconds_total: u64,
+    /// The "last serviced" record for each recorded change on the Work
+    /// — one entry per pair, updated in place on every service. The
+    /// merge-detection and merge-scan passes order by it; keeping it
+    /// here instead of the append-only observation log is what lets a
+    /// pass run every poll tick without unbounded growth. `None`-empty
+    /// on rows written before the record existed — a pair with no
+    /// entry simply sorts least-recently-serviced.
+    #[serde(default)]
+    pub merge_check_services: Vec<MergeCheckService>,
+}
+
+/// The durable "last serviced" record for one change on a Work: when
+/// the merge-detection or merge-scan pass last serviced the pair and
+/// the sequence position it consumed. A consumed detection read and a
+/// consumed merge scan record the same position, so one shared
+/// least-recently-serviced ordering rotates the deferred tail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeCheckService {
+    /// The change the service covered.
+    pub change: ChangeRequestRef,
+    /// The revision the service bound — the pull-reported head, the
+    /// recorded merge head, or the last recorded head when the read
+    /// failed or reported an unusable revision. A serviced pair always
+    /// binds a truthful head.
+    pub head: CommitRevision,
+    /// Wall clock of the servicing pass — the coarse half of the
+    /// least-recently-serviced key.
+    pub observed_unix_seconds: i64,
+    /// The sequence position the service consumed — the fine half of
+    /// the key, so services inside one second still order instead of
+    /// freezing on a constant leading set.
+    pub serviced_seq: EventSequence,
 }
 
 impl WorkUsage {
+    /// The pair's least-recently-serviced key
+    /// `(observed, serviced_seq)`, or `None` when the pair has never
+    /// been serviced. `None` sorts before every recorded service.
+    pub fn merge_check_position(&self, change: &ChangeRequestRef) -> Option<(i64, EventSequence)> {
+        self.merge_check_services
+            .iter()
+            .find(|s| s.change == *change)
+            .map(|s| (s.observed_unix_seconds, s.serviced_seq))
+    }
+
+    /// Record one merge-check service for the pair, replacing any
+    /// earlier record — the record is a position, not history.
+    pub fn record_merge_check_service(
+        &mut self,
+        change: &ChangeRequestRef,
+        head: &CommitRevision,
+        observed_unix_seconds: i64,
+        serviced_seq: EventSequence,
+    ) {
+        match self
+            .merge_check_services
+            .iter_mut()
+            .find(|s| s.change == *change)
+        {
+            Some(service) => {
+                service.head = head.clone();
+                service.observed_unix_seconds = observed_unix_seconds;
+                service.serviced_seq = serviced_seq;
+            }
+            None => self.merge_check_services.push(MergeCheckService {
+                change: change.clone(),
+                head: head.clone(),
+                observed_unix_seconds,
+                serviced_seq,
+            }),
+        }
+    }
+
     pub fn new(work_id: &WorkId) -> Self {
         Self {
             work_id: work_id.clone(),
@@ -441,6 +513,7 @@ impl WorkUsage {
             last_progress_unix_seconds: None,
             last_progress_basis: None,
             human_wait_seconds_total: 0,
+            merge_check_services: Vec::new(),
         }
     }
 }

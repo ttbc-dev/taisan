@@ -127,6 +127,61 @@ impl ConflictEpisode {
     }
 }
 
+/// The most conflicting paths one repair request or recorded verdict
+/// retains. The host controls this list: an unbounded path set would
+/// grow the durable request payload and the worker prompt without
+/// bound, so every sink keeps only the leading entries — the same cap
+/// the human-facing pause reason applies.
+pub const MAX_CONFLICT_PATHS: usize = 20;
+
+/// The most characters the retained conflicting paths may total. A
+/// path that would push the retained set past the bound is dropped, so
+/// one giant path cannot starve the smaller ones behind it.
+pub const MAX_CONFLICT_PATH_CHARS: usize = 1024;
+
+/// Bound a host-reported conflicting-path list for retention: at most
+/// [`MAX_CONFLICT_PATHS`] entries whose combined length stays under
+/// [`MAX_CONFLICT_PATH_CHARS`]. The pair revisions are the repair's
+/// authoritative evidence; the path list is advisory and may be a
+/// strict prefix-with-skips of what the host reported.
+pub fn bound_conflict_paths(paths: &[String]) -> Vec<String> {
+    let mut used = 0usize;
+    let mut out = Vec::new();
+    for path in paths {
+        if out.len() >= MAX_CONFLICT_PATHS {
+            break;
+        }
+        let len = path.chars().count();
+        if used + len > MAX_CONFLICT_PATH_CHARS {
+            continue;
+        }
+        used += len;
+        // The host names the files: a path is bounded free text, so
+        // control characters that would reshape the worker prompt's
+        // structure (newlines, escapes) are flattened, never trusted.
+        out.push(
+            path.chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect(),
+        );
+    }
+    out
+}
+
+/// The most characters a host-reported mergeability reason retains —
+/// the same budget the path list gets, since it reaches the same
+/// durable records and human-facing surfaces.
+pub const MAX_MERGEABILITY_REASON_CHARS: usize = MAX_CONFLICT_PATH_CHARS;
+
+/// Bound host free text the way the pause reason is bounded: leading
+/// characters only, control characters flattened.
+pub fn bound_reason_text(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_MERGEABILITY_REASON_CHARS)
+        .collect()
+}
+
 /// The bounded repair trigger: a Fix-class request bound to both the
 /// new target revision and the conflicted head. It carries the exact
 /// pair into the request payload so a worker never repairs a moved
@@ -134,8 +189,9 @@ impl ConflictEpisode {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConflictFixRequest {
     pub episode: ConflictEpisode,
-    /// The files the host reported as conflicting. May be empty when the
-    /// host gives only a verdict; the request still binds both revisions.
+    /// The files the host reported as conflicting, bounded by
+    /// [`bound_conflict_paths`]. May be empty when the host gives only
+    /// a verdict; the request still binds both revisions.
     pub paths: Vec<String>,
     /// The exact task payload. `source_revision`/`target_revision` are
     /// also carried as top-level aliases for consumers that read the
@@ -145,6 +201,7 @@ pub struct ConflictFixRequest {
 
 impl ConflictFixRequest {
     pub fn new(episode: ConflictEpisode, paths: Vec<String>) -> Self {
+        let paths = bound_conflict_paths(&paths);
         let payload = conflict_payload(&episode, &paths);
         Self {
             episode,
@@ -220,7 +277,7 @@ pub fn plan_conflict(
                 .filter(|r| !r.is_empty())
                 .unwrap_or("conflict could not be bound to a source and target revision")
                 .to_string(),
-            paths: paths.to_vec(),
+            paths: bound_conflict_paths(paths),
         }),
     }
 }

@@ -162,13 +162,31 @@ fn record_change(store: &SqliteStore, work: &WorkId, change: &ChangeRequestRef) 
         .unwrap();
 }
 
+/// How many pairs on the Work hold a service record. The merge-check
+/// service is a per-pair cursor on the usage row — one bounded record
+/// per pair, overwritten in place, never an observation per pass.
 fn merge_check_facts(store: &SqliteStore, work: &WorkId) -> usize {
     store
-        .transact(|tx| tx.observations_for_work(work))
+        .transact(|tx| tx.work_usage(work))
         .unwrap()
-        .iter()
-        .filter(|o| matches!(o.fact, ObservationFact::MergeCheck { .. }))
-        .count()
+        .map(|usage| usage.merge_check_services.len())
+        .unwrap_or(0)
+}
+
+/// The Work's service records `(observed, seq)`: the positions the
+/// least-recently-serviced ordering reads, one per serviced pair.
+fn merge_check_positions(store: &SqliteStore, work: &WorkId) -> Vec<(i64, i64)> {
+    store
+        .transact(|tx| tx.work_usage(work))
+        .unwrap()
+        .map(|usage| {
+            usage
+                .merge_check_services
+                .iter()
+                .map(|s| (s.observed_unix_seconds, s.serviced_seq))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Settle the Work's active Execution: a terminal Work owes no head
@@ -1140,10 +1158,11 @@ fn merge_detection_reads_are_bounded_per_pass() {
     assert_eq!(adapter.client().pull_reads(), 3 * MAX_MERGE_CHECKS_PER_PASS);
 
     // A scoped pass detects only the scoped Work's pair: one read,
-    // one check record, nothing observed for the other Works.
+    // its service record re-stamped, nothing recorded for the other
+    // Works.
     let before = works
         .iter()
-        .map(|w| merge_check_facts(&store, w))
+        .map(|w| merge_check_positions(&store, w))
         .collect::<Vec<_>>();
     adapter
         .refresh_sources(&store, &config, &mut || NOW + 3, None, Some(&works[0]))
@@ -1153,12 +1172,18 @@ fn merge_detection_reads_are_bounded_per_pass() {
         3 * MAX_MERGE_CHECKS_PER_PASS + 1
     );
     for (index, work) in works.iter().enumerate() {
-        let expected = before[index] + usize::from(index == 0);
-        assert_eq!(
-            merge_check_facts(&store, work),
-            expected,
-            "a scoped pass observes only the scoped work's pair"
-        );
+        let after = merge_check_positions(&store, work);
+        if index == 0 {
+            assert!(
+                after.first() > before[index].first(),
+                "a scoped pass re-stamps the scoped work's service record"
+            );
+        } else {
+            assert_eq!(
+                after, before[index],
+                "a scoped pass records nothing for another work's pair"
+            );
+        }
     }
 
     // The check record is inert: recorded with no subject execution it
@@ -1278,14 +1303,16 @@ fn a_failed_detection_read_still_advances_the_ordering_key() {
         .refresh_sources(&store, &config, &mut || NOW + 1, None, None)
         .unwrap();
     let checks: Vec<String> = store
-        .transact(|tx| tx.observations_for_work(&deferred))
+        .transact(|tx| tx.work_usage(&deferred))
         .unwrap()
-        .iter()
-        .filter_map(|o| match &o.fact {
-            ObservationFact::MergeCheck { head, .. } => Some(head.object.clone()),
-            _ => None,
+        .map(|usage| {
+            usage
+                .merge_check_services
+                .iter()
+                .map(|s| s.head.object.clone())
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
     assert_eq!(
         checks.len(),
         1,
@@ -1333,12 +1360,18 @@ fn an_unbindable_merged_read_still_advances_the_ordering_key() {
     adapter
         .refresh_sources(&store, &config, &mut || NOW, None, None)
         .unwrap();
+    let first = merge_check_positions(&store, &merged_work);
     adapter
         .refresh_sources(&store, &config, &mut || NOW + 1, None, None)
         .unwrap();
+    let second = merge_check_positions(&store, &merged_work);
     assert_eq!(
-        merge_check_facts(&store, &merged_work),
-        2,
+        second.len(),
+        1,
+        "the service record is one bounded cursor, not a log"
+    );
+    assert!(
+        second > first,
         "every issued detection read advances the ordering key"
     );
     let merges = store
@@ -1599,7 +1632,7 @@ fn the_fixture_does_not_starve_deferred_merge_scans() {
 
 #[test]
 fn same_second_merge_checks_keep_the_scan_rotation_moving() {
-    // A fixed clock stamps every MergeCheck record in the same second:
+    // A fixed clock stamps every service record in the same second:
     // without a durable secondary key the stable order would freeze on
     // the leading set after the first full round and the tail pair
     // would never be re-scanned.
@@ -1662,18 +1695,180 @@ fn same_second_merge_checks_keep_the_scan_rotation_moving() {
         "every recorded merge is serviced once within {passes} passes"
     );
 
-    let before = merge_check_facts(&store, &tail_work);
+    let before = merge_check_positions(&store, &tail_work);
     let mut extra = 0usize;
-    while merge_check_facts(&store, &tail_work) == before && extra < 3 {
+    while merge_check_positions(&store, &tail_work) == before && extra < 3 {
         adapter
             .refresh_sources(&store, &config, &mut || NOW, None, None)
             .unwrap();
         extra += 1;
     }
     assert!(
-        merge_check_facts(&store, &tail_work) > before,
+        merge_check_positions(&store, &tail_work) > before,
         "the tail pair is re-serviced after a full same-second round ({extra} extra passes)"
     );
+}
+
+#[test]
+fn merge_check_services_are_one_bounded_record_not_an_observation_log() {
+    // Repeated detection passes must not grow the durable log: the
+    // service record is a per-pair cursor overwritten in place, so the
+    // only thing a steady pass moves is the pair's position.
+    let store = SqliteStore::in_memory(4).unwrap();
+    let config = config();
+    let mut api = InMemoryGitHub::new();
+    api.seed_branch(&repo(), "main", "old-base");
+    let works = unmerged_works(&store, &config, &mut api, "bounded-check", 1);
+    let work = &works[0];
+
+    let observation_count = |store: &SqliteStore| {
+        store
+            .transact(|tx| tx.observations_for_work(work))
+            .unwrap()
+            .len()
+    };
+    let mut adapter = GitHubAdapter::new(api);
+    adapter
+        .refresh_sources(&store, &config, &mut || NOW, None, None)
+        .unwrap();
+    let first = observation_count(&store);
+    let first_position = merge_check_positions(&store, work);
+    for pass in 1..4i64 {
+        adapter
+            .refresh_sources(&store, &config, &mut || NOW + pass, None, None)
+            .unwrap();
+    }
+    assert_eq!(
+        observation_count(&store),
+        first,
+        "detection passes append nothing to the observation log"
+    );
+    assert_eq!(
+        merge_check_facts(&store, work),
+        1,
+        "the service record stays one bounded cursor"
+    );
+    assert!(
+        merge_check_positions(&store, work) > first_position,
+        "every pass still advances the pair's position"
+    );
+}
+
+#[test]
+fn a_recorded_merge_is_never_re_stamped_with_a_later_base() {
+    // A merge the first pass records binds the target revision observed
+    // at that time; a later pass whose branch advanced still scans the
+    // siblings against the fresh base but must never re-ingest the
+    // recorded merge with the later base.
+    let store = SqliteStore::in_memory(4).unwrap();
+    let config = config();
+    let mut api = InMemoryGitHub::new();
+    let merged_work = submit(&store, &config, "restamp-merged");
+    let sibling_work = submit(&store, &config, "restamp-sibling");
+    api.seed_branch(&repo(), "work/restamp-merged", "restamp-merged-head");
+    api.seed_branch(&repo(), "work/restamp-sibling", "restamp-sibling-head");
+    api.seed_branch(&repo(), "main", "restamp-base-1");
+    let merged_pull = api
+        .open_pull(&repo(), "work/restamp-merged", "main", "restamp-merged", "")
+        .unwrap();
+    let sibling_pull = api
+        .open_pull(
+            &repo(),
+            "work/restamp-sibling",
+            "main",
+            "restamp-sibling",
+            "",
+        )
+        .unwrap();
+    let merged = change(&merged_pull.id);
+    let sibling = change(&sibling_pull.id);
+    record_change(&store, &merged_work, &merged);
+    record_change(&store, &sibling_work, &sibling);
+    ingest_head(
+        &store,
+        &config,
+        &merged_work,
+        &merged,
+        "restamp-merged-head",
+    );
+    ingest_head(
+        &store,
+        &config,
+        &sibling_work,
+        &sibling,
+        "restamp-sibling-head",
+    );
+    finish_execution(&store, &merged_work);
+    api.set_pull_merged(&repo(), &merged_pull.id);
+
+    let merged_pairs = |store: &SqliteStore| -> Vec<(String, String)> {
+        store
+            .transact(|tx| tx.observations_for_work(&merged_work))
+            .unwrap()
+            .iter()
+            .filter_map(|o| match &o.fact {
+                ObservationFact::ChangeMerged { head, base, .. } => {
+                    Some((head.object.clone(), base.object.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let mut adapter = GitHubAdapter::new(api);
+    adapter
+        .refresh_sources(&store, &config, &mut || NOW, None, None)
+        .unwrap();
+    assert_eq!(
+        merged_pairs(&store),
+        vec![(
+            "restamp-merged-head".to_string(),
+            "restamp-base-1".to_string()
+        )],
+        "the merge binds the target revision observed at detection"
+    );
+
+    // The target branch advances; the scan still reads the fresh base —
+    // the sibling verdict binds it — but the recorded merge is durable
+    // proof and is never re-stamped.
+    adapter
+        .client_mut()
+        .seed_branch(&repo(), "main", "restamp-base-2");
+    adapter.client_mut().set_pull_mergeability(
+        &repo(),
+        &sibling_pull.id,
+        Some(false),
+        "dirty",
+        "restamp-base-2",
+        &["src/shared.rs"],
+    );
+    adapter
+        .refresh_sources(&store, &config, &mut || NOW + 1, None, None)
+        .unwrap();
+    assert_eq!(
+        merged_pairs(&store),
+        vec![(
+            "restamp-merged-head".to_string(),
+            "restamp-base-1".to_string()
+        )],
+        "a recorded merge is never re-ingested with a later base"
+    );
+    let sibling_base = store
+        .transact(|tx| tx.observations_for_work(&sibling_work))
+        .unwrap()
+        .iter()
+        .filter_map(|o| match &o.fact {
+            ObservationFact::Mergeability { target, .. } => {
+                target.base.as_ref().map(|b| b.object.clone())
+            }
+            _ => None,
+        })
+        .next_back();
+    assert_eq!(
+        sibling_base.as_deref(),
+        Some("restamp-base-2"),
+        "the sibling scan still binds the fresh base"
+    );
+    assert_eq!(fix_requests(&store, &sibling_work), 1);
 }
 
 #[test]

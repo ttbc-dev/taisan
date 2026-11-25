@@ -869,6 +869,19 @@ pub trait ReadView {
 pub trait TxView: ReadView {
     /// Monotonic durable position; also the queue order key.
     fn alloc_seq(&mut self) -> Result<EventSequence, StoreError>;
+    /// Monotonic counter position for ordering records that must not
+    /// mint an `event_log` row: draws from the same durable `id_counters`
+    /// space as [`TxView::alloc_id`], bumped in place.
+    fn next_counter(&mut self, name: &str) -> Result<i64, StoreError>;
+    /// Overwrites only the merge-check service cursors on the Work's
+    /// usage row — an in-place position update, deliberately not an
+    /// audited [`Effect`]: one bounded cell per Work instead of one
+    /// event row per pair per pass.
+    fn write_merge_check_services(
+        &mut self,
+        work_id: &WorkId,
+        services: &[MergeCheckService],
+    ) -> Result<(), StoreError>;
     /// Installation-scoped unique IDs (fresh UUID-based).
     fn alloc_id(&mut self, prefix: &str) -> Result<String, StoreError>;
 

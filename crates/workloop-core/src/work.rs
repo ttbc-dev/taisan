@@ -19,7 +19,7 @@ use crate::identity::{
 };
 use crate::mergeability::{
     ConflictDisposition, ConflictEpisode, ConflictEscalation, ConflictFixRequest,
-    MergeabilityState, conflict_payload, plan_conflict,
+    MergeabilityState, bound_conflict_paths, bound_reason_text, conflict_payload, plan_conflict,
 };
 use crate::observation::{
     ArtifactFact, BranchState, CheckConclusion, Completeness, HostActionStatus, IssueState,
@@ -2602,6 +2602,45 @@ pub fn handle_observation(
             "stage evidence is Core-authored; ingest cannot write pipeline records".into(),
         ));
     }
+    // The merge-check service record is a position, not history: each
+    // service overwrites the pair's durable least-recently-serviced key
+    // on the Work's usage row. Appending one observation per pair per
+    // pass would grow the log without bound — and the per-pass rescans
+    // with it — so the fact never enters the observation log at all.
+    // The update deliberately bypasses the audited effect path too: a
+    // position write per service must not mint an event_log row either.
+    if let ObservationFact::MergeCheck { change, head } = &obs.fact {
+        let Some(work_id) = &obs.subject_work_id else {
+            return Ok(IngestReceipt::Rejected(
+                "merge-check service record carries no work subject".into(),
+            ));
+        };
+        return store.transact(|tx| {
+            if let Some(mut usage) = tx.work_usage(work_id)? {
+                usage.record_merge_check_service(
+                    change,
+                    head,
+                    obs.observed_unix_seconds,
+                    tx.next_counter("merge-check")?,
+                );
+                tx.write_merge_check_services(work_id, &usage.merge_check_services)?;
+            }
+            Ok(IngestReceipt::Recorded)
+        });
+    }
+    // A host-reported mergeability verdict is untrusted input: its path
+    // list and reason text reach durable records and the worker prompt,
+    // so the fact is normalized at the ingest boundary — covering every
+    // producer, not only adapters that bound their own construction.
+    let normalized;
+    let obs = if matches!(obs.fact, ObservationFact::Mergeability { .. }) {
+        let mut fact_obs = obs.clone();
+        normalize_mergeability_fact(&mut fact_obs.fact);
+        normalized = fact_obs;
+        &normalized
+    } else {
+        obs
+    };
     store
         .transact(|tx| {
             tx.apply(&Effect::InsertObservation {
@@ -3374,6 +3413,23 @@ fn escalate_conflict(
     // source (the very case this escalation records), rolling back
     // the observation instead of recording the hold.
     Ok(())
+}
+
+/// Bound a mergeability fact's host-controlled free text at the ingest
+/// boundary: the stored row, the repair request payload, and the worker
+/// prompt all read only the bounded form.
+fn normalize_mergeability_fact(fact: &mut ObservationFact) {
+    if let ObservationFact::Mergeability {
+        conflicting_paths,
+        reason,
+        ..
+    } = fact
+    {
+        *conflicting_paths = bound_conflict_paths(conflicting_paths);
+        if let Some(reason) = reason {
+            *reason = bound_reason_text(reason);
+        }
+    }
 }
 
 /// A bounded human-facing diagnostic: the reason plus the reported
