@@ -366,6 +366,78 @@ fn fsync_dir(path: &Path) -> Result<(), PreparationError> {
         .map_err(PreparationError::Io)
 }
 
+/// The generated-residue set preparation owns in `.git/info/exclude`:
+/// interpreter caches a worker runtime drops into the tree it ran in
+/// (`python3 -m unittest` leaves `__pycache__/` and `*.pyc`/`*.pyo` at
+/// every tested package). They are by-products of the toolchain, never
+/// declared worker output and never real WIP, so the cleanliness gate
+/// excludes them by name — the bytes stay on disk, nothing is deleted.
+const RESIDUE_EXCLUDE_PATTERNS: &[&str] = &["__pycache__/", "*.pyc", "*.pyo"];
+
+/// Append any missing residue patterns to `.git/info/exclude`.
+/// Idempotent, non-destructive, and committed the same way a receipt
+/// is: O_NOFOLLOW read of the existing list, O_NOFOLLOW create of a
+/// tmp file, rename, dir fsync. Callers run it only where the `.git`
+/// tree is known safe — after `verify_git_dir_safe` on a reused tree,
+/// or on a staging tree `git init` just produced.
+pub(crate) fn seed_residue_excludes(git_dir: &Path) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let info = git_dir.join("info");
+    std::fs::create_dir_all(&info)?;
+    let exclude = info.join("exclude");
+    // Bytes, not text: an existing exclude with non-UTF-8 content stays
+    // byte-preserved — refusing a reusable tree over its encoding would
+    // be a new failure mode preparation never had before.
+    let mut content = Vec::new();
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&exclude)
+    {
+        Ok(mut f) => {
+            f.read_to_end(&mut content)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let missing: Vec<&str> = RESIDUE_EXCLUDE_PATTERNS
+        .iter()
+        .copied()
+        .filter(|pattern| {
+            !content
+                .split(|byte| *byte == b'\n')
+                .any(|line| line == pattern.as_bytes())
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    if !content.is_empty() && !content.ends_with(b"\n") {
+        content.push(b'\n');
+    }
+    for pattern in missing {
+        content.extend_from_slice(pattern.as_bytes());
+        content.push(b'\n');
+    }
+    let tmp = info.join(format!(
+        ".exclude-{}-{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        f.write_all(&content)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &exclude)?;
+    std::fs::File::open(&info).and_then(|f| f.sync_all())
+}
+
 fn read_receipt(control: &Path, work_id: &str) -> Result<Option<Receipt>, PreparationError> {
     let path = receipt_path(control, work_id);
     let meta = match std::fs::symlink_metadata(&path) {
@@ -534,11 +606,14 @@ fn declared_porcelain_path(path: &str) -> Option<String> {
 }
 
 /// The reused-tree invariant: branch, HEAD pin, base anchor, and a
-/// porcelain-clean tree — with one exception. A writer's durable
+/// porcelain-clean tree — with two exceptions. A writer's durable
 /// Invocation declares the artifacts it must produce (`artifact.json`
 /// at the workspace root by default); an untracked file at exactly a
 /// declared workspace-relative path is expected output the previous
-/// round left behind, not WIP, and is tolerated. Anything else — a
+/// round left behind, not WIP, and is tolerated. And interpreter
+/// caches the toolchain dropped (`__pycache__/`, `*.pyc`, `*.pyo`)
+/// are normalized into `.git/info/exclude` — preserved, never deleted —
+/// so residue alone never presents as dirt. Anything else — a
 /// modified, staged, or deleted tracked file, or an untracked path the
 /// Invocation never declared — refuses exactly as before.
 fn verify_existing(
@@ -580,6 +655,10 @@ fn verify_existing(
     {
         return Err(conflict("base anchor differs"));
     }
+    // Normalize generated toolchain residue into the exclude file only
+    // after the pin checks proved this is this request's workspace —
+    // a wrong tree refuses before it is ever written to.
+    seed_residue_excludes(&git_dir).map_err(PreparationError::Io)?;
     // `-z` gives unquoted NUL-terminated v1 records and
     // `--untracked-files=all` lists every untracked file rather than a
     // collapsed `dir/` entry, so a declared artifact nested in a
@@ -935,6 +1014,9 @@ fn build_staging(
     source: &RepositorySource,
 ) -> Result<(), PreparationError> {
     git(staging, &["init"])?;
+    // A workspace is born with the residue excludes in place so
+    // interpreter caches the first writer drops never dirty it.
+    seed_residue_excludes(&staging.join(".git")).map_err(PreparationError::Io)?;
     match predecessor {
         None => {
             let src = source.path.to_string_lossy().into_owned();
