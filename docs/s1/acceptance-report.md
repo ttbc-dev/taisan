@@ -12,6 +12,11 @@ No cell is left unmarked. This report contains **no U6 (alternate
 admission) or U9 (host exchangeability) evidence rows** — those are
 separate acceptance tracks; see [evidence-checklist.md](evidence-checklist.md#boundaries).
 
+> **Private references.** `shimpeiws/coding-worker-smoke` is a private
+> repository — every link and `#N` citation to it in this report
+> resolves only for the owner (they 404 publicly). The name is retained
+> verbatim under the owner publication decision (#438).
+
 `config_digest` is `sha256:<hex>` of the sanitized installation config
 file (`installation.json`). The valid claims in this report cite U8.2/U8.3
 evidence; their digests were taken from the retained files **at the time

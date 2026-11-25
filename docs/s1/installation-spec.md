@@ -5,6 +5,11 @@ acceptance scenario runs. This document prepares configuration; it
 grants no live-execution permission (#113 owns execution and live
 evidence approval).
 
+> **Private references.** `shimpeiws/coding-worker-smoke` is a private
+> repository — every link and `#N` citation to it in this document
+> resolves only for the owner (they 404 publicly). The name is retained
+> verbatim under the owner publication decision (#438).
+
 ## Repository isolation
 
 | Field | Value |

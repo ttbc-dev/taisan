@@ -18,8 +18,9 @@ use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::{
     AssessmentVerdict, BranchState, Completeness, HostActionStatus, IssueState,
-    NormalizedEffectFact, Observation, ObservationFact,
+    NormalizedEffectFact, Observation, ObservationFact, ProcessStateFact,
 };
+use workloop_core::ports::ProcessControlPort;
 use workloop_core::store::{
     BodyCatalog, Effect, HostAction, HostActionIntent, Store, StoreError, TxView,
 };
@@ -2201,6 +2202,242 @@ fn the_invocation_io_sweep_reclaims_orphans_and_keeps_live_trees() {
     }
 }
 
+fn record_terminal_only_v2_invocation(
+    store: &SqliteStore,
+    work_id: &WorkId,
+    execution_id: &ExecutionId,
+    request_id: &str,
+    base: &str,
+) -> (Invocation, InvocationRequest) {
+    let request = store
+        .transact(|tx| tx.request(request_id))
+        .unwrap()
+        .expect("request recorded");
+    let repository = WireRepository {
+        host: "fixture".into(),
+        repository: "repo".into(),
+    };
+    let invocation_id = format!("inv-{request_id}");
+    let mut wire = WorkerRequestV2 {
+        format_version: WORKER_REQUEST_V2_FORMAT.into(),
+        request_id: request_id.into(),
+        invocation_id: invocation_id.clone(),
+        request_digest: String::new(),
+        store_id: store.transact(|tx| tx.store_id()).unwrap().0,
+        work_id: work_id.0.clone(),
+        execution_id: execution_id.0.clone(),
+        role: InvocationRole::Coding,
+        repository: repository.clone(),
+        base: RequestBase {
+            repository,
+            object: base.into(),
+        },
+        spec: SpecRef {
+            revision: 1,
+            digest: store
+                .transact(|tx| tx.spec(work_id, Some(1)))
+                .unwrap()
+                .unwrap()
+                .digest,
+        },
+        workspace: WorkspaceGrant {
+            workspace_id: format!("ws-{}", work_id.0),
+            mount: "/workspace".into(),
+            read_only: false,
+        },
+        budget: RequestBudget {
+            deadline_unix_seconds: NOW + 3600,
+            max_runtime_seconds: 1800,
+            max_turns: 200,
+            max_report_bytes: 1 << 20,
+            max_log_bytes: 1 << 25,
+            max_verification_commands: 8,
+            max_continuation_refs: 4,
+        },
+        required_capabilities: RequiredCapabilities {
+            role: InvocationRole::Coding,
+            protocol_versions: vec![WORKER_REQUEST_V2_FORMAT.into()],
+            capabilities: vec![],
+            resume: "unsupported".into(),
+            verification_egress_hosts: vec![],
+        },
+        continuation: vec![],
+        task: TaskBody::Coding {
+            goal: GoalRef {
+                body_ref: "goal-1".into(),
+                media_type: "text/markdown".into(),
+                bytes: 4,
+                digest: "0".repeat(64),
+            },
+            issues: vec![],
+            constraints: vec![],
+            verification_argv: vec![],
+        },
+    };
+    wire.request_digest = wire.digest();
+    let identity = ProcessIdentity {
+        pid: 4242,
+        started_at: "durable-start".into(),
+        pgid: None,
+    };
+    let invocation = Invocation {
+        id: InvocationId(invocation_id),
+        request_id: request_id.into(),
+        execution_id: execution_id.clone(),
+        role: InvocationRole::Coding,
+        state: InvocationState::Running,
+        process_identity: Some(identity),
+        required_artifacts: vec![],
+        evidence_refs: vec![],
+        descendants: vec![],
+    };
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertWorkerRequestBody {
+                body: WorkerRequestBody {
+                    request_id: request_id.into(),
+                    format_version: WORKER_REQUEST_V2_FORMAT.into(),
+                    canonical_body: wire.to_canonical_bytes(),
+                    body_digest: wire.digest(),
+                },
+            })?;
+            tx.apply(&Effect::InsertInvocation {
+                invocation: invocation.clone(),
+            })?;
+            tx.apply(&Effect::MarkRequestConsumed {
+                request_id: request_id.into(),
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    (invocation, request)
+}
+
+/// A crash between persisting the running identity and reporting
+/// `Running`, followed by a proven exit, must still ingest the bounded
+/// report: the Invocation row's durable identity is the launch
+/// acceptance the lost observation would have recorded. A scoped
+/// `--work` pass must also leave the still-pending out tree alone so a
+/// later pass can collect it.
+#[test]
+fn a_lost_running_report_is_collected_and_survives_a_scoped_io_sweep() {
+    let root = tmp_root("report-lost-running");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (_src, base, _newer) = git_source(&root);
+    let (w, e, rid) = admit(&store, "v2-lost-running", vec![]);
+    let (invocation, _request) = record_terminal_only_v2_invocation(&store, &w, &e, &rid, &base);
+    let io_dir = invocation_io_root(&root.join("ws"))
+        .join(workloop_exec::isolation::sanitize_key(&invocation.id.0));
+    std::fs::create_dir_all(io_dir.join("out")).unwrap();
+    std::fs::write(io_dir.join("out").join("report.json"), b"{}").unwrap();
+
+    // Only the terminal fact for the durable identity is recorded; the
+    // `Running` observation was lost with the crashed pass.
+    record_process_observation(
+        &store,
+        &w,
+        &e,
+        &invocation,
+        ProcessStateFact::Exited,
+        Some(0),
+    );
+    assert!(
+        report_facts(&store, &e).is_empty(),
+        "the terminal fact alone does not collect during the observation transaction"
+    );
+
+    let sup = fixture_sup(
+        PosixProcessControl,
+        root.join("ws"),
+        vec![fixture_bin(), "clean-exit".into()],
+        config(),
+    )
+    .with_body_store(BodyStore::new(state_root.clone()));
+
+    // A pass scoped to another Work defers this pending report, but its
+    // io sweep must not reclaim the out tree before that collection.
+    let other = WorkId("w-unrelated".into());
+    sup.run_once_scoped(&store, NOW, Some(&other), &mut || NOW, Some(NOW + 10))
+        .unwrap();
+    assert!(
+        io_dir.join("out").join("report.json").is_file(),
+        "a pending report's out tree survives a scoped sweep"
+    );
+
+    // The next unscoped pass collects the report from the durable
+    // terminal fact despite the lost `Running` observation. Consume any
+    // follow-on role request first so this pass only exercises the
+    // deferred report collection.
+    for request in store.transact(|tx| tx.pending_requests()).unwrap() {
+        store
+            .transact(|tx| {
+                tx.apply(&Effect::MarkRequestConsumed {
+                    request_id: request.request_id,
+                })
+            })
+            .unwrap();
+    }
+    sup.run_once(&store, NOW).unwrap();
+    let facts = report_facts(&store, &e);
+    let fact = the_report_fact(&facts);
+    assert!(
+        matches!(fact, ObservationFact::WorkerReport { .. }),
+        "the report is ingested from the terminal-plus-durable-identity gate"
+    );
+}
+
+#[test]
+fn a_collector_fault_after_the_terminal_fact_still_reaps_the_child() {
+    let root = tmp_root("report-reap");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (_w, _e, rid) = admit(&store, "v2-report-reap", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    sup.consume_requests(&store, NOW).unwrap();
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    let identity = invocation
+        .process_identity
+        .clone()
+        .expect("the running identity is recorded");
+    let io_dir = invocation_io_root(&root.join("ws"))
+        .join(workloop_exec::isolation::sanitize_key(&invocation.id.0));
+    wait_for(
+        || io_dir.join("out").join("report.json").is_file(),
+        "report.json on disk",
+    );
+    let port = PosixProcessControl;
+    wait_for(
+        || {
+            matches!(
+                port.inspect(&identity),
+                workloop_core::ports::ProcessEvidence::Stopped { .. }
+            )
+        },
+        "worker exit before report collection",
+    );
+
+    // Make report retention fail after the request bodies were
+    // materialized: the CAS bodies root is replaced by a regular file,
+    // so retaining the report body faults. The terminal observation is
+    // committed before collection, so the Invocation resolves `Done`
+    // and no later pass re-enters finish.
+    let bodies = state_root.join("bodies");
+    std::fs::remove_dir_all(&bodies).unwrap();
+    std::fs::write(&bodies, b"not a directory").unwrap();
+    assert!(
+        sup.poll_invocations(&store, NOW).is_err(),
+        "the collector fault surfaces to the pass"
+    );
+    assert!(
+        !std::path::Path::new(&format!("/proc/{}", identity.pid)).exists(),
+        "the proven-stopped child is reaped even though collection failed"
+    );
+}
+
 #[test]
 fn a_leftover_io_tree_from_a_crashed_attempt_is_rebuilt_never_trusted() {
     let root = tmp_root("crash-io");
@@ -3017,6 +3254,68 @@ fn report_facts(store: &SqliteStore, execution_id: &ExecutionId) -> Vec<Observat
         .collect()
 }
 
+/// Record one process observation against an Invocation's recorded
+/// identity for a direct `report_v2::collect` call.
+fn record_process_observation(
+    store: &SqliteStore,
+    work: &WorkId,
+    execution: &ExecutionId,
+    invocation: &Invocation,
+    state: ProcessStateFact,
+    exit_code: Option<i32>,
+) {
+    let identity = invocation
+        .process_identity
+        .as_ref()
+        .map(|i| format!("{}@{}", i.pid, i.started_at))
+        .expect("the writer identity is recorded");
+    handle_observation(
+        store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(work.clone()),
+            subject_execution_id: Some(execution.clone()),
+            fact: ObservationFact::ProcessState {
+                invocation_id: invocation.id.clone(),
+                process_identity: identity,
+                state,
+                exit_code,
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+}
+
+/// Record the two required process observations for a direct
+/// `report_v2::collect` call: the launch-acceptance `Running` fact and
+/// the terminal `Exited` fact for the same recorded identity.
+fn record_required_process_observations(
+    store: &SqliteStore,
+    work: &WorkId,
+    execution: &ExecutionId,
+    invocation: &Invocation,
+) {
+    record_process_observation(
+        store,
+        work,
+        execution,
+        invocation,
+        ProcessStateFact::Running,
+        None,
+    );
+    record_process_observation(
+        store,
+        work,
+        execution,
+        invocation,
+        ProcessStateFact::Exited,
+        Some(0),
+    );
+}
+
 /// Drive passes until the Invocation resolves `Done` — the same loop
 /// the materialization test uses.
 fn drive_to_done(sup: &Supervisor<PosixProcessControl>, store: &SqliteStore, rid: &str) {
@@ -3278,6 +3577,44 @@ fn an_oversize_report_is_invalid_before_parsing() {
     assert_eq!(resolved.bytes.len() as u64, 1 << 20);
 }
 
+/// The declared fan-out ceiling is enforced at ingestion, not only
+/// later by the gate binder: a valid envelope carrying more member
+/// claims than the contract bound is `invalid(report.oversize)` and
+/// retains no parsed claim.
+#[test]
+fn an_oversize_verdict_member_set_is_invalid_at_ingestion() {
+    let flood = serde_json::Value::Array(
+        (0..=MAX_REPORT_MEMBERS)
+            .map(|i| serde_json::json!({"key": format!("f-{i}"), "summary": "s"}))
+            .collect(),
+    )
+    .to_string();
+    let (_store, _state_root, _w, _e, _rid, facts) = run_report_mode(
+        "member-overflow",
+        "clean-exit",
+        &["--report-mode", "findings", "--findings", &flood],
+    );
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport {
+        classification,
+        report,
+        ..
+    } = fact
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        *classification,
+        ReportClassification::Invalid {
+            reasons: vec!["report.oversize".into()]
+        }
+    );
+    assert!(
+        report.as_ref().is_some_and(|r| !r.truncated),
+        "the whole under-byte-bound report is retained as invalid evidence"
+    );
+}
+
 #[test]
 fn a_symlinked_report_is_unsafe_never_followed() {
     let (_store, _state_root, _w, _e, _rid, facts) =
@@ -3456,6 +3793,7 @@ fn duplicate_collection_is_idempotent_and_changed_bytes_are_a_retained_conflict(
         .join(workloop_exec::isolation::sanitize_key(&invocation.id.0));
     let report_path = io_dir.join("out").join("report.json");
     wait_for(|| report_path.is_file(), "report.json on disk");
+    record_required_process_observations(&store, &w, &e, &invocation);
     let bodies = BodyStore::new(state_root.to_path_buf());
     let ws_root = root.join("ws");
     let collect = |store: &SqliteStore| {
@@ -3559,6 +3897,125 @@ fn duplicate_collection_is_idempotent_and_changed_bytes_are_a_retained_conflict(
     drive_to_done(&sup, &store, &rid);
 }
 
+/// Collection is deferred — not failed — until both required process
+/// observations are recorded in order: the launch-acceptance `Running`
+/// fact and then the terminal `Exited` fact for the same identity.
+#[test]
+fn report_collection_is_deferred_until_required_process_observations_exist() {
+    let root = tmp_root("report-gate-observations");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, e, rid) = admit(&store, "v2-report-gate-observations", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    sup.consume_requests(&store, NOW).unwrap();
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    let request = store
+        .transact(|tx| tx.request(&rid))
+        .unwrap()
+        .expect("request recorded");
+    let io_dir = invocation_io_root(&root.join("ws"))
+        .join(workloop_exec::isolation::sanitize_key(&invocation.id.0));
+    wait_for(
+        || io_dir.join("out").join("report.json").is_file(),
+        "report.json on disk",
+    );
+    let bodies = BodyStore::new(state_root.to_path_buf());
+    let ws_root = root.join("ws");
+    let collect = |store: &SqliteStore| {
+        workloop_exec::report_v2::collect(
+            store,
+            Some(&bodies),
+            &ws_root,
+            &invocation,
+            &request,
+            NOW,
+        )
+    };
+
+    // No observations yet: the report file exists but is not ingested.
+    assert!(
+        collect(&store).unwrap().is_none(),
+        "collection is deferred before launch acceptance"
+    );
+
+    // Launch acceptance alone is not enough — a live writer's bytes
+    // must not be read as final evidence.
+    record_process_observation(&store, &w, &e, &invocation, ProcessStateFact::Running, None);
+    assert!(
+        collect(&store).unwrap().is_none(),
+        "collection is deferred until the terminal observation"
+    );
+
+    // The terminal fact for the same identity makes the gate ready.
+    record_process_observation(
+        &store,
+        &w,
+        &e,
+        &invocation,
+        ProcessStateFact::Exited,
+        Some(0),
+    );
+    let fact = collect(&store)
+        .unwrap()
+        .expect("both required observations make collection ready");
+    let ObservationFact::WorkerReport {
+        classification,
+        report,
+        ..
+    } = &fact
+    else {
+        panic!("expected WorkerReport, got {fact:?}")
+    };
+    assert_eq!(*classification, ReportClassification::Success);
+    assert!(report.is_some(), "the validated report is retained");
+}
+
+/// A pass that crashed after committing the terminal observation but
+/// before ingesting the report leaves a durable candidate the next pass
+/// collects — the terminal fact is the deferral point, never a lost
+/// report.
+#[test]
+fn a_crash_between_terminal_observation_and_collection_is_retried() {
+    let root = tmp_root("report-retry");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, e, rid) = admit(&store, "v2-report-retry", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    sup.consume_requests(&store, NOW).unwrap();
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    let io_dir = invocation_io_root(&root.join("ws"))
+        .join(workloop_exec::isolation::sanitize_key(&invocation.id.0));
+    wait_for(
+        || io_dir.join("out").join("report.json").is_file(),
+        "report.json on disk",
+    );
+    std::thread::sleep(Duration::from_millis(100));
+
+    // Simulate the crash window: both required process observations
+    // are recorded, but the report fact was never delivered.
+    record_required_process_observations(&store, &w, &e, &invocation);
+    assert!(report_facts(&store, &e).is_empty());
+    let pending = store
+        .transact(|tx| tx.pending_report_invocations())
+        .unwrap();
+    assert!(
+        pending.iter().any(|i| i.id == invocation.id),
+        "the terminal-without-report invocation is a retry candidate"
+    );
+
+    sup.run_once(&store, NOW).unwrap();
+    let facts = report_facts(&store, &e);
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport { classification, .. } = fact else {
+        unreachable!()
+    };
+    assert_eq!(*classification, ReportClassification::Success);
+}
+
 /// An `absent` first report followed by an unreadable report path is
 /// not an idempotent replay: both observations carry no report
 /// evidence, but the classification changed, and the fact record must
@@ -3570,7 +4027,7 @@ fn an_absent_then_unreadable_report_is_a_conflict_not_a_replay() {
     std::fs::create_dir_all(&state_root).unwrap();
     let store = SqliteStore::in_memory(1).unwrap();
     let (src, _base, _newer) = git_source(&root);
-    let (_w, _e, rid) = admit(&store, "v2-report-class-conflict", vec![]);
+    let (w, e, rid) = admit(&store, "v2-report-class-conflict", vec![]);
     let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
     sup.consume_requests(&store, NOW).unwrap();
     let invocation = invocation_for(&store, &rid).expect("invocation recorded");
@@ -3583,6 +4040,7 @@ fn an_absent_then_unreadable_report_is_a_conflict_not_a_replay() {
     let out_dir = io_dir.join("out");
     let report_path = out_dir.join("report.json");
     wait_for(|| report_path.is_file(), "report.json on disk");
+    record_required_process_observations(&store, &w, &e, &invocation);
     let bodies = BodyStore::new(state_root.join("bodies"));
     let ws_root = root.join("ws");
     let collect = |store: &SqliteStore| {
@@ -3621,8 +4079,8 @@ fn an_absent_then_unreadable_report_is_a_conflict_not_a_replay() {
         &config(),
         &Observation {
             delivery: None,
-            subject_work_id: Some(_w.clone()),
-            subject_execution_id: Some(_e.clone()),
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: Some(e.clone()),
             fact: first,
             observed_unix_seconds: NOW,
         },
@@ -4801,32 +5259,39 @@ fn a_negative_review_report_with_findings_seals_them_as_occurrences() {
     assert_eq!(occurrences[0].source_key, "f-1");
 }
 
-/// Over the member cap the whole `findings[]` set is malformed
-/// evidence: the fact records `partial` and parses no member into an
-/// occurrence — the cap bounds the retained fan-out, matching the
-/// invariant-items treatment.
+/// A review whose report carries more members than the ceiling never
+/// reaches the gate binder: ingestion classifies the envelope
+/// `invalid(report.oversize)`, so no `Review` fact and no occurrence is
+/// recorded for a verdict that exceeded the declared fan-out bound.
 #[test]
-fn a_review_over_the_member_cap_records_partial_and_no_occurrences() {
+fn a_review_over_the_member_cap_is_invalid_and_binds_no_review() {
     let flood = serde_json::Value::Array(
         (0..=MAX_REPORT_MEMBERS)
             .map(|i| serde_json::json!({"key": format!("f-{i}"), "summary": "s"}))
             .collect(),
     )
     .to_string();
-    // A success report carrying more members than the cap: the
-    // completeness check reads the flood as malformed evidence.
+    // A success report carrying more members than the cap is invalid
+    // evidence at ingestion; the gate binder emits nothing from it.
     let argv = v2_argv("clean-exit", &["--findings", &flood]);
     let rig = assess_rig("review-flood", argv, true);
     run_assessment_role(&rig, 1, InvocationRole::Review);
-    let reviews = review_facts(&rig.store, &rig.work_id);
-    assert_eq!(reviews.len(), 1, "{reviews:?}");
     assert!(
-        matches!(&reviews[0].0, Completeness::Partial { reason } if reason == "too_many_findings"),
-        "{:?}",
-        reviews[0].0
+        review_facts(&rig.store, &rig.work_id).is_empty(),
+        "an over-cap verdict binds no Review fact"
     );
-    assert_eq!(reviews[0].1, 0, "no member parses past the cap");
     assert!(sealed_rounds(&rig.store, &rig.work_id).is_empty());
+    let facts = report_facts(&rig.store, &rig.execution_id);
+    let fact = the_report_fact(&facts);
+    let ObservationFact::WorkerReport { classification, .. } = fact else {
+        unreachable!()
+    };
+    assert_eq!(
+        *classification,
+        ReportClassification::Invalid {
+            reasons: vec!["report.oversize".into()]
+        }
+    );
 }
 
 /// Record a target-branch revision observation — the axis

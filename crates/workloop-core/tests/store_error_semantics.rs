@@ -153,6 +153,25 @@ impl ReadView for FailingTx<'_> {
     ) -> Result<Option<workloop_core::worker_v2::WorkerRequestBody>, StoreError> {
         Ok(None)
     }
+    fn executor_binding(
+        &self,
+        _request_id: &str,
+    ) -> Result<Option<workloop_core::executor::ExecutorBinding>, StoreError> {
+        Ok(None)
+    }
+    fn executor_operation(
+        &self,
+        _request_id: &str,
+        _operation_id: &str,
+    ) -> Result<Option<workloop_core::executor::ExecutorOperation>, StoreError> {
+        Ok(None)
+    }
+    fn executor_operations_for_request(
+        &self,
+        _request_id: &str,
+    ) -> Result<Vec<workloop_core::executor::ExecutorOperation>, StoreError> {
+        Ok(vec![])
+    }
     fn reservation(&self, _resource_key: &str) -> Result<Option<ResourceReservation>, StoreError> {
         unimplemented!()
     }

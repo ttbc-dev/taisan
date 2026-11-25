@@ -664,7 +664,7 @@ fn build_prompt(request: &WorkerRequestV2, input_dir: &Path) -> Result<String, S
                 p.push_str(&format!("- `{item}`\n"));
             }
             p.push_str(&format!(
-                "\nInspect the workspace and, for each invariant id, decide `conforms`, `violates`, or `inconclusive`. End your reply with exactly one fenced block:\n\n```{RESULT_BLOCK_TAG}\n{{\"invariant_items\":[{{\"id\":\"<invariant id>\",\"verdict\":\"conforms|violates|inconclusive\"}}]}}\n```\n"
+                "\nInspect the workspace and, for each invariant id, decide `conforms`, `violates`, or `inconclusive`. Report at most {MAX_REPORT_MEMBERS} invariant_items; a longer claim set is rejected. End your reply with exactly one fenced block:\n\n```{RESULT_BLOCK_TAG}\n{{\"invariant_items\":[{{\"id\":\"<invariant id>\",\"verdict\":\"conforms|violates|inconclusive\"}}]}}\n```\n"
             ));
             Ok(p)
         }
@@ -700,7 +700,7 @@ fn build_prompt(request: &WorkerRequestV2, input_dir: &Path) -> Result<String, S
                 }
             }
             p.push_str(&format!(
-                "\nReport only actionable findings on this exact diff. End your reply with exactly one fenced block (empty findings list when the diff is clean):\n\n```{RESULT_BLOCK_TAG}\n{{\"findings\":[{{\"key\":\"<stable key>\",\"summary\":\"<what is wrong and where>\",\"severity\":\"low|medium|high\",\"position\":\"<file:line or hunk>\"}}]}}\n```\n"
+                "\nReport only actionable findings on this exact diff, at most {MAX_REPORT_MEMBERS} findings; a longer claim set is rejected. End your reply with exactly one fenced block (empty findings list when the diff is clean):\n\n```{RESULT_BLOCK_TAG}\n{{\"findings\":[{{\"key\":\"<stable key>\",\"summary\":\"<what is wrong and where>\",\"severity\":\"low|medium|high\",\"position\":\"<file:line or hunk>\"}}]}}\n```\n"
             ));
             Ok(p)
         }

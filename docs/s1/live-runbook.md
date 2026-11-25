@@ -6,6 +6,13 @@ owner-executed and begins only after the owner records authorization on
 #113 (see [live-authorization.md](live-authorization.md)). This
 document authorizes nothing; a prepared runbook is not permission.
 
+> **Owner-operations procedure — private references.** Every live step
+> here runs only for the owner, against the private repository
+> `shimpeiws/coding-worker-smoke`; links, `#N` citations, and
+> owner-local paths (`~/.config/…`, `~/s1-*`) below are verbatim owner
+> context and do not resolve publicly. Retained as a record under the
+> owner publication decision (#438).
+
 The runbook covers the three S1 variants — `success`, `Attention`, and
 `recovery` — against the isolated repository
 `shimpeiws/coding-worker-smoke`, using the materials prepared under #73

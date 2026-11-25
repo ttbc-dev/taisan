@@ -79,6 +79,41 @@ pub enum ObservationFact {
         invocation_id: InvocationId,
         reason: String,
     },
+    /// The launch's leader was spawned into this process group. The
+    /// supervisor commits it the moment the spawn call returns —
+    /// before the running commit — so an unidentified launch keeps a
+    /// durable handle on its group even when the leader's identity
+    /// commit never landed. The unidentified-launch absence proof
+    /// reads it back and enumerates the group for descendants that
+    /// escaped the signature and directory scans without calling
+    /// `setsid`.
+    LaunchGroup {
+        invocation_id: InvocationId,
+        pgid: i32,
+        /// The leader's start as captured at report time: `pgid` is
+        /// the leader's pid, so the group member at that slot is the
+        /// owner identity the absence proof verifies the group
+        /// against — a live process there with a different start means
+        /// the number was recycled after the leader died and the whole
+        /// group is a foreign family. `None` when the spawn could not
+        /// capture it; the owner slot is then unverifiable and the
+        /// member check stays conservative.
+        #[serde(default)]
+        leader_started_at: Option<String>,
+    },
+    /// The bounded escalation for an unidentified launch whose
+    /// absence scans could not be completed a bounded number of
+    /// consecutive times. The launch stays an unresolved writer — a
+    /// live process may still exist, so the slot is never released —
+    /// but the unprovable absence is surfaced to the operator as a
+    /// distinct outcome instead of an indefinite `uncertain` hold.
+    /// The escalation surfaces the outcome; it does not conclude it:
+    /// the absence scans keep running underneath, so a later provable
+    /// answer still resolves the writer.
+    LaunchAbsenceUnprovable {
+        invocation_id: InvocationId,
+        reason: String,
+    },
     /// The supervisor refused dispatch before any Invocation existed:
     /// a required input body was missing, stale, corrupt, oversized,
     /// or otherwise undeliverable. `code` is one of the closed
@@ -475,6 +510,85 @@ pub enum ProcessStateFact {
     Unknown,
 }
 
+/// Whether the required process observations for bounded Worker-report
+/// collection are recorded yet.
+///
+/// Collection begins only after (a) a launch acceptance binding a live
+/// process to the Invocation — either a recorded `Running` observation
+/// or the process identity durably recorded on the Invocation row — is
+/// followed by (b) a terminal `Exited` observation for that same
+/// process. A report read before both exist is deferred, never
+/// recorded: a live writer could still change the very bytes a
+/// premature read would retain, and a terminal fact without the
+/// matching launch acceptance does not prove which process ended.
+///
+/// `Unknown` is deliberately not terminal here: it records an
+/// unverifiable liveness state, not the proven stop a collection
+/// depends on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportCollectionGate {
+    /// Both required observations are recorded in order.
+    Ready,
+    /// Neither a launch-acceptance `Running` fact nor a durable
+    /// process identity binds a live process to the Invocation yet.
+    AwaitingLaunchAcceptance,
+    /// The launch is recorded, but no terminal `Exited` fact for that
+    /// same process follows it yet.
+    AwaitingTerminalObservation,
+}
+
+/// Evaluate the report-collection gate over one Execution's recorded
+/// observations in their durable order. A terminal fact can satisfy
+/// the gate only when it names the process the launch acceptance
+/// bound: either a preceding `Running` observation for the same
+/// identity, or the Invocation's durably recorded process identity.
+/// The latter covers a crash between persisting the identity and
+/// recording `Running` — the durable identity already proves which
+/// process was launched, so its terminal fact is not lost evidence.
+/// A terminal fact naming a different process identity never satisfies
+/// the gate.
+pub fn report_collection_gate(
+    observations: &[Observation],
+    invocation_id: &InvocationId,
+    recorded_identity: Option<&str>,
+) -> ReportCollectionGate {
+    let durable_identity = recorded_identity.filter(|identity| !identity.is_empty());
+    let mut launch_identity: Option<&str> = None;
+    for observation in observations {
+        let ObservationFact::ProcessState {
+            invocation_id: recorded,
+            process_identity,
+            state,
+            ..
+        } = &observation.fact
+        else {
+            continue;
+        };
+        if recorded != invocation_id {
+            continue;
+        }
+        match state {
+            ProcessStateFact::Running if !process_identity.is_empty() => {
+                launch_identity = Some(process_identity.as_str());
+            }
+            ProcessStateFact::Exited => {
+                let observed = process_identity.as_str();
+                let matches_launch = launch_identity.is_some_and(|launch| launch == observed);
+                let matches_durable = durable_identity.is_some_and(|durable| durable == observed);
+                if matches_launch || matches_durable {
+                    return ReportCollectionGate::Ready;
+                }
+            }
+            _ => {}
+        }
+    }
+    if launch_identity.is_some() || durable_identity.is_some() {
+        ReportCollectionGate::AwaitingTerminalObservation
+    } else {
+        ReportCollectionGate::AwaitingLaunchAcceptance
+    }
+}
+
 /// `Present` must carry a digest: the artifact's exact payload identity.
 /// A `Corrupt` artifact is never `missing` — it is retained with its
 /// reason and invalid.
@@ -674,4 +788,142 @@ pub enum AttentionReason {
     /// No material progress beyond the policy window. A signal for
     /// human attention, never proof of termination.
     NoProgress,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn observation(fact: ObservationFact) -> Observation {
+        Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: Some(ExecutionId("e-1".into())),
+            fact,
+            observed_unix_seconds: 0,
+        }
+    }
+
+    fn process(
+        invocation_id: &InvocationId,
+        identity: &str,
+        state: ProcessStateFact,
+    ) -> Observation {
+        observation(ObservationFact::ProcessState {
+            invocation_id: invocation_id.clone(),
+            process_identity: identity.into(),
+            state,
+            exit_code: None,
+        })
+    }
+
+    #[test]
+    fn report_collection_is_awaiting_launch_acceptance_without_running() {
+        let invocation = InvocationId("inv-1".into());
+        let gate = report_collection_gate(&[], &invocation, None);
+        assert_eq!(gate, ReportCollectionGate::AwaitingLaunchAcceptance);
+
+        // A terminal fact alone does not prove launch acceptance —
+        // neither an observed `Running` nor a durable identity names
+        // the process, so the order is required, not just presence.
+        let terminal = process(&invocation, "4242@10", ProcessStateFact::Exited);
+        assert_eq!(
+            report_collection_gate(&[terminal], &invocation, None),
+            ReportCollectionGate::AwaitingLaunchAcceptance
+        );
+    }
+
+    #[test]
+    fn report_collection_accepts_terminal_for_a_durably_recorded_identity() {
+        let invocation = InvocationId("inv-1".into());
+        // The launch identity was committed to the Invocation row but
+        // its `Running` observation was lost to a crash. The terminal
+        // fact naming that same durable identity is still proof.
+        let terminal = process(&invocation, "4242@10", ProcessStateFact::Exited);
+        assert_eq!(
+            report_collection_gate(&[terminal], &invocation, Some("4242@10")),
+            ReportCollectionGate::Ready
+        );
+        // A terminal fact naming some other process is not this
+        // launch's terminal observation.
+        assert_eq!(
+            report_collection_gate(
+                &[process(&invocation, "9999@20", ProcessStateFact::Exited)],
+                &invocation,
+                Some("4242@10")
+            ),
+            ReportCollectionGate::AwaitingTerminalObservation
+        );
+    }
+
+    #[test]
+    fn report_collection_is_awaiting_terminal_after_launch_only() {
+        let invocation = InvocationId("inv-1".into());
+        let launch = process(&invocation, "4242@10", ProcessStateFact::Running);
+        assert_eq!(
+            report_collection_gate(&[launch], &invocation, None),
+            ReportCollectionGate::AwaitingTerminalObservation
+        );
+
+        // An unverifiable liveness fact is not a proven terminal stop.
+        let unknown = process(&invocation, "4242@10", ProcessStateFact::Unknown);
+        assert_eq!(
+            report_collection_gate(
+                &[
+                    process(&invocation, "4242@10", ProcessStateFact::Running),
+                    unknown,
+                ],
+                &invocation,
+                None
+            ),
+            ReportCollectionGate::AwaitingTerminalObservation
+        );
+
+        // A terminal fact naming a different process is not this
+        // launch's terminal observation.
+        assert_eq!(
+            report_collection_gate(
+                &[
+                    process(&invocation, "4242@10", ProcessStateFact::Running),
+                    process(&invocation, "9999@20", ProcessStateFact::Exited),
+                ],
+                &invocation,
+                None
+            ),
+            ReportCollectionGate::AwaitingTerminalObservation
+        );
+    }
+
+    #[test]
+    fn report_collection_is_ready_after_matching_launch_and_terminal() {
+        let invocation = InvocationId("inv-1".into());
+        assert_eq!(
+            report_collection_gate(
+                &[
+                    process(&invocation, "4242@10", ProcessStateFact::Running),
+                    process(&invocation, "4242@10", ProcessStateFact::Exited),
+                ],
+                &invocation,
+                None
+            ),
+            ReportCollectionGate::Ready
+        );
+    }
+
+    #[test]
+    fn report_collection_ignores_other_invocations_observations() {
+        let invocation = InvocationId("inv-1".into());
+        let other = InvocationId("inv-2".into());
+        assert_eq!(
+            report_collection_gate(
+                &[
+                    process(&other, "1111@1", ProcessStateFact::Running),
+                    process(&other, "1111@1", ProcessStateFact::Exited),
+                ],
+                &invocation,
+                None
+            ),
+            ReportCollectionGate::AwaitingLaunchAcceptance
+        );
+    }
 }

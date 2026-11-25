@@ -6,6 +6,12 @@ Copy this skeleton and fill every field; a field that does not apply is
 marked `n/a` with a reason, never left blank. Bracketed `[owner: …]`
 fields are entered by the owner at record time.
 
+> **Owner-operations material — private references.** This template
+> produces records of owner-executed runs against the private
+> repository `shimpeiws/coding-worker-smoke`; citations to it resolve
+> only for the owner. Retained under the owner publication decision
+> (#438).
+
 Claims boundary statement (required verbatim, adjusted only for facts):
 state plainly that this is a **live** result — real store, real Worker
 process, real GitHub effects and read-backs — and name the profile

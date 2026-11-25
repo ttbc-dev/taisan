@@ -1189,6 +1189,17 @@ impl WorkerRequestV2 {
                 "base.repository names a foreign repository".into(),
             ));
         }
+        // `work_id` derives the managed `ws-<work_id>` workspace, the
+        // `work/<work_id>` branch, and per-request receipt paths on a
+        // remote executor — bound it to the wire identifier grammar
+        // at parse so no filesystem consumer ever joins a traversal
+        // id (contract §6).
+        if !crate::executor::transfer_id_is_valid(&self.work_id) {
+            return Err(invalid(
+                "request.invalid",
+                format!("work_id {:?} is not a safe identifier", self.work_id),
+            ));
+        }
         // Bounds (§4.2, OD-9).
         if self.continuation.len() as u64 > self.budget.max_continuation_refs {
             return Err(invalid(
@@ -1533,10 +1544,15 @@ pub struct ClassifiedReport {
 
 /// Read a report body against the binding of the exact request it
 /// answers. `max_bytes` applies before parsing — an oversize body is
-/// `invalid` (`report.oversize`) and never parsed. Identity checks
-/// collect every mismatch (§7.4), so `invalid` names each broken
-/// binding. `absent` is produced by the caller (no file after
-/// confirmed exit), not here.
+/// `invalid` (`report.oversize`) and never parsed. The report's
+/// `findings`/`invariant_items` member sets are also bounded by
+/// [`MAX_REPORT_MEMBERS`] at this ingestion boundary: a body whose
+/// member count exceeds the declared ceiling is `invalid`
+/// (`report.oversize`) before any gate sees it, so an oversized
+/// verdict can never inflate a downstream round or assessment. Identity
+/// checks collect every mismatch (§7.4), so `invalid` names each broken
+/// binding. `absent` is produced by the caller (no file after confirmed
+/// exit), not here.
 pub fn classify_report(
     raw: &[u8],
     binding: &ReportBinding<'_>,
@@ -1575,6 +1591,15 @@ pub fn classify_report(
             return invalid(vec![reason]);
         }
     };
+    // The member-count ceiling belongs to the same ingestion boundary
+    // as the byte ceiling: a small-member flood inside the byte budget
+    // must not reach the gates merely because its bytes fit. Both
+    // claim arrays share the one reported-member bound.
+    if report.findings.len() > MAX_REPORT_MEMBERS
+        || report.invariant_items.len() > MAX_REPORT_MEMBERS
+    {
+        return invalid(vec!["report.oversize".into()]);
+    }
     // The declared digest is verified over the raw body minus its
     // digest member, never a re-serialization.
     let body_digest = report_v2_digest(&report_canonical_body(&value));
@@ -1630,7 +1655,10 @@ pub fn classify_report(
 /// Upper bound on `findings`/`invariant_items` members one report may
 /// carry into gate evidence. The report byte bound already caps the
 /// wire; this caps the parsed fan-out so a tiny-member flood cannot
-/// inflate a sealed round or an assessment without bound.
+/// inflate a sealed round or an assessment without bound. The bound is
+/// enforced at ingestion by [`classify_report`] — a report over it is
+/// `invalid` (`report.oversize`) — and re-checked by the gate binder as
+/// defence in depth for evidence recorded before this boundary existed.
 pub const MAX_REPORT_MEMBERS: usize = 128;
 /// Per-string bounds inside a member claim.
 pub const MAX_MEMBER_KEY: usize = 256;
@@ -2388,6 +2416,40 @@ mod tests {
                 )
             }
             other => panic!("expected invalid, got {other:?}"),
+        }
+    }
+
+    /// A valid envelope under the byte bound can still carry an
+    /// oversized verdict: more member claims than the contract's
+    /// declared fan-out ceiling. Ingestion classifies it `invalid`
+    /// with the named `report.oversize` class before any gate binds a
+    /// single member, so the downstream round/assessment reserve is
+    /// never inflated by a tiny-member flood.
+    #[test]
+    fn an_oversize_member_set_is_invalid_at_ingestion() {
+        for field in ["findings", "invariant_items"] {
+            let mut value: serde_json::Value = serde_json::from_str(DOC_REPORT).unwrap();
+            let members: Vec<serde_json::Value> = (0..=MAX_REPORT_MEMBERS)
+                .map(|i| serde_json::json!({"key": format!("f-{i}"), "summary": "claim"}))
+                .collect();
+            value[field] = serde_json::Value::Array(members);
+            value["report_digest"] =
+                serde_json::Value::String(report_v2_digest(&report_canonical_body(&value)));
+            let raw = serde_json::to_vec(&value).unwrap();
+            assert!(
+                raw.len() < 1_048_576,
+                "{field}: fixture stays under the byte bound"
+            );
+            let classified = classify_report(&raw, &doc_binding(), 1_048_576);
+            match classified.classification {
+                ReportClassification::Invalid { reasons } => assert_eq!(
+                    reasons,
+                    vec!["report.oversize".to_string()],
+                    "{field}: the member ceiling fails with the named class"
+                ),
+                other => panic!("{field}: expected invalid, got {other:?}"),
+            }
+            assert!(classified.report.is_none(), "{field}: no claim is parsed");
         }
     }
 

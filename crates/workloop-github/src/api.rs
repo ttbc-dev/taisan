@@ -337,7 +337,10 @@ pub trait GitHubApi {
 
     /// Whether `descendant`'s recorded ancestry contains `ancestor` —
     /// used to classify a push read-back (`Equal`/`Ancestor`/
-    /// `Diverged`).
+    /// `Diverged`). A revision the remote does not know (a produced
+    /// commit not yet pushed) is a definite `false`, never an error —
+    /// the guarded write's lease is what makes the ensuing force
+    /// update safe. `Err` is reserved for the read itself failing.
     fn contains_revision(
         &mut self,
         repository: &RepositoryRef,

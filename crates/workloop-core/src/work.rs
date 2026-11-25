@@ -2802,6 +2802,28 @@ fn assess(
             // unresolved writer.
             if execution.state == ExecutionState::Ready {
                 let mut next = execution.clone();
+                // The refund binds to the attempt the current `ready`
+                // admission minted — `<eid>:inv:<invocations_used - 1>`
+                // since the counter never decrements. The supervisor
+                // abandons the refused Invocation in its own transaction
+                // before reporting, so the binding keys on the recorded
+                // request id, not on the Invocation still being an
+                // unresolved writer; a refusal re-delivered under a fresh
+                // delivery id for an earlier attempt must not refund a
+                // charged attempt a second time.
+                let live_request = format!(
+                    "{}:inv:{}",
+                    execution.id.0,
+                    execution.invocations_used.saturating_sub(1)
+                );
+                if let Some(role) = tx
+                    .invocations_for_execution(&execution.id)?
+                    .into_iter()
+                    .find(|inv| inv.id == *invocation_id && inv.request_id == live_request)
+                    .map(|inv| inv.role)
+                {
+                    refund_refused_attempt(tx, &mut next, role)?;
+                }
                 next.state = ExecutionState::Paused;
                 next.pause_reason = Some("repair: launch refused before spawn".into());
                 next.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
@@ -2816,7 +2838,46 @@ fn assess(
             }
             Ok(())
         }
-        ObservationFact::DispatchRefused { code, detail, .. } => {
+        ObservationFact::LaunchAbsenceUnprovable {
+            invocation_id,
+            reason,
+        } => {
+            // The bounded escalation for an unidentified launch: the
+            // absence scans could not be completed a bounded number of
+            // consecutive times. The Invocation stays an unresolved
+            // writer — a live process may still exist, so no slot is
+            // released — and is marked `unknown`: the distinct outcome
+            // surfaces the unprovable absence to the operator while
+            // the Execution is held for an operator decision. The
+            // mark does not end the resolution — the poll loop keeps
+            // scanning the `unknown` launch, so a later provable
+            // answer (a re-bound writer or a completed clear) still
+            // settles it under the recorded desired action; the
+            // transient burst is never a permanent wedge. An intent
+            // already recorded on the Execution (cancel/fail/pause)
+            // is never overwritten, and a terminal Execution is never
+            // resurrected — the state guard lives inside
+            // `pause_for_repair`.
+            mark_invocation(tx, invocation_id, |_| InvocationState::Unknown)?;
+            if execution.desired_action.is_none()
+                || execution.desired_action == Some(DesiredAction::Continue)
+            {
+                pause_for_repair(
+                    tx,
+                    &execution,
+                    "absence_unprovable",
+                    &format!("repair: launch absence unprovable: {reason}"),
+                    vec![RepairPrerequisite::OperatorDecision],
+                    now_unix_seconds,
+                )?;
+            }
+            Ok(())
+        }
+        ObservationFact::DispatchRefused {
+            request_id,
+            code,
+            detail,
+        } => {
             // No Invocation ever existed for the request: the refusal
             // is proven before spawn, so — like `LaunchRefused` — it
             // resolves the waiting Execution only from `ready` and
@@ -2825,6 +2886,25 @@ fn assess(
             // the pause reason carries it verbatim for the operator.
             if execution.state == ExecutionState::Ready {
                 let mut next = execution.clone();
+                // The refund binds to the request the current `ready`
+                // admission minted — `<eid>:inv:<invocations_used - 1>`
+                // since the counter never decrements. A refusal
+                // re-delivered under a fresh delivery id for an earlier
+                // attempt's durable request row must not refund a
+                // charged attempt a second time.
+                let live_request = format!(
+                    "{}:inv:{}",
+                    execution.id.0,
+                    execution.invocations_used.saturating_sub(1)
+                );
+                if *request_id == live_request
+                    && let Some(role) = tx
+                        .request(request_id)?
+                        .filter(|request| request.execution_id == execution.id)
+                        .map(|request| request.role)
+                {
+                    refund_refused_attempt(tx, &mut next, role)?;
+                }
                 next.state = ExecutionState::Paused;
                 next.pause_reason = Some(format!("repair: dispatch refused {code}: {detail}"));
                 next.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
@@ -4137,6 +4217,38 @@ fn mark_invocation(
                 return Ok(());
             }
         }
+    }
+    Ok(())
+}
+
+/// Roll back the accounting a refused pre-spawn attempt consumed at
+/// admission. Admission cleared `next_role` into the minted request and
+/// charged the role-scoped ledgers — the Work-wide fix account and the
+/// Execution review-round ledger — so a launch proven never to have
+/// spawned hands both back: `next_role` re-arms so a `resume` re-issues
+/// the recorded role instead of degrading to `Coding`, and the bounded
+/// ledgers refund so the re-issued dispatch is charged exactly once.
+/// `invocations_used` deliberately stays charged: every request-creation
+/// attempt counts against `max_invocations`, and the counter mints
+/// request ids that must never repeat.
+fn refund_refused_attempt(
+    tx: &mut dyn TxView,
+    next: &mut Execution,
+    role: InvocationRole,
+) -> Result<(), StoreError> {
+    next.next_role = Some(role.clone());
+    match role {
+        InvocationRole::Fix => {
+            let mut usage = tx
+                .work_usage(&next.work_id)?
+                .unwrap_or_else(|| WorkUsage::new(&next.work_id));
+            usage.fix_invocations_used = usage.fix_invocations_used.saturating_sub(1);
+            tx.apply(&Effect::UpdateWorkUsage { usage })?;
+        }
+        InvocationRole::Review => {
+            next.review_rounds_used = next.review_rounds_used.saturating_sub(1);
+        }
+        InvocationRole::Coding | InvocationRole::InvariantCheck => {}
     }
     Ok(())
 }

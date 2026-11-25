@@ -17,7 +17,9 @@ and results.
 from source reads and tracker queries at the recorded revisions, plus
 the public locators produced by the first live run (Work `w-2` /
 Execution `e-6` → `succeeded` at head `35ce3cb`, PR
-`shimpeiws/coding-worker-smoke#62`, 2026-11-23). That run approximated
+`shimpeiws/coding-worker-smoke#62`, 2026-11-23 — a private repository;
+the citation resolves only for the owner, retained verbatim under the
+owner publication decision #438). That run approximated
 a remote boundary by operator-driven manual transport, a
 bridge-assisted push, and containment workarounds; its facts are
 cited through the issues it produced (#410, #411, #412) and are
@@ -31,6 +33,7 @@ contract evidence never prove a live remote run.
 | Surface | Revision | Locator |
 | --- | --- | --- |
 | Repository `main` (all components below) | `63905c6bd08f646289876ebb1dfeedd4409ca7f6` | `git rev-parse origin/main`, merge of #408; also the revision the first live run exercised |
+| Executor transport contract review baseline | `ca45ac8fbf5647df7dbdcac59185b8442c9e4890` | `git rev-parse origin/main` after #417; current review baseline for Core, supervisor, Worker, host adapter, and the public #366/#367 reference implementations |
 | Manifest-handoff PR | `bfa0412` (merge of branch head `c1d3343`) | PR #413, addressing #410/#411/#412 — merged into `main` during this baseline review; the baseline main pin above predates it |
 | Public v0.3 reference implementations | same tree | `public-issue-selector` and `taisan-worker-claude` shipped under #366; clean-install documentation alignment tracked by #367 |
 | Design baselines cited by prior contracts | `51f0b34daf33a1975a39b7614f5ceeac7dabf431`, `7d9ea3d` | [v0.3](v0.3.md) planning/recheck baselines, kept as historical audit |
@@ -70,7 +73,7 @@ not a weakened remote variant.
 | Reference Worker did not produce the workspace-root `artifact.json` required-artifact evidence | #410; operator scaffolding synthesized it during the first live run; addressed by PR #413, merged into `main` as `bfa0412` during this baseline review | The remote custody contract cannot rely on implicit workspace state: produced artifacts cross the transport only as validated descriptors (manifest + object closure), and the manifest shape is a contract input, not an afterthought — manifest placement/lifecycle is decided by #416 and bound through #374 |
 | `push_ref` wrote only `git/refs` — no git-object transport, remote 422 | #411; worked around via Git Database API staging plus a bridge push; addressed by PR #413 (pack upload from the handoff repository under `--force-with-lease`), merged as `bfa0412` | Object transfer is the hard primitive everywhere: coordinator→executor inputs and executor→coordinator produced objects both travel as real git transport (bundle/pack), never as ref updates against objects that do not exist |
 | Contained sandbox lacked a CA trust store and a git identity | #412; worked around via `--runtime-arg` bind and `GIT_*` env injection; addressed by PR #413 (`ca_trust_paths`, `commit_identity` profile fields), merged as `bfa0412` | A remote executor host needs the same declared environment; it is a preflight requirement of the executor profile, not per-run surgery |
-| No executor transport or placement port | `ProcessControlPort` (`workloop-core/src/ports.rs`) is POSIX-local; `Supervisor` spawns, inspects, and signals on the coordinator host only | The coordinator↔executor operation set (§4) and its versioned wire types (#374/#375) are new contract surface; placement is bound per request like the adapter declaration, never inferred mid-Invocation |
+| No executor transport or placement port | `ProcessControlPort` (`workloop-core/src/ports.rs`) is POSIX-local; `Supervisor` spawns, inspects, and signals on the coordinator host only | The coordinator-to-executor operation set (§4) and versioned wire contract in [executor transport contract](executor-transport-contract.md) are new; placement is bound per request like the adapter declaration, never inferred mid-Invocation |
 | Workspace and `source_path` are local filesystem identities | [v0.3 installation](v0.3-installation.md#v03-installation-record-keys): `worker_dispatch.source_path` is an absolute coordinator path | A local path is never a transferable remote artifact identity; inputs cross as content-addressed bodies plus a git object closure (§4.1) |
 | No remote durable receipt store, incarnation identity, or remote stop evidence | first live run reconciled everything by hand | Executor-side durable receipts and a boot/incarnation identity are required before any remote start; the coordinator reconciles by recorded identities after any restart (§4.3) |
 
@@ -216,21 +219,22 @@ fix as failure.
 ## 4. Custody: transfer, retention, and authority
 
 The executor contract has six operations. This section fixes their
-required semantics; the versioned envelopes, digests, and refusal
-vocabulary are the dependent contract's deliverable (#374, with wire
-types in #375). One reference transport — restricted SSH plus bounded
-framed messages — is the starting candidate and is selected only
-after #373's environment decision; this document requires semantics
-any conforming transport must provide.
+required semantics. The versioned envelopes, identities, digests,
+refusal vocabulary, wire examples, and fault matrix are defined in the
+[executor transport contract](executor-transport-contract.md) for
+#374. Wire types in #375 implement that contract. Restricted SSH plus
+bounded framed messages remains the starting transport candidate. The
+reference transport is selected after #373's environment decision;
+every conforming transport must provide the same semantics.
 
 | Operation | Coordinator issues | Required semantics |
 | --- | --- | --- |
 | `prepare` | input transfer + staging | Delivers the canonical request body, all referenced immutable bodies, and the git object closure (§4.1). The executor validates digests and reconstructs its own workspace; a body that fails validation refuses before any process exists |
 | `start` | launch one bound request | Durable start under recorded identities; the answer distinguishes `started`, `known_not_started`, and `unknown`. A lost or ambiguous response reconciles by request identity — never a second start while the first is unknown |
-| `observe` | poll remote state | Returns remote process evidence, bounded progress, and receipt identities for the recorded Invocation. Silence is `unknown`, not `dead` |
+| `observe` | poll remote state | Returns remote process evidence, bounded progress, and receipt identities for the recorded Invocation. Silence is `unknown`, not `dead`; reconciliation after reboot reports both the bound and responding incarnation |
 | `request_stop` | stop one Invocation | Persisted remote stop intent, bounded SIGTERM/grace/SIGKILL escalation, inspected remote stop proof covering the descendant snapshot and the executor incarnation. A closed session or expired heartbeat is never stop evidence |
 | `collect` | retrieve outputs | Bounded, digest-verified retrieval of the report, retained log, and — for producing roles — the produced object closure through quarantine, with base-ancestry and exact-commit checks before coordinator import |
-| `acknowledge` | confirm durable receipt | Coordinator-side durable acknowledgement pins remote WIP/output until it lands; after acknowledgement the executor may release its retention for that Invocation. A lost acknowledgement re-collects; it never deletes remote output |
+| `acknowledge` | confirm durable receipt | The executor retains remote WIP/output until the acknowledgement command is durable. If that command never arrives, it retains the bodies. If the command commits but its response is lost, it may clean up under retention policy and replays its durable tombstone without recollection |
 
 ### 4.1 Input and artifact transfer
 
@@ -279,6 +283,11 @@ any conforming transport must provide.
   idempotent and produces no duplicate artifacts; acknowledgement of
   an Invocation whose collection never completed is refused rather
   than recorded.
+- The executor durably records an acknowledgement before it removes any
+  remote body. If the acknowledgement command never arrives, the executor
+  retains the body. If the acknowledgement commits but its response is lost,
+  the executor may clean up under retention policy and replays the stored
+  acknowledgement tombstone without requiring recollection.
 - Coordinator-side availability states are unchanged: a remote body
   that cannot be collected within the artifact-recovery bound resolves
   to `unavailable`/`absent` evidence with its reason — never to a
@@ -369,7 +378,7 @@ the milestone splits contract, mechanism, and environment:
 | Open item | Owner | Why left open |
 | --- | --- | --- |
 | Reference environment (native Linux vs minimal guest on Mac, memory footprint, on-demand start/stop) | #373 | Measurement must precede selection; this spec constrains only the shape (one static Linux endpoint, independent filesystems, no mandatory Docker) |
-| Executor transport and wire envelopes (`taisan.executor.*` command/receipt/observation/artifact types, digest tags, refusal vocabulary) | #374/#375 | Transport selection follows the environment; restricted SSH plus bounded framed messages is the recorded starting candidate |
+| Executor transport and wire envelopes (`taisan.executor.*` command/receipt/observation/artifact types, digest tags, refusal vocabulary) | #374 defines the contract; #375 implements its wire types | Transport selection follows the environment; restricted SSH plus bounded framed messages is the recorded starting candidate |
 | Executor helper implementation shape (reuse of supervisor components, durable receipt store, process incarnations) | #377 | Mechanism, not contract; must satisfy §4 semantics and the minimal-executable constraint |
 | Input/object transfer mechanics (chunking, staging, quarantine layout) | #376 | Implementation of §4.1–4.2 |
 | Fault reconciliation test surface | #378 | Implementation of §4.3 |
@@ -378,16 +387,17 @@ the milestone splits contract, mechanism, and environment:
 | Interchange suite rows and packaging/quickstart | #384/#385 | Compose the proven slices |
 | Automatic event-driven review arming (#309–#311, #322) | parallel milestone items | Remote review must not depend on webhook ingress; polling and the bounded reconciler supply arming facts. The milestone's automatic-review acceptance rides on those issues, not on this boundary |
 
-#416 is not an open item in this table because it is already decided: the remote handoff manifest is a fresh per-Invocation out-directory record (`handoff.json`) beside `report.json`. The decision record lands on `main` as `docs/handoff-manifest-custody.md` with #416's own PR; this spec consumes the decision through §4 and #374 rather than leaving it open here.
+#416 is not an open item in this table because it is already decided: the remote handoff manifest is a fresh per-Invocation out-directory record (`handoff.json`) beside `report.json`. The [executor transport contract](executor-transport-contract.md) defines its schema, size and path bounds, collection digest, whitelist, and acknowledgement rules. This spec consumes the decision; it does not treat the workspace-root `artifact.json` as a remote authority.
 
 ### 7.2 Intentionally open design points
 
 Recorded so downstream issues can depend on the answer existing, not
 on this document having guessed it:
 
-- **Executor incarnation identity format** — required by §4.3 fencing;
-  the concrete identity (boot ID, key pair, generation counter) is a
-  #374/#375 choice.
+- **Executor incarnation identity format** — #374 defines a fresh
+  unpredictable identifier per executor process start, bound to the
+  authenticated endpoint identity. #377 selects the durable receipt
+  store and verifies that the identifier changes on reboot.
 - **Remote workspace retention** — §4.1 fixes construction: the
   executor builds the `ws-<work_id>` workspace on branch
   `work/<work_id>` from validated objects inside its own state root. Whether the executor may then retain and reuse that
@@ -396,12 +406,14 @@ on this document having guessed it:
   #376/#377's trade-off — a retention/optimization question over the
   fixed construction rule, not an alternative to it; §4.2 requires
   WIP retention until acknowledgement either way.
-- **Bounded progress surface of `observe`** — minimum is liveness plus
-  receipt identity; richer progress (bounded log tail) is a #374
-  negotiation item, never a liveness substitute.
-- **Clock skew treatment** — §4.3 fixes the rule (absolute deadlines,
-  skew may consume but never extend); tolerances and detection are
-  #374's.
+- **Bounded progress surface of `observe`** — the contract returns
+  process facts, a monotonically increasing progress sequence, and
+  receipt identities. A log tail is optional bounded diagnostic data,
+  never a liveness substitute.
+- **Clock skew treatment** — the contract carries absolute deadlines.
+  Skew may consume budget but never extend it. The installation pins a
+  maximum clock offset; the executor refuses new starts when measured
+  offset exceeds that limit.
 
 ### 7.3 Feasibility decisions referenced, not made (#373 scope)
 

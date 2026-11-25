@@ -4,6 +4,11 @@ Status: the deterministic fixture that produces the single input issue
 for one S1 run. Creating the seed is a fixture procedure, not live
 execution — the run itself is #113.
 
+> **Private references.** `shimpeiws/coding-worker-smoke` is a private
+> repository — every link and `#N` citation to it in this document
+> resolves only for the owner (they 404 publicly). The name is retained
+> verbatim under the owner publication decision (#438).
+
 ## Requirements
 
 A seeded issue must satisfy all of:

@@ -250,6 +250,50 @@ pub enum Effect {
     InsertWorkerRequestBody {
         body: crate::worker_v2::WorkerRequestBody,
     },
+    /// The immutable executor endpoint binding for one remote request
+    /// (`docs/executor-transport-contract.md` §2). Written before the
+    /// first remote operation is sent. A duplicate insert with
+    /// identical content is a replay; different content is a
+    /// `ConstraintConflict` — a bound request is never silently
+    /// migrated to another endpoint, incarnation, payload, or launch
+    /// configuration.
+    InsertExecutorBinding {
+        binding: crate::executor::ExecutorBinding,
+    },
+    /// The durable executor operation record (`docs/executor-transport-
+    /// contract.md` §4): the command identity and canonical bytes are
+    /// committed before the operation is sent. A duplicate insert with
+    /// identical bytes is an idempotent replay; differing bytes under
+    /// the same `(request_id, operation_id)` are a `ConstraintConflict`
+    /// — the store's form of `conflicting_replay`. A second `start`
+    /// for one request conflicts structurally.
+    RecordExecutorCommand {
+        operation: crate::executor::ExecutorOperation,
+    },
+    /// Attach a validated receipt to its previously recorded command.
+    /// The receipt must parse and echo every identity field of the
+    /// stored command; an identical re-record is a replay, differing
+    /// bytes a `ConstraintConflict`, and a receipt for an unrecorded
+    /// operation is refused.
+    RecordExecutorReceipt {
+        request_id: String,
+        operation_id: String,
+        receipt_body: Vec<u8>,
+    },
+    /// Full-row upsert of the durable remote-collection record
+    /// (`docs/executor-transport-contract.md` §6, #376). One request
+    /// admits one collection identity: a row naming a different
+    /// `collection_id`, `invocation_id`, or `collection_digest` is a
+    /// `ConstraintConflict` — the contract's "a different collection
+    /// digest for one Invocation is a conflict". State moves are
+    /// monotonic (`collecting → collected → acknowledged`, `invalid`
+    /// terminal); a regression or a move off a terminal row conflicts.
+    /// `expected_seq` is the `recorded_seq` the writer read (0 for a
+    /// row believed absent).
+    UpsertExecutorCollection {
+        collection: crate::executor::ExecutorCollection,
+        expected_seq: EventSequence,
+    },
     /// Replaces the singleton intake-settings record, guarded by the
     /// caller-observed revision: `expected_revision` must equal the
     /// currently recorded `settings_revision`, and `None` requires the
@@ -725,6 +769,16 @@ pub trait ReadView {
     /// Invocations that may still write (prepared/running/unknown).
     fn unresolved_invocations(&self) -> Result<Vec<Invocation>, StoreError>;
 
+    /// Resolved v2 Invocations whose required process observations are
+    /// recorded but whose bounded Worker-report collection has not
+    /// recorded an accepted fact yet — the durable retry set for a pass
+    /// that committed the terminal observation and then crashed before
+    /// ingestion. Stores that cannot enumerate them return none and
+    /// rely on the supervisor's inline collection at finish.
+    fn pending_report_invocations(&self) -> Result<Vec<Invocation>, StoreError> {
+        Ok(Vec::new())
+    }
+
     fn works(&self) -> Result<Vec<Work>, StoreError>;
     fn nonterminal_executions(&self) -> Result<Vec<Execution>, StoreError>;
 
@@ -750,6 +804,49 @@ pub trait ReadView {
         &self,
         request_id: &str,
     ) -> Result<Option<crate::worker_v2::WorkerRequestBody>, StoreError>;
+    /// The immutable executor binding recorded for a remote request;
+    /// `None` = absent (the request is local-bound or predates remote
+    /// placement). A corrupt row is an error, never silently absent —
+    /// a missing binding refuses dispatch, a forged one must too.
+    fn executor_binding(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<crate::executor::ExecutorBinding>, StoreError>;
+    /// The durable operation record for one command identity;
+    /// `None` = absent. Replay and reconciliation read this before any
+    /// endpoint contact.
+    fn executor_operation(
+        &self,
+        request_id: &str,
+        operation_id: &str,
+    ) -> Result<Option<crate::executor::ExecutorOperation>, StoreError>;
+    /// Every durable operation record for one request, ordered by
+    /// `operation_id` — the deterministic reconciliation set a
+    /// restart replays against.
+    fn executor_operations_for_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Vec<crate::executor::ExecutorOperation>, StoreError>;
+    /// The durable remote-collection record for one request; `None` =
+    /// absent (nothing collected or declared). A corrupt row is an
+    /// error, never silently absent — a collection that cannot prove
+    /// its durable record is never `acknowledged` (contract §6, #376).
+    /// Stores that cannot enumerate them return `None` and rely on the
+    /// collection driver's explicit re-check.
+    fn executor_collection(
+        &self,
+        _request_id: &str,
+    ) -> Result<Option<crate::executor::ExecutorCollection>, StoreError> {
+        Ok(None)
+    }
+    /// Collection rows the collection/acknowledgement sweep must
+    /// advance: everything not yet `acknowledged` or `invalid`.
+    /// Stores that cannot enumerate them return none.
+    fn incomplete_executor_collections(
+        &self,
+    ) -> Result<Vec<crate::executor::ExecutorCollection>, StoreError> {
+        Ok(Vec::new())
+    }
     /// The first recorded handoff row for an Invocation; an Invocation
     /// may carry one handoff per required artifact.
     fn handoff_for_invocation(

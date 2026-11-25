@@ -193,7 +193,7 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, HandoffError> {
 /// `git merge-base --is-ancestor` distinguishes a real descendant (0)
 /// from a non-descendant (1); any other exit is a transport failure,
 /// never a quiet "no".
-fn is_ancestor(dir: &Path, base: &str, produced: &str) -> Result<bool, HandoffError> {
+pub(crate) fn is_ancestor(dir: &Path, base: &str, produced: &str) -> Result<bool, HandoffError> {
     let out = git_output(dir, &["merge-base", "--is-ancestor", base, produced])?;
     match out.status.code() {
         Some(0) => Ok(true),
@@ -769,6 +769,37 @@ const VERIFICATION_TIMEOUT_V2: Duration = Duration::from_secs(30 * 60);
 /// The approved v2 captured-output bound: an 8 MiB tail.
 const VERIFICATION_OUTPUT_V2: u64 = 8 * 1024 * 1024;
 
+/// The prefix every bound marker carries. A real `environment_digest`
+/// is exactly 64 lowercase hex characters (`docs/v0.3.md` §3.1); the
+/// prefix makes a marker structurally distinguishable, so recorded
+/// evidence can never present it as a digest of an environment that
+/// never ran.
+pub const BOUND_MARKER_PREFIX: &str = "bound-marker-v1:";
+
+/// The marker digest recorded when the Execution deadline is already
+/// spent. No enforcement hashing or worktree maintenance ran, so the
+/// evidence identifies the checked bound instead: SHA-256 over the
+/// canonical `{"kind":"deadline"}` structure under the
+/// `verification-bound-marker-v1` tag. The shape is
+/// `bound-marker-v1:deadline:<64 lowercase hex>` — never an
+/// `environment_digest` and never a refused/contained identity.
+pub fn deadline_bound_marker() -> String {
+    format!(
+        "{BOUND_MARKER_PREFIX}deadline:{}",
+        sha256_hex(
+            "verification-bound-marker-v1",
+            &canonical_json(&serde_json::json!({"kind": "deadline"})),
+        )
+    )
+}
+
+/// Whether a recorded digest is a bound marker rather than a real
+/// `environment_digest`. Evidence presentation must use this to avoid
+/// mislabelling a marker as an environment identity.
+pub fn is_bound_marker(digest: &str) -> bool {
+    digest.starts_with(BOUND_MARKER_PREFIX)
+}
+
 enum VerificationRun {
     Finished(std::process::ExitStatus),
     TimedOut,
@@ -1108,7 +1139,7 @@ fn prove_verification_mounts(
         Err(workloop_core::ports::SpawnError::Refused { reason }) => Err(format!(
             "verification.toolchain_preflight_failed: spawn refused: {reason}"
         )),
-        Err(workloop_core::ports::SpawnError::Unknown { reason }) => Err(format!(
+        Err(workloop_core::ports::SpawnError::Unknown { reason, .. }) => Err(format!(
             "verification.toolchain_preflight_failed: spawn unknown: {reason}"
         )),
     }
@@ -1384,6 +1415,34 @@ pub fn verify_with_timeout(
         )));
     }
 
+    // A spent bound permits no run at all, and the bound is known
+    // before any cost is paid (`docs/v0.3.md` §14.5: bounds are checked
+    // before the cost is paid). Return before enforcement resolution,
+    // toolchain/cache hashing, and worktree maintenance. Enforcement
+    // never ran, so the evidence carries the dedicated bound marker —
+    // never a fabricated `environment_digest`.
+    if timeout.is_zero() {
+        let mut result = VerificationResult {
+            id: String::new(),
+            artifact_id: artifact_id.to_string(),
+            requirement: requirement.to_string(),
+            argv: argv.to_vec(),
+            produced,
+            environment_digest: deadline_bound_marker(),
+            result: VerificationOutcome::Inconclusive,
+            output: "execution deadline elapsed before verification started".to_string(),
+            recorded_seq: 0,
+        };
+        store.transact(|tx| {
+            result.recorded_seq = tx.alloc_seq()?;
+            result.id = tx.alloc_id("verify")?;
+            tx.apply(&Effect::InsertVerificationResult {
+                result: result.clone(),
+            })
+        })?;
+        return Ok(result);
+    }
+
     // The §14.5 enforcement resolves before the worktree: a missing
     // toolchain/cache or a denied egress host records the same bounded
     // Inconclusive evidence a failed command would — never an
@@ -1438,128 +1497,116 @@ pub fn verify_with_timeout(
     // then add fresh — `worktree add` refuses a registered path.
     let _ = git(&layout.repository, &["worktree", "prune"]);
     let _ = std::fs::remove_dir_all(&worktree);
-    // A spent bound permits no run at all: no worktree is added and
-    // no command spawns — the recorded `Inconclusive` is the same
-    // honest evidence a spent timeout reports.
-    let (result, output) = if timeout.is_zero() {
-        (
-            VerificationOutcome::Inconclusive,
-            "execution deadline elapsed before verification started".to_string(),
-        )
-    } else {
-        // A refused enforcement boundary never registers a worktree —
-        // mutating the handoff repository is part of the cost the
-        // refusal exists to avoid, and cleanup below is only
-        // best-effort.
-        match &enforcement {
-            Err(reason) => (VerificationOutcome::Inconclusive, reason.clone()),
-            Ok(enforcement) => match git(
-                &layout.repository,
-                &[
-                    "worktree",
-                    "add",
-                    "--detach",
-                    worktree.to_str().unwrap_or_default(),
-                    &produced,
-                ],
-            ) {
-                Err(e) => (VerificationOutcome::Inconclusive, format!("worktree: {e}")),
-                Ok(_) => {
-                    let env_root = scratch.join(format!("verify-env-{tag}"));
-                    // The worktree's own gitdir is the single writable
-                    // metadata bind: `git status` can refresh its index
-                    // without ever reaching another artifact's refs.
-                    let gitdir = git(&worktree, &["rev-parse", "--absolute-git-dir"])
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|_| {
-                            layout
-                                .repository
-                                .join("worktrees")
-                                .join(format!("verify-{tag}"))
-                        });
-                    let run = match enforcement {
-                        Enforcement::Hygiene => {
-                            // The recorded v1 hygiene-only environment:
-                            // allowlisted env, fresh HOME/TMPDIR, git config
-                            // scrubbed of credential helpers — required, not
-                            // sufficient; the namespace slice is the
-                            // contained path below.
-                            let _ = std::fs::create_dir_all(env_root.join("home"));
-                            let _ = std::fs::create_dir_all(env_root.join("tmp"));
-                            let env = WorkerEnv {
-                                vars: vec![
-                                    (
-                                        "PATH".to_string(),
-                                        std::env::var("PATH").unwrap_or_default(),
-                                    ),
-                                    (
-                                        "HOME".to_string(),
-                                        env_root.join("home").to_string_lossy().into_owned(),
-                                    ),
-                                    (
-                                        "TMPDIR".to_string(),
-                                        env_root.join("tmp").to_string_lossy().into_owned(),
-                                    ),
-                                    ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
-                                    ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
-                                ],
-                            };
-                            run_verification_command(argv, &worktree, &log_path, &env, timeout)
-                        }
-                        Enforcement::Contained(ctx) => run_verification_contained(
-                            ctx,
-                            layout,
-                            argv,
-                            &worktree,
-                            &gitdir,
-                            &log_path,
-                            &env_root,
-                            &scratch.join(format!("verify-scratch-{tag}")),
-                            &tag,
-                            timeout,
-                        ),
-                    };
-                    // Read back only the bounded tail — never the whole file:
-                    // a large writer must not size the supervisor's memory.
-                    // The cap is the dispatch profile's: 64 KiB recorded v1,
-                    // 8 MiB approved v2.
-                    let captured = match std::fs::File::open(&log_path) {
-                        Ok(f) => {
-                            use std::io::{Read, Seek, SeekFrom};
-                            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-                            let mut r = std::io::BufReader::new(f);
-                            let _ = r.seek(SeekFrom::Start(len.saturating_sub(output_cap)));
-                            let mut bytes = Vec::new();
-                            let _ = r.take(output_cap).read_to_end(&mut bytes);
-                            String::from_utf8_lossy(&bytes).into_owned()
-                        }
-                        Err(_) => String::new(),
-                    };
-                    match run {
-                        VerificationRun::Finished(status) => (
-                            match status.code() {
-                                Some(0) => VerificationOutcome::Pass,
-                                Some(_) => VerificationOutcome::Fail,
-                                // A signal-killed runner is incomplete, never a
-                                // fabricated exit code.
-                                None => VerificationOutcome::Inconclusive,
-                            },
-                            captured,
-                        ),
-                        VerificationRun::TimedOut => (
-                            VerificationOutcome::Inconclusive,
-                            format!("runner exceeded {}s\n{captured}", timeout.as_secs()),
-                        ),
-                        VerificationRun::SpawnFailed(e) => {
-                            (VerificationOutcome::Inconclusive, format!("spawn: {e}"))
-                        }
-                        VerificationRun::Refused(reason) => {
-                            (VerificationOutcome::Inconclusive, reason)
-                        }
+    // A refused enforcement boundary never registers a worktree —
+    // mutating the handoff repository is part of the cost the
+    // refusal exists to avoid, and cleanup below is only
+    // best-effort.
+    let (result, output) = match &enforcement {
+        Err(reason) => (VerificationOutcome::Inconclusive, reason.clone()),
+        Ok(enforcement) => match git(
+            &layout.repository,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                worktree.to_str().unwrap_or_default(),
+                &produced,
+            ],
+        ) {
+            Err(e) => (VerificationOutcome::Inconclusive, format!("worktree: {e}")),
+            Ok(_) => {
+                let env_root = scratch.join(format!("verify-env-{tag}"));
+                // The worktree's own gitdir is the single writable
+                // metadata bind: `git status` can refresh its index
+                // without ever reaching another artifact's refs.
+                let gitdir = git(&worktree, &["rev-parse", "--absolute-git-dir"])
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| {
+                        layout
+                            .repository
+                            .join("worktrees")
+                            .join(format!("verify-{tag}"))
+                    });
+                let run = match enforcement {
+                    Enforcement::Hygiene => {
+                        // The recorded v1 hygiene-only environment:
+                        // allowlisted env, fresh HOME/TMPDIR, git config
+                        // scrubbed of credential helpers — required, not
+                        // sufficient; the namespace slice is the
+                        // contained path below.
+                        let _ = std::fs::create_dir_all(env_root.join("home"));
+                        let _ = std::fs::create_dir_all(env_root.join("tmp"));
+                        let env = WorkerEnv {
+                            vars: vec![
+                                (
+                                    "PATH".to_string(),
+                                    std::env::var("PATH").unwrap_or_default(),
+                                ),
+                                (
+                                    "HOME".to_string(),
+                                    env_root.join("home").to_string_lossy().into_owned(),
+                                ),
+                                (
+                                    "TMPDIR".to_string(),
+                                    env_root.join("tmp").to_string_lossy().into_owned(),
+                                ),
+                                ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+                                ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
+                            ],
+                        };
+                        run_verification_command(argv, &worktree, &log_path, &env, timeout)
                     }
+                    Enforcement::Contained(ctx) => run_verification_contained(
+                        ctx,
+                        layout,
+                        argv,
+                        &worktree,
+                        &gitdir,
+                        &log_path,
+                        &env_root,
+                        &scratch.join(format!("verify-scratch-{tag}")),
+                        &tag,
+                        timeout,
+                    ),
+                };
+                // Read back only the bounded tail — never the whole file:
+                // a large writer must not size the supervisor's memory.
+                // The cap is the dispatch profile's: 64 KiB recorded v1,
+                // 8 MiB approved v2.
+                let captured = match std::fs::File::open(&log_path) {
+                    Ok(f) => {
+                        use std::io::{Read, Seek, SeekFrom};
+                        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                        let mut r = std::io::BufReader::new(f);
+                        let _ = r.seek(SeekFrom::Start(len.saturating_sub(output_cap)));
+                        let mut bytes = Vec::new();
+                        let _ = r.take(output_cap).read_to_end(&mut bytes);
+                        String::from_utf8_lossy(&bytes).into_owned()
+                    }
+                    Err(_) => String::new(),
+                };
+                match run {
+                    VerificationRun::Finished(status) => (
+                        match status.code() {
+                            Some(0) => VerificationOutcome::Pass,
+                            Some(_) => VerificationOutcome::Fail,
+                            // A signal-killed runner is incomplete, never a
+                            // fabricated exit code.
+                            None => VerificationOutcome::Inconclusive,
+                        },
+                        captured,
+                    ),
+                    VerificationRun::TimedOut => (
+                        VerificationOutcome::Inconclusive,
+                        format!("runner exceeded {}s\n{captured}", timeout.as_secs()),
+                    ),
+                    VerificationRun::SpawnFailed(e) => {
+                        (VerificationOutcome::Inconclusive, format!("spawn: {e}"))
+                    }
+                    VerificationRun::Refused(reason) => (VerificationOutcome::Inconclusive, reason),
                 }
-            },
-        }
+            }
+        },
     };
     let _ = git(
         &layout.repository,

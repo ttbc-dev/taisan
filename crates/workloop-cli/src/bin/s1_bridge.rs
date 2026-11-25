@@ -1967,6 +1967,7 @@ mod tests {
     };
     use workloop_core::work::{HostTemplate, handle_command};
 
+    // The isolated S1 scenario repository — private, owner-only.
     const SCENARIO_REPO: &str = "shimpeiws/coding-worker-smoke";
 
     fn test_ctx() -> Ctx {

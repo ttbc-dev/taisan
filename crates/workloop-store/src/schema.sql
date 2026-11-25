@@ -1,6 +1,6 @@
--- workloop v13 store: current-state tables enforcing structural
+-- workloop v16 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
--- `PRAGMA user_version = 13` marks the format; a stamped older file with
+-- `PRAGMA user_version = 16` marks the format; a stamped older file with
 -- the complete recognized schema upgrades additively at open, while an
 -- unversioned slice-0 database and a newer version are refused.
 -- v7 added work_usage.last_progress_basis; v8 added the intake run and
@@ -8,9 +8,13 @@
 -- added the intake_settings admission record (#213); v10 added the
 -- recovery_intents.retirement_generation column (#139); v11 added the
 -- worker_request_bodies canonical v2 request-body record (docs/v0.3.md,
--- #256); v12 added the finding_occurrences.summary column (#264);
--- v13 added work_usage.merge_check_services, the bounded per-pair
--- service cursor that replaced the merge-check observation record.
+-- #256); v12 added the finding_occurrences.summary column (#264); v13
+-- added the observations_execution evidence-lookup index; v14 added the
+-- executor_bindings and executor_operations durable remote-binding
+-- tables (#375, docs/executor-transport-contract.md); v15 added the
+-- executor_collections durable remote-collection record (#376); v16
+-- added work_usage.merge_check_services, the bounded per-pair service
+-- cursor that replaced the merge-check observation record.
 
 CREATE TABLE IF NOT EXISTS store_meta (
     key TEXT PRIMARY KEY,
@@ -195,6 +199,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS observations_dedupe
     ON observations (delivery_scope, delivery_host, delivery_source,
                      delivery_event_id)
     WHERE delivery_event_id IS NOT NULL;
+
+-- Per-Execution evidence history (process, artifacts, reports) is read
+-- in durable order on every supervisor pass and by the deferred-report
+-- retry; keep that lookup from scanning the whole append-only log.
+CREATE INDEX IF NOT EXISTS observations_execution
+    ON observations (subject_execution_id);
 
 -- Recorded host write intents; `pending`/`unknown` are outstanding
 -- effects a terminal state must not silently drain.
@@ -415,6 +425,69 @@ CREATE TABLE IF NOT EXISTS worker_request_bodies (
     format_version TEXT NOT NULL,
     canonical_body BLOB NOT NULL,
     body_digest TEXT NOT NULL
+);
+
+-- The immutable executor endpoint binding for one remote request
+-- (`docs/executor-transport-contract.md` §2): endpoint identity and
+-- incarnation, selected protocol version, capability-set digest,
+-- launch-configuration digest, request digest, and transfer limits —
+-- all inside the canonical `binding_body`, recorded before the first
+-- remote operation is sent. Re-recording identical content is a
+-- replay; different content conflicts — a bound request is never
+-- silently migrated to another endpoint, incarnation, payload, or
+-- launch configuration.
+CREATE TABLE IF NOT EXISTS executor_bindings (
+    request_id TEXT PRIMARY KEY REFERENCES invocation_requests(request_id),
+    binding_body BLOB NOT NULL,
+    binding_digest TEXT NOT NULL
+);
+
+-- The coordinator-side durable operation ledger (`docs/executor-
+-- transport-contract.md` §4): each command's full identity and
+-- canonical bytes are committed before the operation is sent, keyed by
+-- request and operation identity. Replay under byte-identical content
+-- is idempotent; differing bytes conflict and perform no effect. The
+-- receipt attaches to its recorded command — a receipt can never
+-- precede the command it answers.
+CREATE TABLE IF NOT EXISTS executor_operations (
+    request_id TEXT NOT NULL REFERENCES executor_bindings(request_id),
+    operation_id TEXT NOT NULL,
+    operation_kind TEXT NOT NULL CHECK (operation_kind IN
+        ('prepare', 'start', 'observe', 'request_stop', 'collect', 'acknowledge')),
+    command_digest TEXT NOT NULL,
+    command_body BLOB NOT NULL,
+    receipt_body BLOB,
+    receipt_digest TEXT,
+    PRIMARY KEY (request_id, operation_id)
+);
+
+-- One start slot per request (`docs/executor-transport-contract.md`
+-- §4): a second distinct start command for the same bound request
+-- conflicts — the store never holds two durable start records.
+CREATE UNIQUE INDEX IF NOT EXISTS executor_one_start
+    ON executor_operations (request_id)
+    WHERE operation_kind = 'start';
+
+-- The durable remote-collection record (`docs/executor-transport-
+-- contract.md` §6, #376): one bound request admits exactly one
+-- collection identity — request_id is the key, and a record naming a
+-- different collection_id, invocation, or collection digest for the
+-- same request is a conflict, never an overwrite. `collection_body`
+-- is the canonical validated record; `body_digest` re-checks it on
+-- every read. State is monotonic — collecting → collected →
+-- acknowledged, invalid terminal — with recorded_seq the
+-- compare-and-set cursor the UpsertHandoff rows already use.
+CREATE TABLE IF NOT EXISTS executor_collections (
+    request_id TEXT PRIMARY KEY REFERENCES executor_bindings(request_id),
+    invocation_id TEXT NOT NULL,
+    collection_id TEXT NOT NULL,
+    collection_digest TEXT NOT NULL,
+    collection_body BLOB NOT NULL,
+    body_digest TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN
+        ('collecting', 'collected', 'acknowledged', 'invalid')),
+    invalid_reason TEXT,
+    recorded_seq INTEGER NOT NULL
 );
 
 -- Two-phase bounded reclaim plans for explicit `retention cleanup`.

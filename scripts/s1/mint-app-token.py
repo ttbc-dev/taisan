@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Mint a GitHub App installation token for the S1 reviewer App.
 
+Owner-operations tooling: it depends on the owner's local App sidecar
+record and the private ``shimpeiws/coding-worker-smoke`` installation —
+it cannot run for a public reader.
+
 Reads the local App sidecar record
 (``~/.config/coding-worker/github-apps/s1-reviewer.json`` by default,
 overridable with ``--config <path>``), builds an RS256 App JWT signed

@@ -10,6 +10,19 @@ authorize live execution.** Executing the live scenario and approving
 live evidence is separately scoped (#113) and requires its own explicit
 authorization under the [implementation start gate](../design-closure.md#implementation-start-gate).
 
+**Private references and owner-ops tooling.** The S1 scenario targets
+`shimpeiws/coding-worker-smoke`, a private repository owned by this
+project's owner: every link and `#N` citation to it in this directory
+and in the paired `fixtures/s1/` data resolves only for the owner
+(they 404 publicly). The live-execution
+documents below (`live-runbook.md`, `stage-c-runbook.md`,
+`live-authorization.md`, `live-acceptance-checklist.md`,
+`live-evidence-template.md`) and the tooling under `scripts/s1/` are
+owner-operations material — they describe and support runs only the
+owner can execute, and are retained as records, not as publicly
+runnable procedure. Names and paths are kept verbatim under the owner
+publication decision (#438).
+
 ## Materials
 
 | Material | Contents |

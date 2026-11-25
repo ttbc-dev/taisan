@@ -9,9 +9,9 @@ retained as maintainer locators. The
 detailed audit — inspected revisions, per-behavior
 retain/re-model/omit decisions, incident analysis, and evidence
 classification — lives in
-[source-workflow-audit](source-workflow-audit.md) (issue #33), which is
-the audit record and needs its own disclosure review before this
-repository is published.
+[source-workflow-audit](source-workflow-audit.md) (issue #33), the
+audit record, which stays in the published tree under the owner
+decision recorded in [release-audit](release-audit.md) §7 (#438).
 
 ## Source systems
 
@@ -27,9 +27,29 @@ referred to here by role, using the legend in the audit document:
 | the infra repo | Remote execution infrastructure running bounded worker jobs in isolated containers | Execution-environment evidence: bounded runs, idempotent lifecycle operations, and the observation that a lost acknowledgement is not proof of failure |
 
 All four systems are private. Their names, contents, histories, and
-internal identifiers are not reproduced in this project's
-publication-facing documents and are not consulted at build or runtime;
-the audit document records what was inspected and at which revisions.
+internal identifiers are not consulted at build or runtime and are not
+reproduced in publication-facing documents outside the two
+owner-controlled audit records (`docs/source-workflow-audit.md`,
+`docs/release-audit.md`); the one name that does surface outside them
+is the worker repo's, embedded in the smoke repo's name and owner-local
+config paths described in the next section. The audit document records
+what was inspected and at which revisions.
+
+## Private references in this repository
+
+Separately from the source systems above, this tree records live
+acceptance work executed against `shimpeiws/coding-worker-smoke`, a
+private GitHub repository owned by this project's owner. Documents
+that cite it — under `docs/s1/`, `docs/evidence/`, and
+`fixtures/s1/` — retain the name verbatim: links and `#N` issue/PR
+citations to it resolve only for the owner (they 404 publicly), and
+each citing document marks those references as private/owner-only.
+The same applies to owner-local paths (`~/.config/coding-worker/`,
+`~/s1-*` run directories) and owner-recorded runtime identities
+(GitHub App, installation, and user ids) inside owner-run records.
+Disclosure of these names and the owner identity was accepted by
+owner decision under issue #438; no credential values are recorded
+anywhere in the tree.
 
 ## Provenance versus dependency
 

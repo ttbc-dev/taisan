@@ -2,6 +2,7 @@ pub mod census;
 pub mod command;
 pub mod credential;
 pub mod domain;
+pub mod executor;
 pub mod identity;
 pub mod mergeability;
 pub mod observation;
