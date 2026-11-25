@@ -237,6 +237,10 @@ status on the candidate:
 | #448 — resume after consumed `next_role` re-queues as `coding`, not the judged role | None (open) | Run 4: operator `resume` after `inv-3`'s refusal issued `e-1:inv:3` as `coding` pinned to the Work base — a judged fix proved effectively single-shot even though the refusal was environmental |
 | #449 — worker runtime residue (`__pycache__`) dirties workspace, refuses next launch | None (open) | Run 4: `launch_refused: workspace conflict: workspace is not clean` on untracked interpreter caches left by the worker's own verification; manual removal + resume unblocked the gate |
 | #450 — republish of a divergent head holds `read_indeterminate` forever | None (open) | Run 4: round-2 `push_ref` `act-27b7a832` (produced `2d0163c`, `expected_prior` `fdc0bb8a`) held `read_indeterminate` permanently — `compare` 404 collapses to Indeterminate instead of Absent; teardown additionally showed the pending intent defers Execution cancel settlement (`stopping` held as the honest terminal) |
+| #453 — cancel does not withdraw pending outbox intents | None (open) | Run 4/5: run-4's `e-1` sits durably `stopping` — a cancelled Execution's held claim + capacity slot had to be released by hand before run 5 could submit (`issue_claims`/`slots` rows) |
+| #454 — capability reports only refresh on unscoped passes | None (open) | Run 5 (`179f6fe`): a `run --work`-scoped loop deadlocked publication on a poisoned capability ledger (obs 41 all-`unknown`); one bounded unscoped pass recorded a fresh authorized `CapabilityReport` (obs 55) and unblocked the publish gate |
+| #455 — remote leftover head kills a Work's publish path | None (open) | Run 5: `work/w-2` residue (`35ce3cb`) → `stale_head`, then three deterministic `merge-base` missing-object refusals burned `transport_retries_used` to 4 > 3 → `transport_exhausted`; post-resume `maybe_publish` mints zero intents (work.rs:4155 early-return, no budget reset, `resume` requeues `coding` only) — no operator release; folded evidence: non-transport refusals consume `recovery.transport.*` budget (#447 class) |
+| #456 — `unavailable`/`provider_unavailable` check at exit 0 is lane-terminal | None (open) | Run 5 ×3 reproduction: `inv-16`/`inv-18`/`inv-20` (invariant_check) reported `provider_unavailable` at exit 0 — `checked`=true so no bounded re-request, assessment stays `complete:false`, completion permanently closed; worker log shows `api_error: connection_failed` after ~473 s while coding/fix Invocations went 4/4 |
 
 Repairs in flight at record time: PR #427 (sibling-PR conflict
 detection, #323) and PR #431 (`artifact.json` collision, #419) are
@@ -255,6 +259,31 @@ produced live evidence, while the judged-fix H2 leg, the republish
 converged path, and the verified-outcome settle stayed unexercised —
 each blocked by a filed defect (#447/#448/#449/#450).
 
+Run 5 (#270, owner-authorized, guest `taisan-v03`, driver built from
+`179f6fe`) reached **M-1…M-6 PASS** on independent
+Execution chains (e-3 → PR #66, e-4 → PR #67) — proven twice for
+M-1, M-3, M-4, M-5 and M-6; M-2 (independent invariant coverage) is
+proven on the e-3 chain only, e-4's `inv-18` having completed
+`unavailable`/`provider_unavailable` — covering: intake, real coding,
+independent verification, H1 publish, bound-actor review finding →
+`paused_judgment`, `judge-findings`/`release-judgment` → judged fix,
+and the republish-converged H2 leg (`expected_prior` fast-forward,
+PR check runs observed SUCCESS under a `required_checks []`
+installation) — including the path run 4 never reached. **M-7
+verified outcome stayed unexercised**: the post-republish
+invariant checks (`inv-16`, `inv-20`) reported `provider_unavailable`
+at exit 0 — lane-terminal under #456, with the provider failure
+reproduced three times (`connection_failed`). Two earlier structural
+deadlocks were hit and honestly terminated: #455 (e-2 `cancelled` —
+publish path dead on transport-budget exhaustion with no release) and
+the #453/#454 chains (pre-run surgery + one bounded unscoped pass,
+recorded as operator inputs). Termination was the owner **Z1**
+decision; e-4 is left parked `waiting(ci)` with `automatic_time_limit`
+as the expected terminus. Retained record:
+`RUN-RECORD-2026-11-25-RUN5.md` (owner-side), sanitized evidence copy
+`acceptance-v03-run5/`; the repo-facing filled record is
+`docs/evidence/v0.3-manual-acceptance.md`.
+
 Recorded observations not yet filed as issues (kept visible, not
 silently dropped):
 
@@ -264,7 +293,17 @@ silently dropped):
   acceptance criteria as a separate small follow-up).
 - `CapabilityReport` is issued on the unscoped pass only; a
   `run --work`-scoped loop deadlocks publication — clarify intended
-  scoping (run 1 deferred observation).
+  scoping (run 1 deferred observation; now filed as #454).
+- Runs 1–3 left remote `work/w-2` at `35ce3cb` on the smoke repository
+  (teardown gap, ops-side not a code defect; owner-deleted during run
+  5 — its collision with the publish lease produced #455's first
+  stage). Retained `work/w-1` (run 4's PR #65) stayed untouched at
+  `fdc0bb8a`, verified at run-5 teardown.
+- Run 5 operator error recorded for honesty: a scoped loop briefly
+  launched with `export HOME=/root` broke `gh` config resolution for
+  the guest user and paused e-3 on `source read unavailable`;
+  relaunching without the export resolved it — operator error, not a
+  defect.
 - macOS cannot host containment natively (no bubblewrap); the tracked
   answer is the minimal on-demand Linux guest (#373 design).
 
@@ -285,7 +324,7 @@ while their owner decisions remain open. States verified 2026-11-25:
 | #366 — pluggable public Selector/Worker references | Closed | PR #404 (`f883d6e`) | done |
 | #368 — public-content/history/metadata audit | Audit delivered | PR #432 (`b0b81f6`) | `release-audit.md` §5 blockers stay gated on the publication-route decision — an open owner choice, not picked here |
 | #369 — license selection prep | Prep delivered | PR #433 (`aff8721`) | license selection, `LICENSE`, and package metadata pending owner choice |
-| #270 — manual real-Worker acceptance | M-1…M-7 exercised live | runs 1–6 retained owner-side | Run 6 done (driver `c445feee` incl. the #458 fix): M-7 verified outcome exercised — post-republish `invariant_check` → assessment `complete:true` → `succeeded` on e-5 (`RUN-RECORD-2026-11-25-RUN6.md`, sanitized copy `acceptance-v03-run6/`); M-7 row filled in `docs/evidence/v0.3-manual-acceptance.md`. Attribution recorded honestly: run 6's H1 review round sealed with zero occurrences, so the finding→judged-fix→republish legs (M-4/M-5/M-6) are evidenced by run 5's e-3/e-4 chains — the M-1…M-6 rows are recorded in the separate run-5 record PR (#457), still `TO RECORD` in this PR's base; residual: owner approval (record §8), restart-clean store-recovery variant still unexercised, sanitized public evidence fold-in — pending owner review |
+| #270 — manual real-Worker acceptance | M-1…M-7 exercised live | runs 1–6 retained owner-side | Run 6 done (driver `c445feee` incl. the #458 fix): M-7 verified outcome exercised — post-republish `invariant_check` → assessment `complete:true` → `succeeded` on e-5 (`RUN-RECORD-2026-11-25-RUN6.md`, sanitized copy `acceptance-v03-run6/`); M-7 row filled in `docs/evidence/v0.3-manual-acceptance.md`. Attribution recorded honestly: run 6's H1 review round sealed with zero occurrences, so the finding→judged-fix→republish legs (M-4/M-5/M-6) are evidenced by run 5's e-3/e-4 chains — the M-1…M-6 rows are recorded via the run-5 record (#457, merged); residual: owner approval (record §8), restart-clean store-recovery variant still unexercised, sanitized public evidence fold-in — pending owner review |
 | #271 — scheduled pilot acceptance | Not started | — | pending owner run (§5) |
 | #367 — clean-Linux-install reproduction | Not started | — | pending owner run; reuses #269 runbook and #270/#271 evidence where it qualifies |
 | #370 / #371 — candidate freeze; go/no-go | Not started | — | gated on this ledger, the route decision, and the license selection |
