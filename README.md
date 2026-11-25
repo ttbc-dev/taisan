@@ -49,7 +49,7 @@ The system can make routine implementation decisions within the supplied intent 
 
 ## Build and run
 
-Install Rust with support for edition 2024, then build from source. The v0.3 Worker path is documented in the [installation and operation guide](docs/v0.3-installation.md); live Worker and host acceptance remains owner-run.
+Install Rust with support for edition 2024, then build from source. A Linux install additionally needs `bwrap`, `git`, and a C toolchain; the `github` host transport needs the `gh` CLI, and the public reference Worker needs a Node.js runtime for `claude`. The public reference Selector/Worker install the same way per [public reference adapters](docs/reference-adapters.md). The v0.3 Worker path is documented in the [installation and operation guide](docs/v0.3-installation.md); live Worker and host acceptance remains owner-run.
 
 ```sh
 git clone https://github.com/ttbc-dev/taisan.git
