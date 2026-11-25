@@ -51,13 +51,18 @@ checks rules that span fields, messages, and artifact bytes.
 Exclusion is default-on for both profiles; ordinary evidence remains
 exportable.
 
-An excluded artifact's content is absent from the page, every bundle
-file, and every preview render. Its integrity metadata is retained in
-the export manifest (`--manifest PATH`, or `manifest.json` in an
-`--output DIR` bundle): artifact id, class, identity, SHA-256, byte
-length, media type, availability, and whether content or a preview was
-included. A referenced excluded artifact also carries an artifact-class
-gap so the page remains a valid, honest export.
+Exclusion runs at the replay: an event whose artifact class is excluded
+projects no records and feeds no derived bindings, so no exported file —
+the page, every bundle file, and every preview render — carries the
+artifact's bytes or copies of its payload, including entity text derived
+from it (a work naming an excluded spec revision exports `intent: null`
+with an `intent`-class gap). A source reference to an excluded artifact,
+where one remains, resolves to a descriptor shell marked `unavailable`
+plus an artifact-class gap so the page stays valid. Its integrity
+metadata is retained in the export manifest (`--manifest PATH`, or
+`manifest.json` in an `--output DIR` bundle): artifact id, class,
+identity, SHA-256, byte length, media type, availability, and whether
+content or a preview was included.
 
 `--output DIR` writes `manifest.json`, `page.json`, the included
 artifacts, and their previews. `--include-class CLASS` is the only way

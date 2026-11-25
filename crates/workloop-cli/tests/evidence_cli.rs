@@ -576,17 +576,20 @@ fn help_documents_the_supported_protocol() {
 const PLAN_MARKER: &str = "PLAN-ONLY-MARKER-2f8c4d1a-SECRET";
 
 /// Append a spec revision whose retained artifact payload carries the
-/// private marker in a source snapshot (which no exported record body
-/// copies), then register the event artifact as plan-class. The
-/// projected invariant keeps the event cited, so the artifact really is
-/// part of the export page before the profile excludes it.
+/// private marker in fields the projection copies into exported record
+/// bodies — the constraint text (projected as invariant `text`) and the
+/// spec intent (projected as work `intent`) — then register the event
+/// artifact as plan-class. A following `UpdateWork` names the spec
+/// revision so a retained work revision would copy the intent if the
+/// exclusion only filtered descriptors. Returns the plan artifact id
+/// and its payload digest.
 fn append_plan_artifact(db: &Path) -> (String, String) {
     let store = SqliteStore::open(db, 2).unwrap();
     let spec = SpecSnapshot {
         work_id: WorkId("w-1".into()),
         revision: 2,
         payload: SpecPayload {
-            intent: "synthetic follow-up".into(),
+            intent: PLAN_MARKER.into(),
             sources: vec![SourceSnapshot {
                 issue: IssueRef {
                     repository: repo(),
@@ -596,7 +599,7 @@ fn append_plan_artifact(db: &Path) -> (String, String) {
                 source_revision: PLAN_MARKER.into(),
                 content_digest: "p".repeat(64),
             }],
-            constraints: vec!["exported constraint".into()],
+            constraints: vec![PLAN_MARKER.into()],
             verification_argv: vec![],
             required_checks: vec![],
             lanes: LanePolicy::default(),
@@ -616,6 +619,38 @@ fn append_plan_artifact(db: &Path) -> (String, String) {
         .unwrap();
     let id = format!("event:{seq}");
     store.set_artifact_class(&id, ArtifactClass::Plan).unwrap();
+    // A work revision naming the excluded spec: without replay-level
+    // exclusion this record copies the plan intent into `intent`.
+    let work = Work {
+        id: WorkId("w-1".into()),
+        version: 2,
+        binding: HostBinding::new(
+            AdapterId::trusted("fixture"),
+            repo(),
+            1,
+            [],
+            vec![RoleBinding {
+                role: ActorRole::Publication,
+                actor: HostActorRef {
+                    host: host(),
+                    actor: HostActorId::trusted("pub-agent"),
+                },
+                credential_ref: CredentialRef::trusted("cred"),
+            }],
+        )
+        .unwrap(),
+        spec: 2,
+        approved_spec: 2,
+        source_gate: SourceGate::NotApplicable,
+        policy: WorkPolicy::default(),
+        created_seq: 0,
+    };
+    store
+        .append_event(
+            "effect",
+            &serde_json::to_string(&Effect::UpdateWork { work, expected: 1 }).unwrap(),
+        )
+        .unwrap();
     let snapshot = store.evidence_history().unwrap();
     let descriptor = snapshot
         .events
@@ -677,6 +712,68 @@ fn sanitized_export_excludes_plan_content_but_retains_integrity_metadata() {
             .all(|artifact| artifact.artifact_id != plan_id),
         "the excluded artifact descriptor is not exported as content-bearing"
     );
+
+    // Replay-level exclusion: no record projected from the excluded
+    // event survives, so no entity or link body may cite it or carry a
+    // copy of its payload. The spec's invariant entities are gone, and
+    // the work revision naming the excluded spec exports intent: null
+    // with the intent-class gap the contract requires.
+    let bodies: Vec<serde_json::Value> = page
+        .entities
+        .iter()
+        .chain(page.links.iter())
+        .map(|record| serde_json::from_str(&record.body_json).unwrap())
+        .collect();
+    assert!(
+        bodies
+            .iter()
+            .all(|body| !serde_json::to_string(body).unwrap().contains(PLAN_MARKER)),
+        "an exported record body leaked excluded plan content"
+    );
+    assert!(
+        bodies.iter().all(|body| {
+            body["source_refs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .all(|r| r["artifact_id"] != plan_id)
+        }),
+        "a retained record still cites the excluded artifact"
+    );
+    for prefix in ["req:w-1:2:", "inv:w-1:2:"] {
+        assert!(
+            page.entities
+                .iter()
+                .all(|record| !record.source_id.starts_with(prefix)),
+            "spec-revision entities projected from the excluded event must not export"
+        );
+    }
+    let work_body = bodies
+        .iter()
+        .find(|body| body["source_id"] == "work:w-1" && body["revision"] == "r2")
+        .expect("the work revision naming the excluded spec");
+    assert!(work_body["payload"]["intent"].is_null());
+    assert!(
+        page.gaps.iter().any(|gap| {
+            gap.evidence_class == EvidenceClass::Intent
+                && matches!(
+                    &gap.scope,
+                    GapScope::Revision { record } if record.source_id == "work:w-1"
+                        && record.revision == "r2"
+                )
+        }),
+        "a work with intent: null requires an intent-class gap"
+    );
+
+    // The emitted page is a valid export: every source reference
+    // resolves against the artifact set the page declares.
+    let req = ExportRequest {
+        protocol_version: ProtocolVersion::V1,
+        after: None,
+        cursor: None,
+        limit: 500,
+    };
+    validate_snapshot(&[(req, page.clone())], None, &artifact_bytes(&db)).unwrap();
 
     let manifest: ExportManifest =
         serde_json::from_slice(&std::fs::read(out_dir.join("manifest.json")).unwrap()).unwrap();
@@ -924,4 +1021,47 @@ fn widening_a_sanitized_profile_is_explicit_and_recorded() {
         .into_iter()
         .any(|file| String::from_utf8_lossy(&std::fs::read(file).unwrap()).contains(PLAN_MARKER));
     assert!(leaked, "an explicit widening exports the plan content");
+}
+
+/// A pre-existing symlinked `artifacts/` subtree must never be
+/// followed: the bundle sweep unlinks it rather than deleting regular
+/// files under the link target.
+#[cfg(unix)]
+#[test]
+fn export_sweep_unlinks_a_symlinked_artifacts_dir() {
+    let root = root("sweep-symlink");
+    let db = root.join("workloop.db");
+    populate(&db);
+    let out_dir = root.join("linked-export");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let target = root.join("elsewhere");
+    std::fs::create_dir_all(&target).unwrap();
+    let victim = target.join("keep-me.txt");
+    std::fs::write(&victim, b"not ours to delete").unwrap();
+    std::os::unix::fs::symlink(&target, out_dir.join("artifacts")).unwrap();
+
+    let output = output_at(
+        &root,
+        &[
+            "evidence",
+            "export",
+            "--limit",
+            "500",
+            "--profile",
+            "sanitized",
+            "--output",
+            &out_dir.to_string_lossy(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(&victim).unwrap(), b"not ours to delete");
+    // The link is gone; a real `artifacts/` subtree carries the bundle.
+    let metadata = std::fs::symlink_metadata(out_dir.join("artifacts")).unwrap();
+    assert!(!metadata.file_type().is_symlink());
+    assert!(metadata.is_dir());
+    assert!(out_dir.join("manifest.json").is_file());
 }

@@ -61,6 +61,23 @@ fn artifact_id(seq: u64) -> String {
     format!("event:{seq}")
 }
 
+/// The canonical artifact id one retained `effect` row is exported
+/// under — the same spelling [`artifact_seq`] resolves.
+pub(crate) fn event_artifact_id(seq: u64) -> String {
+    artifact_id(seq)
+}
+
+/// The descriptor an `event:<seq>` artifact declares in an export page:
+/// the event-log identity, the payload digest and length, the JSON
+/// media type, and payload-size availability.
+pub(crate) fn event_descriptor(
+    snap: &HistorySnapshot,
+    seq: u64,
+    payload: &[u8],
+) -> ArtifactDescriptor {
+    descriptor(&snap.installation_id, &snap.store_epoch, seq, payload)
+}
+
 fn descriptor(
     installation_id: &str,
     store_epoch: &str,
@@ -1789,16 +1806,24 @@ fn project(
 /// (the consumer already committed everything at or below the lower
 /// checkpoint); derivation state is replayed from the retained boundary
 /// so revision numbering and endpoint bindings stay continuous.
+/// `excluded_events` names recorded rows an export profile withholds;
+/// an excluded row is skipped entirely — nothing is projected from it
+/// and none of its registered facts feed derived bindings — so the
+/// export can never carry a copy of excluded content.
 fn materialize(
     snap: &HistorySnapshot,
     watermark: u64,
     after_seq: Option<u64>,
+    excluded_events: &BTreeSet<u64>,
 ) -> Result<Materialized, ExportError> {
     let mut rep = Replay::default();
     let mut items = Vec::new();
     for event in &snap.events {
         if event.seq > watermark {
             break;
+        }
+        if excluded_events.contains(&event.seq) {
+            continue;
         }
         let effect: Effect = serde_json::from_str(&event.payload).map_err(|e| {
             ExportError::new(
@@ -1951,6 +1976,19 @@ pub fn export_page(
     snap: &HistorySnapshot,
     now_unix_seconds: i64,
 ) -> Result<ExportPage, ExportError> {
+    export_page_excluding(request, snap, now_unix_seconds, &BTreeSet::new())
+}
+
+/// `export_page` with the recorded rows listed in `excluded_events`
+/// removed from the replay: no record is projected from them and no
+/// replay state is derived from their payloads, so a profiled export
+/// carries neither the excluded artifacts nor copies of their content.
+pub(crate) fn export_page_excluding(
+    request: &ExportRequest,
+    snap: &HistorySnapshot,
+    now_unix_seconds: i64,
+    excluded_events: &BTreeSet<u64>,
+) -> Result<ExportPage, ExportError> {
     validate_request(request).map_err(|e| {
         ExportError::new(
             ErrorCode::InvalidRequest,
@@ -2035,7 +2073,7 @@ pub fn export_page(
         retained_from_seq: retained,
         after_seq,
     };
-    let mat = materialize(snap, watermark, after_seq)?;
+    let mat = materialize(snap, watermark, after_seq, excluded_events)?;
     let limit = usize::from(request.limit);
     let mut a = Assembly::new();
     if after_seq.is_none() && retained > 1 && position == 0 && gap_pos == 0 {

@@ -326,6 +326,19 @@ fn write_bundle(dir: &Path, files: &[ExportedFile]) -> Result<(), String> {
 /// subtrees; empty descendants are pruned so a narrower export leaves no
 /// stale tree behind. Symlinks are unlinked, never followed.
 fn sweep_stale_files(path: &Path, keep: &BTreeSet<PathBuf>) -> Result<(), String> {
+    // The subtree root itself is checked without following it: a
+    // symlinked `artifacts/` or `previews/` must be unlinked, never
+    // descended — `read_dir` resolves the link and the sweep would
+    // delete regular files under an attacker-controlled target.
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("cannot inspect the export directory: {e}")),
+    };
+    if metadata.file_type().is_symlink() {
+        return std::fs::remove_file(path)
+            .map_err(|e| format!("cannot clear a stale export link: {e}"));
+    }
     let entries = match std::fs::read_dir(path) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),

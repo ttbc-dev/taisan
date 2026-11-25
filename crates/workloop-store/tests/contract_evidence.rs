@@ -1014,3 +1014,53 @@ fn oversized_payloads_export_unavailable_with_an_artifact_gap() {
         ErrorCode::ArtifactTooLarge
     );
 }
+
+#[test]
+fn a_profiled_page_keeps_an_unavailable_shell_for_a_cited_exclusion() {
+    use workloop_store::artifact_class::ArtifactClass;
+    use workloop_store::export_profile::{ExportProfile, profile_page};
+
+    let store = SqliteStore::open(&db_path("shell"), 2).unwrap();
+    append(&store, &full_history());
+    // Marking the first event plan-class while the page is built by the
+    // unfiltered exporter leaves its projected records on the page, so
+    // their own source references still cite `event:1` — the
+    // still-cited-exclusion path `profile_page` must keep resolvable.
+    store
+        .set_artifact_class("event:1", ArtifactClass::Plan)
+        .unwrap();
+    let snap = snapshot(&store);
+    let req = ExportRequest {
+        protocol_version: ProtocolVersion::V1,
+        after: None,
+        cursor: None,
+        limit: 500,
+    };
+    let page = evidence::export_page(&req, &snap, NOW).unwrap();
+    let profiled = profile_page(page, &snap, &ExportProfile::sanitized());
+
+    let shell = profiled
+        .page
+        .artifacts
+        .iter()
+        .find(|a| a.artifact_id == "event:1")
+        .expect("a still-cited exclusion keeps a descriptor shell");
+    assert_eq!(shell.availability, Availability::Unavailable);
+    assert!(profiled.page.gaps.iter().any(|g| {
+        g.code == GapCode::SourceUnavailable
+            && g.evidence_class == EvidenceClass::Artifact
+            && matches!(
+                &g.scope,
+                GapScope::Artifact { artifact_id, .. } if artifact_id == "event:1"
+            )
+    }));
+    assert!(
+        profiled
+            .manifest
+            .excluded_artifact("event:1")
+            .is_some_and(|entry| entry.excluded && !entry.content_included)
+    );
+    // Every source reference resolves: the frozen validator accepts
+    // the profiled page.
+    validate_snapshot(&[(req, profiled.page)], None, &artifact_bytes(&snap)).unwrap();
+}

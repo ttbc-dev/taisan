@@ -7,10 +7,16 @@
 //! manifest, so an audited export always states what left and what did
 //! not.
 //!
-//! Excluded artifacts are removed from the exported page and emit no
-//! content file or preview. Their identity, digest, length, media type,
-//! and availability remain in [`ExportManifest::artifacts`] so the
-//! exclusion is auditable without carrying the content.
+//! Exclusion runs at the replay: an event whose artifact class the
+//! profile excludes projects no records and feeds no derived bindings,
+//! so the exported page carries neither the artifact nor copies of its
+//! payload. Excluded artifacts emit no content file or preview. A
+//! still-referenced excluded artifact keeps a descriptor shell marked
+//! `unavailable` plus an artifact-class gap, so the page stays valid;
+//! and every excluded event in the export's range keeps its identity,
+//! digest, length, media type, and availability in
+//! [`ExportManifest::artifacts`] so the exclusion is auditable without
+//! carrying the content.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,7 +27,9 @@ use workloop_evidence_protocol::{
 };
 
 use crate::artifact_class::{ArtifactClass, classify_artifact};
-use crate::evidence::{HistorySnapshot, artifact_seq, export_page};
+use crate::evidence::{
+    HistorySnapshot, artifact_seq, event_artifact_id, event_descriptor, export_page_excluding,
+};
 
 /// The manifest format version.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -248,6 +256,29 @@ fn safe_name(artifact_id: &str, sha256: &str) -> String {
     format!("{name}-{suffix}")
 }
 
+/// The recorded rows whose artifact this profile excludes, keyed by
+/// sequence. An excluded row is skipped by the export replay — every
+/// record projected from it would be a copy of excluded content — and
+/// listed here so the manifest can keep the integrity entry the
+/// artifact's absence requires.
+fn excluded_event_seqs(
+    snap: &HistorySnapshot,
+    profile: &ExportProfile,
+) -> BTreeMap<u64, ArtifactClass> {
+    snap.events
+        .iter()
+        .filter_map(|event| {
+            let id = event_artifact_id(event.seq);
+            let class = classify_artifact(
+                &id,
+                Some(event.payload.as_bytes()),
+                snap.artifact_classes.get(&id).copied(),
+            );
+            profile.excludes(class).then_some((event.seq, class))
+        })
+        .collect()
+}
+
 /// Apply `profile` to a page and build its integrity manifest.
 pub fn profile_page(
     mut page: ExportPage,
@@ -343,7 +374,52 @@ pub fn profile_page(
         });
         if !excluded {
             page.artifacts.push(descriptor);
+        } else if referenced.contains(&descriptor.artifact_id) {
+            // A still-cited exclusion keeps a descriptor shell — no
+            // content, availability downgraded — so the source
+            // references that name it resolve and the page stays
+            // valid; the artifact gap emitted above marks the bytes
+            // withheld.
+            let mut shell = descriptor;
+            shell.availability = Availability::Unavailable;
+            page.artifacts.push(shell);
         }
+    }
+    // Excluded events project no records, so their descriptors never
+    // reach the page — the manifest still owes each of them an
+    // integrity entry for the exclusion to stay auditable.
+    let excluded_events = excluded_event_seqs(snap, profile);
+    let lower = page.after_seq.unwrap_or(0);
+    let mut covered: BTreeSet<String> = artifacts
+        .iter()
+        .map(|entry| entry.artifact_id.clone())
+        .collect();
+    for event in &snap.events {
+        if event.seq > page.snapshot_seq {
+            break;
+        }
+        if event.seq <= lower {
+            continue;
+        }
+        let Some(&class) = excluded_events.get(&event.seq) else {
+            continue;
+        };
+        let descriptor = event_descriptor(snap, event.seq, event.payload.as_bytes());
+        if !covered.insert(descriptor.artifact_id.clone()) {
+            continue;
+        }
+        artifacts.push(ArtifactIntegrityEntry {
+            artifact_id: descriptor.artifact_id,
+            class,
+            excluded: true,
+            content_included: false,
+            preview_included: false,
+            sha256: descriptor.sha256,
+            byte_length: descriptor.byte_length,
+            media_type: descriptor.media_type,
+            identity: descriptor.identity,
+            availability: descriptor.availability,
+        });
     }
 
     page.gaps.extend(excluded_gaps);
@@ -366,14 +442,19 @@ pub fn profile_page(
     }
 }
 
-/// Produce a profiled export page and its manifest.
+/// Produce a profiled export page and its manifest. Events whose
+/// artifact class the profile excludes are withheld from the replay
+/// itself — an exported record body is a copy of its source payload,
+/// so the exclusion must run before projection, not only over the
+/// emitted artifact set.
 pub fn export_profiled(
     request: &ExportRequest,
     snap: &HistorySnapshot,
     now_unix_seconds: i64,
     profile: &ExportProfile,
 ) -> Result<ProfiledExport, ExportError> {
-    let page = export_page(request, snap, now_unix_seconds)?;
+    let excluded: BTreeSet<u64> = excluded_event_seqs(snap, profile).keys().copied().collect();
+    let page = export_page_excluding(request, snap, now_unix_seconds, &excluded)?;
     let export = profile_page(page, snap, profile);
     if export.page.gaps.len() > MAX_PAGE_GAPS
         || serde_json::to_vec(&export.page)

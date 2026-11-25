@@ -320,8 +320,9 @@ enum EvidenceCommands {
         /// by default. Recorded as a widening in the export manifest.
         #[arg(long = "include-class", alias = "widen", alias = "include")]
         include_class: Vec<String>,
-        /// Write a sanitized export bundle (page, manifest, included
-        /// artifacts, and previews) into this directory.
+        /// Write an export bundle (page, manifest, included artifacts,
+        /// and previews) into this directory. The bundle follows the
+        /// selected `--profile`; `full` exports every artifact class.
         #[arg(long, alias = "out-dir")]
         output: Option<PathBuf>,
         /// Write the export manifest to this file.
