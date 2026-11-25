@@ -299,8 +299,12 @@ files; `assets/taisan-hero.jpg` is excluded under its own terms in
 whole `assets/` directory — and the standard MIT/Apache-2.0 texts carry
 no image exceptions).
 
-Applied artifacts: `LICENSE-MIT`, `LICENSE-APACHE` (standard texts,
-copyright `2026 Shimpei Takamatsu`), `README.md` License section,
+Applied artifacts: `LICENSE-MIT` (standard MIT text carrying the
+copyright line `2026 Shimpei Takamatsu`), `LICENSE-APACHE` (verbatim
+Apache Software Foundation text —
+https://www.apache.org/licenses/LICENSE-2.0.txt — the project
+copyright is recorded in `LICENSE-MIT` and here, not inside the
+standard text), `README.md` License section,
 `assets/LICENSE.md`, `CONTRIBUTING.md` (same dual license for
 contributions, no CLA/copyright assignment), `THIRD-PARTY.md` (87-crate
 inventory with per-package copyright or `authors` attribution),

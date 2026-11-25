@@ -1,11 +1,10 @@
 # Contributing
 
-Unless you explicitly state otherwise, any contribution intentionally
-submitted for inclusion in this project is licensed under the same
-terms as the project itself — either the MIT License or the Apache
-License, Version 2.0, at your option — without any additional terms
-or conditions. See [LICENSE-MIT](LICENSE-MIT) and
-[LICENSE-APACHE](LICENSE-APACHE).
+Unless explicitly agreed otherwise, contributions to code are provided
+under both the MIT License and the Apache License, Version 2.0,
+allowing recipients to choose either license — the same dual terms as
+the project itself, without any additional terms or conditions. See
+[LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
 
 This project does not use a contributor license agreement or a
 copyright-assignment process.
