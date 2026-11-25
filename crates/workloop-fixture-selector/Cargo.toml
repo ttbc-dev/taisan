@@ -1,6 +1,7 @@
 [package]
 name = "workloop-fixture-selector"
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

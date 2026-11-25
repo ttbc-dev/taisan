@@ -1,6 +1,7 @@
 [package]
 name = "workloop-cli"
 edition.workspace = true
+license.workspace = true
 default-run = "taisan"
 description = "taisan command-line interface"
 
