@@ -69,14 +69,17 @@ Concretely:
   `taisan run` behind the `GhCliApi` transport — every GitHub call goes
   through the `gh` CLI as a bounded subprocess. Bounded reads are scoped
   to served hosts and active executions; writes reconcile by read-back
-  before retry. Live-verified behavior against a real repository is
-  still pending owner-run acceptance.
+  before retry. Live-verified against a real repository in the
+  owner-run acceptance recorded in
+  [release-acceptance-v0.3.md](release-acceptance-v0.3.md).
 - The Worker port is exercised by `workloop-fixture-worker` and the
   independent `workloop-contract-worker`, both real local processes
   implementing the executable
   `taisan.worker.declaration/1` / `request/2` / `report/2` wire — not
-  by a source-system worker. A real conforming Worker is owner-supplied
-  and validated by the owner-run checklist.
+  by a source-system worker. The in-repo reference adapter
+  `taisan-worker-claude` is the validated conforming Worker —
+  owner-run live under the owner-run checklist; the runtime it drives
+  and its credential remain operator-supplied.
 - The Work Selector port has a reference implementation
   (`workloop-selector`, shipped as the `public-issue-selector`
   binary), a fixture selector, and the intake scheduler's
@@ -144,8 +147,12 @@ integrations.
 **Missing integrations and open gaps:**
 
 - Owner-run live acceptance of the real Worker path and the production
-  GitHub driver — the [v0.3 owner-run checklist](v0.3-owner-acceptance-checklist.md)
-  defines the scenarios; no live evidence exists yet.
+  GitHub driver — **recorded, no longer a gap**: the
+  [v0.3 owner-run checklist](v0.3-owner-acceptance-checklist.md)
+  scenarios ran live across manual runs 1–6 and the scheduled-intake
+  pilot; evidence and dispositions in
+  [release-acceptance-v0.3.md](release-acceptance-v0.3.md) and
+  [evidence/v0.3-manual-acceptance.md](evidence/v0.3-manual-acceptance.md).
 - The `fixture` driver emits no `CapabilityReport` — it is the
   deterministic test double, so a fixture-driven run still parks at
   the host-effect boundary. The in-process `github` driver is a real
