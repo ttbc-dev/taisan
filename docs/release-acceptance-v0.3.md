@@ -233,11 +233,27 @@ status on the candidate:
 | #363 — spent-deadline check ran after paid work | PR #426 (merged `84525a0`) | `handoff.rs:1424` short-circuits before enforcement/worktree cost with the `deadline_bound_marker()` digest; `handoff_contract.rs` covers the marker path — PASS |
 | #364 — staged runtime-auth never cleaned up | PR #425 (merged `4df7087`) | `boundary.rs` unstages the credential and its staging sibling on refusal, re-resolve, stage failure, and `Drop`; `dropping_the_boundary_removes_the_staged_credential` — PASS |
 | #437 — `remote_collect` zero-byte artifact reported `Present` | None (open) | — |
+| #447 — refused worker launch consumes role invocation budget | None (open) | Run 4 (#270, `28afb72`): `inv-3` (fix) refused pre-spawn on a dirty workspace yet `work_usage.fix_invocations_used=1` — the one-shot judged-fix budget burned by a launch that produced nothing |
+| #448 — resume after consumed `next_role` re-queues as `coding`, not the judged role | None (open) | Run 4: operator `resume` after `inv-3`'s refusal issued `e-1:inv:3` as `coding` pinned to the Work base — a judged fix proved effectively single-shot even though the refusal was environmental |
+| #449 — worker runtime residue (`__pycache__`) dirties workspace, refuses next launch | None (open) | Run 4: `launch_refused: workspace conflict: workspace is not clean` on untracked interpreter caches left by the worker's own verification; manual removal + resume unblocked the gate |
+| #450 — republish of a divergent head holds `read_indeterminate` forever | None (open) | Run 4: round-2 `push_ref` `act-27b7a832` (produced `2d0163c`, `expected_prior` `fdc0bb8a`) held `read_indeterminate` permanently — `compare` 404 collapses to Indeterminate instead of Absent; teardown additionally showed the pending intent defers Execution cancel settlement (`stopping` held as the honest terminal) |
 
 Repairs in flight at record time: PR #427 (sibling-PR conflict
 detection, #323) and PR #431 (`artifact.json` collision, #419) are
 open against the candidate; the candidate is provisional until they
 resolve.
+
+Run 4 (#270, owner-authorized, guest `taisan-v03`, driver built from
+`28afb72`) ended on the owner STOP decision at the #450 wedge and was
+torn down honestly: Execution `e-1` accepted `cancel` and sits durably
+`stopping` — terminal settle is gated on outbox reconciliation by
+design, and `act-27b7a832` never reconciled. Its retained record is
+`RUN-RECORD-2026-11-25-RUN4.md` with the sanitized evidence copy at the
+owner-side `acceptance-v03/` location; M-1…M-5 (intake, coding,
+independent verification, publish, review→judgment seal/release) all
+produced live evidence, while the judged-fix H2 leg, the republish
+converged path, and the verified-outcome settle stayed unexercised —
+each blocked by a filed defect (#447/#448/#449/#450).
 
 Recorded observations not yet filed as issues (kept visible, not
 silently dropped):
@@ -269,7 +285,7 @@ while their owner decisions remain open. States verified 2026-11-25:
 | #366 — pluggable public Selector/Worker references | Closed | PR #404 (`f883d6e`) | done |
 | #368 — public-content/history/metadata audit | Audit delivered | PR #432 (`b0b81f6`) | `release-audit.md` §5 blockers stay gated on the publication-route decision — an open owner choice, not picked here |
 | #369 — license selection prep | Prep delivered | PR #433 (`aff8721`) | license selection, `LICENSE`, and package metadata pending owner choice |
-| #270 — manual real-Worker acceptance | Partial | runs 1–3 retained owner-side | sanitized public evidence record, explicit authorization record, restart-clean store-recovery variant — pending owner run |
+| #270 — manual real-Worker acceptance | Partial | runs 1–4 retained owner-side | Run 4 done (owner STOP at #450; record `RUN-RECORD-2026-11-25-RUN4.md`, sanitized copy `acceptance-v03/`); residual: sanitized public evidence record into the repo-facing form, explicit authorization record, restart-clean store-recovery variant — pending owner run |
 | #271 — scheduled pilot acceptance | Not started | — | pending owner run (§5) |
 | #367 — clean-Linux-install reproduction | Not started | — | pending owner run; reuses #269 runbook and #270/#271 evidence where it qualifies |
 | #370 / #371 — candidate freeze; go/no-go | Not started | — | gated on this ledger, the route decision, and the license selection |
