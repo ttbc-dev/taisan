@@ -6285,8 +6285,12 @@ mod tests {
             std::env::temp_dir().join(format!("taisan-boundary-grant-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let provider_config = dir.join("provider.toml");
-        std::fs::write(&provider_config, "model = \"demo\"\n").unwrap();
+        let provider_config = dir.join("provider.json");
+        std::fs::write(
+            &provider_config,
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"demo\"}\n",
+        )
+        .unwrap();
         let mut cfg = boundary_config(&dir);
         cfg.credential_ref = Some("env:TAISAN_CONTAINED_EXEC_TOKEN".into());
         cfg.provider_config = Some(provider_config.clone());

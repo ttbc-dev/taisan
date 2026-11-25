@@ -1,0 +1,21 @@
+#!/bin/sh
+# Example managed-Worker launcher. Illustrative only: it shows where a
+# packaged Worker reads its bindings — the real adapter is installed by
+# the deployment, never by this repository.
+#
+# Reads:   /taisan/provider-config  (taisan.worker.bindings/1, read-only)
+#          /taisan/runtime-auth     (staged credential, read-only)
+#          /taisan/request.json     (canonical request, read-only)
+# Writes:  /taisan/out              (report.json, runtime.log)
+# Egress:  $HTTPS_PROXY             (CONNECT relay, model-API hosts only)
+# Scratch: $HOME, $TMPDIR           (tmpfs; nothing persists)
+set -eu
+
+PKG_ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
+
+# The runtime payload and dependencies resolve relative to the package
+# root — inside the sandbox these are the same paths, read-only.
+export PATH="$PKG_ROOT/runtime/opencode/bin:$PATH"
+export NODE_PATH="$PKG_ROOT/node_modules"
+
+exec node "$PKG_ROOT/dist/main.js" "$@"

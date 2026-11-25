@@ -158,10 +158,12 @@ pub struct Installation {
     /// runtime credential.
     #[serde(default)]
     pub worker_credential_ref: Option<String>,
-    /// Absolute path to a non-secret provider configuration file or
-    /// directory, bound read-only at `/taisan/provider-config`. It
-    /// must not contain the resolved credential value; the supervisor
-    /// validates before mounting.
+    /// Absolute path to a non-secret provider configuration file —
+    /// exactly one regular file satisfying the
+    /// `taisan.worker.bindings/1` contract — bound read-only at
+    /// `/taisan/provider-config`. It must not contain the resolved
+    /// credential value; the supervisor validates before every
+    /// dispatch.
     #[serde(default)]
     pub worker_provider_config: Option<String>,
     /// Bare host names the Worker CONNECT proxy may reach on port 443

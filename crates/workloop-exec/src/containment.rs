@@ -130,7 +130,8 @@ pub struct MountPlan {
     /// SSH socket, or keyring.
     pub runtime_auth: Option<PathBuf>,
     /// The validated non-secret provider configuration →
-    /// `/taisan/provider-config`, read-only. A file or directory.
+    /// `/taisan/provider-config`, read-only. Exactly one regular file
+    /// — the `taisan.worker.bindings/1` contract document.
     pub provider_config: Option<PathBuf>,
     /// The CONNECT proxy's Unix socket → `/taisan/proxy.sock`,
     /// read-only. Present only when the launch's egress allowlist is

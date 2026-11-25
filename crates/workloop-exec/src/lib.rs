@@ -5,6 +5,7 @@
 
 pub mod adapter;
 pub mod assessment_v2;
+pub mod bindings;
 pub mod bodies;
 pub mod boundary;
 pub mod bounded;

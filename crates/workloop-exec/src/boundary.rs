@@ -4,14 +4,17 @@
 //!
 //! Configuration names *references*, never values: a
 //! `credential_ref` provider slot, an absolute non-secret provider
-//! config path, and the bare model-API host set. Resolution is lazy
-//! and happens once per supervisor at the first contained launch or
-//! declaration probe — `env:`/`file:`/`command:` providers resolve
-//! through [`crate::credentials`], the resolved bytes are staged as a
-//! single `0600` file the mount plan binds read-only at
-//! `/taisan/runtime-auth`, and the provider config is validated
-//! (present, readable, and free of the credential value) before it is
-//! bound read-only at `/taisan/provider-config`.
+//! config path, and the bare model-API host set. The credential is
+//! resolved and staged fresh for every contained launch and probe —
+//! `env:`/`file:`/`command:` providers resolve through
+//! [`crate::credentials`] at each `ensure`, so a rotated `file:` or
+//! `command:` value is what the next Invocation observes — and the
+//! resolved bytes are staged as a single `0600` file the mount plan
+//! binds read-only at `/taisan/runtime-auth`. The provider config is
+//! validated as the `taisan.worker.bindings/1` contract document
+//! ([`crate::bindings`]) — present, regular, versioned, and free of
+//! the credential value — before it is bound read-only at
+//! `/taisan/provider-config`.
 //!
 //! Egress is a supervisor-owned CONNECT proxy on a Unix socket,
 //! started lazily the first time a contained launch needs it and
@@ -40,8 +43,9 @@ pub struct BoundaryConfig {
     /// `env:`/`file:`/`command:` provider reference — shape-validated
     /// upstream, resolved lazily here. `None` grants no credential.
     pub credential_ref: Option<String>,
-    /// Absolute path to the non-secret provider configuration (file
-    /// or directory), mounted read-only.
+    /// Absolute path to the non-secret provider configuration —
+    /// exactly one regular file satisfying the
+    /// `taisan.worker.bindings/1` contract — mounted read-only.
     pub provider_config: Option<PathBuf>,
     /// Bare host names the CONNECT proxy may reach on 443. Empty
     /// denies all Worker egress — no proxy is started.
@@ -78,13 +82,10 @@ pub struct BoundaryGrant {
 }
 
 struct BoundaryReady {
-    credential_file: Option<PathBuf>,
-    credential_source: Option<PathBuf>,
     provider_config: Option<PathBuf>,
-    /// The provider-config content identity captured at resolution —
-    /// `ensure` re-checks it so a post-resolution edit re-runs the
-    /// credential scan instead of riding on the cached grant.
-    provider_digest: String,
+    /// The proxy persists for the boundary's life: its allowlist is
+    /// static configuration, so a provider-config edit never rebuilds
+    /// the listener.
     proxy: Option<ConnectProxy>,
 }
 
@@ -93,12 +94,12 @@ enum BoundaryState {
     Ready(BoundaryReady),
 }
 
-/// The lazily-resolved runtime boundary. `ensure` is idempotent: the
-/// first contained use resolves the credential, validates the
-/// provider config, and starts the proxy; later uses reuse the
-/// recorded state. A failure is never cached — each call retries, so
-/// a credential that becomes available mid-run recovers on the next
-/// launch attempt.
+/// The lazily-resolved runtime boundary. `ensure` re-resolves the
+/// credential and re-validates the provider contract on every call —
+/// the latest staged credential is what each launch and probe mounts,
+/// and no validation result is ever cached past a use. Only the proxy
+/// is recorded: a failure starts no proxy, and a proxy that could not
+/// start retries on the next call.
 pub struct RuntimeBoundary {
     config: BoundaryConfig,
     state: Mutex<BoundaryState>,
@@ -140,48 +141,59 @@ impl RuntimeBoundary {
         Ok(sha256_hex("runtime-boundary-v1", &canonical_json(&value)))
     }
 
-    /// Resolve the boundary for one contained launch or probe. The
-    /// first call performs the credential/provider/proxy work; later
-    /// calls return the recorded grant. `Err` is a typed refusal —
+    /// Resolve the boundary for one contained launch or probe. Every
+    /// call re-resolves the credential reference and re-validates the
+    /// provider contract — the latest staged credential is what the
+    /// launch mounts, and a post-resolution provider-config edit can
+    /// never ride on a cached validation. `Err` is a typed refusal —
     /// `credential.*`, `provider_config.*`, or `egress.*` — the caller
     /// records it as a launch repair.
     pub fn ensure(&self) -> Result<BoundaryGrant, String> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if matches!(*state, BoundaryState::Unresolved) {
-            *state = BoundaryState::Ready(self.resolve()?);
+        let grant = self.grant_locked(&mut state);
+        if grant.is_err() {
+            // A refused ensure unstages: the staged credential exists
+            // only while a grant needs it, and the staging sibling
+            // holds the same secret material while it lives.
+            let _ = self.unstage_credential();
         }
-        // The provider config is mounted read-only into the sandbox:
-        // a post-resolution edit — including a same-size one that
-        // embeds the resolved credential — must re-run the scan, not
-        // ride on the cached grant.
-        let stale = match &*state {
-            BoundaryState::Ready(ready) => current_provider_digest(&self.config.provider_config)
-                .map(|digest| digest != ready.provider_digest)
-                .unwrap_or(true),
-            BoundaryState::Unresolved => unreachable!("state resolved above"),
+        grant
+    }
+
+    /// The per-call grant path under the state mutex: resolve the
+    /// credential reference fresh, validate the provider contract
+    /// against the resolved bytes, stage the credential, and start
+    /// the CONNECT proxy once when hosts are configured. Nothing is
+    /// cached across calls except the proxy itself.
+    fn grant_locked(&self, state: &mut BoundaryState) -> Result<BoundaryGrant, String> {
+        let resolved = match &self.config.credential_ref {
+            None => None,
+            Some(reference) => Some(credentials::resolve(reference).map_err(|e| e.to_string())?),
         };
-        if stale {
-            // Release the stale grant's resources — the proxy and,
-            // when it carried one, the staged credential — before
-            // re-resolving. A failed re-resolve leaves `Unresolved`
-            // behind: never a dismantled grant a later digest match
-            // could serve with its staged file already gone.
-            if let BoundaryState::Ready(ready) =
-                std::mem::replace(&mut *state, BoundaryState::Unresolved)
-            {
-                if let Some(proxy) = ready.proxy {
-                    proxy.shutdown();
-                }
-                if ready.credential_file.is_some() {
-                    let _ = self.unstage_credential();
-                }
+        self.validate_provider_config(resolved.as_ref().map(|r| r.bytes()))?;
+        let credential_file = match &resolved {
+            None => {
+                // A grant carrying no credential still owns the staged
+                // paths: a file or staging sibling an earlier grant
+                // left behind is stale secret material and is unlinked
+                // here.
+                self.unstage_credential()?;
+                None
             }
-            *state = BoundaryState::Ready(self.resolve()?);
+            Some(resolved) => Some(self.stage_credential(resolved)?),
+        };
+        if matches!(*state, BoundaryState::Unresolved) {
+            *state = BoundaryState::Ready(BoundaryReady {
+                provider_config: self.config.provider_config.clone(),
+                proxy: self.start_proxy()?,
+            });
         }
-        match &*state {
+        match state {
             BoundaryState::Ready(ready) => Ok(BoundaryGrant {
-                credential_file: ready.credential_file.clone(),
-                credential_source: ready.credential_source.clone(),
+                credential_file,
+                credential_source: resolved
+                    .as_ref()
+                    .and_then(|r| r.source_path().map(Path::to_path_buf)),
                 provider_config: ready.provider_config.clone(),
                 proxy_sock: ready
                     .proxy
@@ -192,71 +204,21 @@ impl RuntimeBoundary {
         }
     }
 
-    /// The one-time resolution: credential → staged file, provider
-    /// config → validated, proxy → started when hosts are configured.
-    fn resolve(&self) -> Result<BoundaryReady, String> {
-        let mut credential_bytes: Option<Vec<u8>> = None;
-        let mut credential_source: Option<PathBuf> = None;
-        let credential_file = match &self.config.credential_ref {
-            None => {
-                // A resolution carrying no credential still owns the
-                // staged paths: a file or staging sibling an earlier
-                // grant left behind is stale secret material and is
-                // unlinked here.
-                self.unstage_credential()?;
-                None
-            }
-            Some(reference) => {
-                let resolved = credentials::resolve(reference).map_err(|e| e.to_string())?;
-                credential_bytes = Some(resolved.bytes().to_vec());
-                credential_source = resolved.source_path().map(Path::to_path_buf);
-                Some(self.stage_credential(&resolved)?)
-            }
-        };
-        // A refusal past staging must not leave the file behind: the
-        // credential exists only while a ready grant needs it.
-        let (provider_digest, proxy) = match self.validate_and_start(credential_bytes.as_deref()) {
-            Ok(done) => done,
-            Err(e) => {
-                let _ = self.unstage_credential();
-                return Err(e);
-            }
-        };
-        Ok(BoundaryReady {
-            credential_file,
-            credential_source,
-            provider_config: self.config.provider_config.clone(),
-            provider_digest,
-            proxy,
-        })
-    }
-
-    /// The post-stage half of resolution: the provider config is
-    /// validated against the resolved bytes, its content identity is
-    /// captured, and the CONNECT proxy is started when model-API
-    /// hosts are configured.
-    fn validate_and_start(
-        &self,
-        credential_bytes: Option<&[u8]>,
-    ) -> Result<(String, Option<ConnectProxy>), String> {
-        if let Some(path) = &self.config.provider_config {
-            self.validate_provider_config(path, credential_bytes)?;
+    /// The CONNECT proxy, started the first time a grant needs the
+    /// boundary and kept for its life — the allowlist is static
+    /// configuration, so nothing later rebuilds the listener. An
+    /// empty host set starts no proxy and grants no egress.
+    fn start_proxy(&self) -> Result<Option<ConnectProxy>, String> {
+        if self.config.model_api_hosts.is_empty() {
+            return Ok(None);
         }
-        let provider_digest = current_provider_digest(&self.config.provider_config)
-            .map_err(|e| format!("provider_config.unreadable: {e}"))?;
-        let proxy = if self.config.model_api_hosts.is_empty() {
-            None
-        } else {
-            let sock_dir = crate::egress::socket_dir(&self.config.egress_dir)
-                .map_err(|e| format!("egress.proxy_unavailable: {e}"))?;
-            let sock = sock_dir.join("worker.sock");
-            let evidence = self.config.egress_dir.join("worker-egress.jsonl");
-            Some(
-                ConnectProxy::start(&sock, self.config.model_api_hosts.clone(), &evidence)
-                    .map_err(|e| format!("egress.proxy_unavailable: {e}"))?,
-            )
-        };
-        Ok((provider_digest, proxy))
+        let sock_dir = crate::egress::socket_dir(&self.config.egress_dir)
+            .map_err(|e| format!("egress.proxy_unavailable: {e}"))?;
+        let sock = sock_dir.join("worker.sock");
+        let evidence = self.config.egress_dir.join("worker-egress.jsonl");
+        ConnectProxy::start(&sock, self.config.model_api_hosts.clone(), &evidence)
+            .map(Some)
+            .map_err(|e| format!("egress.proxy_unavailable: {e}"))
     }
 
     /// Stage the resolved credential as a single owner-only file the
@@ -306,50 +268,36 @@ impl RuntimeBoundary {
         failed.map_or(Ok(()), Err)
     }
 
-    /// The provider config must exist, be a file or directory the
-    /// supervisor can read, and carry no credential value — a secret
-    /// embedded there is a configuration error, never a tolerated
-    /// convenience (`docs/installation-config.md`).
-    fn validate_provider_config(
-        &self,
-        path: &Path,
-        credential_bytes: Option<&[u8]>,
-    ) -> Result<(), String> {
-        let metadata = std::fs::symlink_metadata(path)
-            .map_err(|e| format!("provider_config.unreadable: {e}"))?;
-        if !metadata.is_file() && !metadata.is_dir() {
-            return Err("provider_config.unreadable: not a regular file or directory".into());
+    /// The provider config must exist and satisfy the
+    /// `taisan.worker.bindings/1` contract — a regular bounded file
+    /// with the exact format version and the required non-secret
+    /// members — and carry no credential value. A secret embedded
+    /// there is a configuration error, never a tolerated convenience
+    /// (`docs/runtime-bindings.md`, `docs/installation-config.md`).
+    /// Validation runs on every `ensure`, so an edit between calls is
+    /// always re-checked against the freshly resolved credential.
+    fn validate_provider_config(&self, credential_bytes: Option<&[u8]>) -> Result<(), String> {
+        match &self.config.provider_config {
+            None => Ok(()),
+            Some(path) => crate::bindings::validate(path, credential_bytes),
         }
-        // Scanning the provider config for the resolved bytes proves
-        // the mount carries no secret. When no credential is
-        // configured there is nothing to leak.
-        if let Some(bytes) = credential_bytes
-            && !bytes.is_empty()
-            && credentials::provider_config_contains(path, bytes)
-                .map_err(|e| format!("provider_config.unreadable: {e}"))?
-        {
-            return Err(
-                "provider_config.contains_credential: the provider configuration embeds \
-                 the resolved credential value"
-                    .into(),
-            );
-        }
-        Ok(())
     }
 }
 
 impl Drop for RuntimeBoundary {
     fn drop(&mut self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let BoundaryState::Ready(ready) = &mut *state {
-            if let Some(proxy) = ready.proxy.take() {
-                proxy.shutdown();
-            }
-            // The staged credential's lifetime is the grant's.
-            if ready.credential_file.is_some() {
-                let _ = self.unstage_credential();
-            }
+        if let BoundaryState::Ready(ready) = &mut *state
+            && let Some(proxy) = ready.proxy.take()
+        {
+            proxy.shutdown();
         }
+        drop(state);
+        // The staged credential's lifetime is the grant's — with the
+        // boundary gone, any staged file or staging sibling is stale
+        // secret material. Unconditional: a credential staged by a
+        // grant whose state never reached Ready is still removed.
+        let _ = self.unstage_credential();
     }
 }
 
@@ -380,16 +328,6 @@ fn write_staged_credential(
             .map_err(|e| format!("credential.stage_failed: {e}"))?;
     }
     std::fs::rename(tmp, path).map_err(|e| format!("credential.stage_failed: {e}"))
-}
-
-/// The provider-config content identity `ensure` compares against
-/// the recorded grant: `None` for an unconfigured boundary, else the
-/// same digest the gate identity records.
-fn current_provider_digest(path: &Option<PathBuf>) -> Result<String, std::io::Error> {
-    match path {
-        None => Ok("none".to_string()),
-        Some(path) => provider_config_digest(path),
-    }
 }
 
 /// Bounded-memory digest of one file's full content: every byte feeds
@@ -596,8 +534,12 @@ mod tests {
         let dir = tmp("dirtycfg");
         // SAFETY: test-only env mutation.
         unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_TOKEN2", "sekrit") };
-        let dirty = dir.join("provider.toml");
-        std::fs::write(&dirty, "token = \"sekrit\"\n").unwrap();
+        let dirty = dir.join("provider.json");
+        std::fs::write(
+            &dirty,
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"sekrit\"}\n",
+        )
+        .unwrap();
         let mut cfg = config(&dir);
         cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_TOKEN2".into());
         cfg.provider_config = Some(dirty);
@@ -612,8 +554,12 @@ mod tests {
     #[test]
     fn a_clean_provider_config_is_granted_read_only_path() {
         let dir = tmp("cleancfg");
-        let clean = dir.join("provider.toml");
-        std::fs::write(&clean, "model = \"m\"\n").unwrap();
+        let clean = dir.join("provider.json");
+        std::fs::write(
+            &clean,
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\"}\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&clean, std::fs::Permissions::from_mode(0o644)).unwrap();
         let mut cfg = config(&dir);
         cfg.provider_config = Some(clean.clone());
@@ -622,7 +568,11 @@ mod tests {
         assert_eq!(grant.provider_config, Some(clean));
         // Digest is stable for identical content and changes on edit.
         let d1 = boundary.identity_digest().unwrap();
-        std::fs::write(dir.join("provider.toml"), "model = \"m2\"\n").unwrap();
+        std::fs::write(
+            dir.join("provider.json"),
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m2\"}\n",
+        )
+        .unwrap();
         // identity_digest re-reads the file each call.
         let d2 = boundary.identity_digest().unwrap();
         assert_ne!(d1, d2);
@@ -674,26 +624,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The grant cache must not carry a stale scan: embedding the
+    /// Validation never rides on a cached scan: embedding the
     /// resolved credential into the provider config after the first
-    /// resolution — even at identical size — re-runs the
-    /// `contains_credential` check on the next `ensure`.
+    /// grant re-runs the `contains_credential` check on the next
+    /// `ensure`.
     #[test]
     fn a_post_resolution_provider_config_edit_re_runs_the_credential_scan() {
         let dir = tmp("restage");
         // SAFETY: test-only env mutation.
         unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_TOKEN3", "sekrit3") };
-        let cfg_dir = dir.join("cfg");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        let member = cfg_dir.join("provider.toml");
-        std::fs::write(&member, "token = \"aaaaa\"\n").unwrap();
+        let member = dir.join("provider.json");
+        std::fs::write(
+            &member,
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"aaaaa\"}\n",
+        )
+        .unwrap();
         let mut cfg = config(&dir);
         cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_TOKEN3".into());
-        cfg.provider_config = Some(cfg_dir);
+        cfg.provider_config = Some(member.clone());
         let boundary = RuntimeBoundary::new(cfg);
         boundary.ensure().expect("a clean config resolves");
-        // A same-size edit that embeds the credential.
-        std::fs::write(&member, "token = \"sekrit3\"\n").unwrap();
+        // An edit that embeds the credential.
+        std::fs::write(
+            &member,
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"sekrit3\"}\n",
+        )
+        .unwrap();
         let err = boundary.ensure().unwrap_err();
         assert!(err.contains("provider_config.contains_credential"), "{err}");
         assert!(!err.contains("sekrit3"));
@@ -709,8 +665,12 @@ mod tests {
         let dir = tmp("refuse");
         // SAFETY: test-only env mutation.
         unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_TOKEN4", "sekrit4") };
-        let dirty = dir.join("provider.toml");
-        std::fs::write(&dirty, "token = \"sekrit4\"\n").unwrap();
+        let dirty = dir.join("provider.json");
+        std::fs::write(
+            &dirty,
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"sekrit4\"}\n",
+        )
+        .unwrap();
         let mut cfg = config(&dir);
         cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_TOKEN4".into());
         cfg.provider_config = Some(dirty);
@@ -785,24 +745,34 @@ mod tests {
         let dir = tmp("dismantle");
         // SAFETY: test-only env mutation.
         unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_TOKEN7", "sekrit7") };
-        let cfg_dir = dir.join("cfg");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        let member = cfg_dir.join("provider.toml");
-        std::fs::write(&member, "token = \"aaaaaa\"\n").unwrap();
+        let member = dir.join("provider.json");
+        std::fs::write(
+            &member,
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"aaaaaa\"}\n",
+        )
+        .unwrap();
         let mut cfg = config(&dir);
         cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_TOKEN7".into());
-        cfg.provider_config = Some(cfg_dir);
+        cfg.provider_config = Some(member.clone());
         let boundary = RuntimeBoundary::new(cfg);
         boundary.ensure().expect("a clean config resolves");
-        // A stale re-resolve that fails past staging leaves no file.
-        std::fs::write(&member, "token = \"sekrit7\"\n").unwrap();
+        // A re-validate that fails past resolution leaves no file.
+        std::fs::write(
+            &member,
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"sekrit7\"}\n",
+        )
+        .unwrap();
         let err = boundary.ensure().unwrap_err();
         assert!(err.contains("provider_config.contains_credential"), "{err}");
         assert!(!dir.join("runtime/runtime-auth").exists());
-        // Restoring the original content re-resolves from scratch:
-        // the grant carries a live staged file, not the dismantled
-        // grant's dead path.
-        std::fs::write(&member, "token = \"aaaaaa\"\n").unwrap();
+        // Restoring the original content resolves again: the grant
+        // carries a live staged file, never a dismantled grant's dead
+        // path.
+        std::fs::write(
+            &member,
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"aaaaaa\"}\n",
+        )
+        .unwrap();
         let grant = boundary.ensure().unwrap();
         let staged = grant.credential_file.expect("credential restaged");
         assert_eq!(std::fs::read(&staged).unwrap(), b"sekrit7");
