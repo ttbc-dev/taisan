@@ -2741,6 +2741,16 @@ fn assess(
             now_unix_seconds,
         ),
         ObservationFact::LaunchRefused { invocation_id, .. } => {
+            // Capture the refused attempt's role while its Invocation is
+            // still an unresolved writer of this Execution: a refusal
+            // re-delivered under a fresh delivery id after the attempt
+            // already resolved must not refund the accounting a second
+            // time inside a later `ready` window.
+            let refused_role = tx
+                .invocations_for_execution(&execution.id)?
+                .into_iter()
+                .find(|inv| inv.id == *invocation_id && inv.state.is_unresolved_writer())
+                .map(|inv| inv.role);
             mark_invocation(tx, invocation_id, |_| InvocationState::Abandoned)?;
             // Definitely no process exists. lifecycle.md permits this
             // transition only from `ready`: a late refusal delivered after
@@ -2750,12 +2760,7 @@ fn assess(
             // unresolved writer.
             if execution.state == ExecutionState::Ready {
                 let mut next = execution.clone();
-                if let Some(role) = tx
-                    .invocations_for_execution(&execution.id)?
-                    .into_iter()
-                    .find(|inv| inv.id == *invocation_id)
-                    .map(|inv| inv.role)
-                {
+                if let Some(role) = refused_role {
                     refund_refused_attempt(tx, &mut next, role)?;
                 }
                 next.state = ExecutionState::Paused;
@@ -2820,10 +2825,22 @@ fn assess(
             // the pause reason carries it verbatim for the operator.
             if execution.state == ExecutionState::Ready {
                 let mut next = execution.clone();
-                if let Some(role) = tx
-                    .request(request_id)?
-                    .filter(|request| request.execution_id == execution.id)
-                    .map(|request| request.role)
+                // The refund binds to the request the current `ready`
+                // admission minted — `<eid>:inv:<invocations_used - 1>`
+                // since the counter never decrements. A refusal
+                // re-delivered under a fresh delivery id for an earlier
+                // attempt's durable request row must not refund a
+                // charged attempt a second time.
+                let live_request = format!(
+                    "{}:inv:{}",
+                    execution.id.0,
+                    execution.invocations_used.saturating_sub(1)
+                );
+                if *request_id == live_request
+                    && let Some(role) = tx
+                        .request(request_id)?
+                        .filter(|request| request.execution_id == execution.id)
+                        .map(|request| request.role)
                 {
                     refund_refused_attempt(tx, &mut next, role)?;
                 }

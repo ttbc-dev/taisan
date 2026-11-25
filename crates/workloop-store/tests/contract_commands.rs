@@ -3594,6 +3594,160 @@ fn launch_refused_refunds_the_review_round_ledger() {
     assert_eq!(read_execution(&store, &e1).review_rounds_used, 1);
 }
 
+/// A refusal re-delivered under a fresh delivery id — the delivery
+/// dedupe is per delivery, not per attempt — for an Invocation that
+/// already resolved refunds nothing during a later `ready` window: the
+/// charge belongs to the live attempt now, not the resolved one.
+#[test]
+fn a_stale_launch_refusal_during_a_new_ready_window_never_refunds_twice() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let (w, e1) = accepted_with_execution(
+        &handle_command(&store, &config, &submit("lr-stale"), NOW).unwrap(),
+    );
+    admit_judged_role(&store, &config, &e1, InvocationRole::Fix);
+
+    let mut inv = recorded_invocation(&e1, "inv-lr-stale");
+    inv.role = InvocationRole::Fix;
+    inv.request_id = format!("{}:inv:0", e1.0);
+    apply_effects(
+        &store,
+        &[Effect::InsertInvocation {
+            invocation: inv.clone(),
+        }],
+    );
+    launch_refused(&store, &e1, &inv.id);
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(usage.fix_invocations_used, 0, "the first refusal refunds");
+
+    // Resume mints and charges a fresh attempt — the Execution is
+    // `ready` again with a live request.
+    let version = store.transact(|tx| tx.work(&w)).unwrap().unwrap().version;
+    let d = handle_command(
+        &store,
+        &config,
+        &req(
+            "lr-stale-resume",
+            CommandBody::Resume {
+                work_id: w.clone(),
+                expected_work_version: version,
+                execution_id: e1.clone(),
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    accepted(&d);
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued(tx, &config, &e1, NOW + 10)?.is_some(),
+                "the resumed Execution readmits"
+            );
+            Ok(())
+        })
+        .unwrap();
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(
+        usage.fix_invocations_used, 1,
+        "the live attempt carries the charge"
+    );
+
+    // The stale re-delivery still resolves nothing new: the Invocation
+    // is already abandoned, so the live attempt's charge stands.
+    launch_refused(&store, &e1, &inv.id);
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(
+        usage.fix_invocations_used, 1,
+        "a stale refusal never refunds the live attempt's charge"
+    );
+}
+
+/// The dispatch-refusal twin: the durable request row outlives its
+/// attempt, so a stale re-delivery naming the old request id must not
+/// refund the live attempt's charge.
+#[test]
+fn a_stale_dispatch_refusal_during_a_new_ready_window_never_refunds_twice() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let (w, e1) = accepted_with_execution(
+        &handle_command(&store, &config, &submit("dr-stale"), NOW).unwrap(),
+    );
+    admit_judged_role(&store, &config, &e1, InvocationRole::Fix);
+    let stale_rid = format!("{}:inv:0", e1.0);
+
+    workloop_core::work::handle_observation(
+        &store,
+        &config,
+        &Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: Some(e1.clone()),
+            fact: ObservationFact::DispatchRefused {
+                request_id: stale_rid.clone(),
+                code: "request.body_missing".into(),
+                detail: "no durable v2 request body".into(),
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(usage.fix_invocations_used, 0, "the first refusal refunds");
+
+    let version = store.transact(|tx| tx.work(&w)).unwrap().unwrap().version;
+    let d = handle_command(
+        &store,
+        &config,
+        &req(
+            "dr-stale-resume",
+            CommandBody::Resume {
+                work_id: w.clone(),
+                expected_work_version: version,
+                execution_id: e1.clone(),
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    accepted(&d);
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued(tx, &config, &e1, NOW + 10)?.is_some(),
+                "the resumed Execution readmits"
+            );
+            Ok(())
+        })
+        .unwrap();
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(usage.fix_invocations_used, 1);
+
+    workloop_core::work::handle_observation(
+        &store,
+        &config,
+        &Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: Some(e1.clone()),
+            fact: ObservationFact::DispatchRefused {
+                request_id: stale_rid,
+                code: "request.body_missing".into(),
+                detail: "no durable v2 request body".into(),
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(
+        usage.fix_invocations_used, 1,
+        "a refusal naming an earlier request never refunds the live attempt"
+    );
+}
+
 /// Work-scoped observation delivery: the fact types that name only the
 /// Work still resolve the current Execution for assessment.
 fn emit_work_fact(store: &SqliteStore, w: &WorkId, fact: ObservationFact) {
