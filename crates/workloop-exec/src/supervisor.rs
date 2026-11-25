@@ -5057,16 +5057,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     }
                 }
             }
-            // Record the attempt durably, then report any found artifacts.
-            let mut next = execution.clone();
-            next.recovery_attempts_used += 1;
-            store.transact(|tx| {
-                tx.apply(&Effect::UpdateExecution {
-                    execution: next,
-                    expected_state: execution.state.clone(),
-                })?;
-                Ok(())
-            })?;
+            // Promote and evaluate every recovered artifact first: the
+            // facts a pass can report decide whether the pass consumed
+            // the bounded-recovery policy at all.
+            let mut reports: Vec<(InvocationRequest, InvocationId, String, ArtifactFact)> =
+                Vec::new();
             for invocation in store.transact(|tx| tx.invocations_for_execution(&execution.id))? {
                 let request = match store.transact(|tx| tx.request(&invocation.request_id))? {
                     Some(r) => r,
@@ -5076,48 +5071,99 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     .transact(|tx| tx.worker_request_body(&invocation.request_id))?
                     .is_some();
                 for (required, name, dir) in &recovered {
-                    if invocation.required_artifacts.contains(required) {
-                        // Promote into the workspace root so downstream
-                        // evidence paths are uniform. A hit already in
-                        // the root needs no copy (copying a file onto
-                        // itself truncates it), and a symlinked slot is
-                        // never written through — the fact evaluation
-                        // below reports it on its own.
-                        let dest = workspace.join(name);
-                        let dest_is_symlink = std::fs::symlink_metadata(&dest)
-                            .map(|m| m.file_type().is_symlink())
-                            .unwrap_or(false);
-                        if dir != &workspace
-                            && !dest_is_symlink
-                            && std::fs::copy(dir.join(name), &dest).is_err()
-                        {
-                            continue;
-                        }
-                        // Every fact the evidence path can act on is
-                        // reported, not only `Present`: a structural
-                        // `Unfulfillable` lets Core settle the collision
-                        // instead of charging the bounded-recovery bound
-                        // for a slot that can never hold the bound
-                        // manifest. Thinner states stay unreported —
-                        // recovery is still in flight for them.
-                        let state =
-                            match artifact_fact(&workspace, required, &invocation, v2_manifest) {
-                                fact @ (ArtifactFact::Present { .. }
-                                | ArtifactFact::Unfulfillable { .. }) => fact,
-                                _ => continue,
-                            };
-                        self.report(
-                            store,
-                            &request,
-                            ObservationFact::Artifact {
-                                invocation_id: invocation.id.clone(),
-                                required_artifact: required.kind.clone(),
-                                state,
-                            },
-                            _now_unix_seconds,
-                        )?;
+                    if !invocation.required_artifacts.contains(required) {
+                        continue;
                     }
+                    // Promote into the workspace root so downstream
+                    // evidence paths are uniform. A hit already in
+                    // the root needs no copy (copying a file onto
+                    // itself truncates it), and a symlinked slot is
+                    // never written through — the fact evaluation
+                    // below reports it on its own.
+                    let dest = workspace.join(name);
+                    let dest_is_symlink = std::fs::symlink_metadata(&dest)
+                        .map(|m| m.file_type().is_symlink())
+                        .unwrap_or(false);
+                    if dir != &workspace
+                        && !dest_is_symlink
+                        && std::fs::copy(dir.join(name), &dest).is_err()
+                    {
+                        continue;
+                    }
+                    // Every fact the evidence path can act on is
+                    // reported, not only `Present`: a structural
+                    // `Unfulfillable` lets Core settle the collision
+                    // instead of charging the bounded-recovery bound
+                    // for a slot that can never hold the bound
+                    // manifest. Thinner states stay unreported —
+                    // recovery is still in flight for them.
+                    let state = match artifact_fact(&workspace, required, &invocation, v2_manifest)
+                    {
+                        fact @ (ArtifactFact::Present { .. }
+                        | ArtifactFact::Unfulfillable { .. }) => fact,
+                        _ => continue,
+                    };
+                    reports.push((
+                        request.clone(),
+                        invocation.id.clone(),
+                        required.kind.clone(),
+                        state,
+                    ));
                 }
+            }
+            // The bound prices recoverable absence: a pass that can
+            // only report structural refusals is decided, not
+            // recovering, so its reports land before the attempt
+            // record — whether the pass consumed the policy is settled
+            // by where the refusal leaves the Execution. Every other
+            // pass is the bounded work the policy prices; its attempt
+            // is durable before its reports.
+            let only_refusals = !reports.is_empty()
+                && reports
+                    .iter()
+                    .all(|(.., state)| matches!(state, ArtifactFact::Unfulfillable { .. }));
+            if !only_refusals {
+                let mut next = execution.clone();
+                next.recovery_attempts_used += 1;
+                store.transact(|tx| {
+                    tx.apply(&Effect::UpdateExecution {
+                        execution: next,
+                        expected_state: execution.state.clone(),
+                    })?;
+                    Ok(())
+                })?;
+            }
+            for (request, invocation_id, required_artifact, state) in reports {
+                self.report(
+                    store,
+                    &request,
+                    ObservationFact::Artifact {
+                        invocation_id,
+                        required_artifact,
+                        state,
+                    },
+                    _now_unix_seconds,
+                )?;
+            }
+            if only_refusals
+                && let Some(after) = store.transact(|tx| tx.execution(&execution.id))?
+                && after.state == ExecutionState::Waiting
+                && after.waiting_reason == Some(WaitingReason::ArtifactRecovery)
+            {
+                // A refusal that left the Execution on the lane —
+                // recorded under a superseded Invocation, or any
+                // settle that could not decide — is in-flight
+                // recovery like any other: charge the attempt once
+                // the reports prove the pass did not end the wait.
+                let mut next = after.clone();
+                next.recovery_attempts_used += 1;
+                store.transact(|tx| {
+                    tx.apply(&Effect::UpdateExecution {
+                        execution: next,
+                        expected_state: after.state.clone(),
+                    })?;
+                    Ok(())
+                })?;
             }
         }
         Ok(())
