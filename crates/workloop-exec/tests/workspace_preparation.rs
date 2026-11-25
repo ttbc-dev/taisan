@@ -1045,6 +1045,42 @@ fn worker_runtime_residue_never_refuses_reuse_but_wip_still_does() {
     assert_eq!(std::fs::read_to_string(ws.join("wip.txt")).unwrap(), "wip");
 }
 
+/// An `.git/info/exclude` a tool wrote with non-UTF-8 bytes is not a
+/// reason to refuse reuse: the seed reads bytes, preserves them, and
+/// appends the residue patterns after a newline.
+#[test]
+fn a_non_utf8_exclude_still_gains_the_residue_patterns() {
+    let root = tmp_root("residue-nonutf8");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, _n) = git_source(&root);
+    let (w, _e, rid, _r) = coding_fixture(&store, "p-nonutf8", &base, coding_task(vec![]));
+    let (sup, _layout) = supervisor(&root);
+    sup.prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    let ws = ws_path(&root, &w);
+
+    let foreign: &[u8] = b"\xFF\xFE-not-utf8\n";
+    std::fs::write(ws.join(".git/info/exclude"), foreign).unwrap();
+    let prepared = sup
+        .prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    assert_eq!(prepared.path, ws, "reuse proceeds over the raw bytes");
+
+    let exclude = std::fs::read(ws.join(".git/info/exclude")).unwrap();
+    assert!(
+        exclude.starts_with(foreign),
+        "existing content is byte-preserved: {exclude:?}"
+    );
+    for pattern in [b"__pycache__/".as_slice(), b"*.pyc", b"*.pyo"] {
+        assert!(
+            exclude
+                .split(|byte| *byte == b'\n')
+                .any(|line| line == pattern),
+            "{pattern:?} missing from .git/info/exclude: {exclude:?}"
+        );
+    }
+}
+
 #[test]
 fn a_retried_request_reuses_a_workspace_holding_declared_output() {
     let root = tmp_root("retry-art");

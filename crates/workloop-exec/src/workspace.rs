@@ -386,14 +386,17 @@ pub(crate) fn seed_residue_excludes(git_dir: &Path) -> std::io::Result<()> {
     let info = git_dir.join("info");
     std::fs::create_dir_all(&info)?;
     let exclude = info.join("exclude");
-    let mut content = String::new();
+    // Bytes, not text: an existing exclude with non-UTF-8 content stays
+    // byte-preserved — refusing a reusable tree over its encoding would
+    // be a new failure mode preparation never had before.
+    let mut content = Vec::new();
     match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&exclude)
     {
         Ok(mut f) => {
-            f.read_to_string(&mut content)?;
+            f.read_to_end(&mut content)?;
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
@@ -401,17 +404,21 @@ pub(crate) fn seed_residue_excludes(git_dir: &Path) -> std::io::Result<()> {
     let missing: Vec<&str> = RESIDUE_EXCLUDE_PATTERNS
         .iter()
         .copied()
-        .filter(|pattern| !content.lines().any(|line| line == *pattern))
+        .filter(|pattern| {
+            !content
+                .split(|byte| *byte == b'\n')
+                .any(|line| line == pattern.as_bytes())
+        })
         .collect();
     if missing.is_empty() {
         return Ok(());
     }
-    if !content.is_empty() && !content.ends_with('\n') {
-        content.push('\n');
+    if !content.is_empty() && !content.ends_with(b"\n") {
+        content.push(b'\n');
     }
     for pattern in missing {
-        content.push_str(pattern);
-        content.push('\n');
+        content.extend_from_slice(pattern.as_bytes());
+        content.push(b'\n');
     }
     let tmp = info.join(format!(
         ".exclude-{}-{}.tmp",
@@ -424,7 +431,7 @@ pub(crate) fn seed_residue_excludes(git_dir: &Path) -> std::io::Result<()> {
             .create_new(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&tmp)?;
-        f.write_all(content.as_bytes())?;
+        f.write_all(&content)?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, &exclude)?;
