@@ -23,7 +23,7 @@ use workloop_core::executor::{
 };
 use workloop_core::worker_v2::{
     FailedEvidenceBody, FixOrigin, InvariantSetBody, IssueSnapshotBody, ReviewSourceBody, TaskBody,
-    WorkerRequestV2, goal_body_digest,
+    VerificationEvidenceBody, WorkerRequestV2, goal_body_digest,
 };
 
 use crate::bodies::content_id;
@@ -224,21 +224,43 @@ fn verify_input(request: &WorkerRequestV2, name: &str, bytes: &[u8]) -> Result<(
                 "input {name:?} is not declared by the request"
             )))
         }
-        TaskBody::InvariantCheck { invariant_set, .. } => {
-            if name != "invariant-set.json" {
-                return Err(check(format!(
-                    "input {name:?} is not declared by the request"
-                )));
+        TaskBody::InvariantCheck {
+            invariant_set,
+            verification_evidence,
+            ..
+        } => {
+            if name == "invariant-set.json" {
+                let set = InvariantSetBody::parse(bytes)
+                    .map_err(|e| check(format!("invariant set malformed: {e}")))?;
+                if set.wire_digest() != invariant_set.digest
+                    || set.id != invariant_set.id
+                    || set.revision != invariant_set.revision
+                {
+                    return Err(check("invariant set disagrees with the request ref".into()));
+                }
+                return Ok(());
             }
-            let set = InvariantSetBody::parse(bytes)
-                .map_err(|e| check(format!("invariant set malformed: {e}")))?;
-            if set.wire_digest() != invariant_set.digest
-                || set.id != invariant_set.id
-                || set.revision != invariant_set.revision
+            if let Some(index) = name
+                .strip_prefix("verification-")
+                .and_then(|rest| rest.strip_suffix(".json"))
+                .and_then(|n| n.parse::<usize>().ok())
             {
-                return Err(check("invariant set disagrees with the request ref".into()));
+                let Some(ev) = verification_evidence.get(index) else {
+                    return Err(check(format!("input {name:?} names no declared evidence")));
+                };
+                let body = VerificationEvidenceBody::parse(bytes)
+                    .map_err(|e| check(format!("verification evidence malformed: {e}")))?;
+                if body.wire_digest() != ev.digest
+                    || body.evidence_id != ev.evidence_id
+                    || body.kind != ev.kind
+                {
+                    return Err(check(format!("input {name:?} digest disagrees")));
+                }
+                return Ok(());
             }
-            Ok(())
+            Err(check(format!(
+                "input {name:?} is not declared by the request"
+            )))
         }
         TaskBody::CodeReview { review_source, .. } => {
             if name != "review-source.json" {
@@ -281,7 +303,14 @@ fn required_input_names(request: &WorkerRequestV2) -> Vec<String> {
                 names.extend((0..failed_evidence.len()).map(|i| format!("evidence-{i}.json")));
             }
         }
-        TaskBody::InvariantCheck { .. } => names.push("invariant-set.json".into()),
+        TaskBody::InvariantCheck {
+            verification_evidence,
+            ..
+        } => {
+            names.push("invariant-set.json".into());
+            names
+                .extend((0..verification_evidence.len()).map(|i| format!("verification-{i}.json")));
+        }
         TaskBody::CodeReview { .. } => names.push("review-source.json".into()),
     }
     names
