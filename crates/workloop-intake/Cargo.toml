@@ -1,6 +1,7 @@
 [package]
 name = "workloop-intake"
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 workloop-config = { path = "../workloop-config" }

@@ -110,4 +110,10 @@ v0.3 makes the Worker boundary executable: Workers launch through a versioned wi
 
 ## License
 
-No license has been selected. Choose and add an open source license before distribution.
+Except where otherwise noted, this project is licensed under either
+the MIT License or the Apache License, Version 2.0, at your option.
+See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+
+The hero illustration at `assets/taisan-hero.jpg` is excluded from
+these licenses. See [assets/LICENSE.md](assets/LICENSE.md) for its
+usage terms.

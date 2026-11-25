@@ -1,12 +1,14 @@
 # License preparation: dependency inventory and options
 
-Status: preparation document for the license-selection gate
-([issue #369](https://github.com/ttbc-dev/taisan/issues/369)). This
-document inventories what the planned release would redistribute and
-what each component requires. It does **not** select a license, add a
-`LICENSE` file, or change Cargo metadata — the owner selects the license
-first. This is an evidence-backed audit, not a legal guarantee; items
-that could not be resolved are listed as release blockers in §5.
+Status: **decision applied** — the owner selected
+`MIT OR Apache-2.0` (dual; licensees pick either) for code and
+unmarked project files, with `assets/taisan-hero.jpg` excluded under
+its own usage terms in `assets/LICENSE.md`. `LICENSE-MIT`,
+`LICENSE-APACHE`, `CONTRIBUTING.md`, `THIRD-PARTY.md`, and `LICENSES/`
+are in place; every workspace crate declares
+`license.workspace = true`. This document remains the evidence-backed
+inventory the selection was made from — see §5 for resolved and
+remaining items. ([issue #369](https://github.com/ttbc-dev/taisan/issues/369))
 
 Evidence basis: `cargo metadata --format-version 1 --locked` and
 `cargo tree --locked` resolved against `Cargo.lock` in this checkout,
@@ -269,8 +271,8 @@ file(s).
 
 | # | Item | Severity | Evidence |
 | --- | --- | --- | --- |
-| B1 | **Project license unselected** — every workspace crate currently declares no `license` field (cargo metadata shows `[]` for all 14 members) and no `LICENSE` file exists. Blocks the release itself, and blocks AC #3 (LICENSE + consistent Cargo metadata). | **Release blocker** — pending owner decision | `Cargo.toml` files; `cargo metadata` |
-| B2 | **`assets/taisan-hero.jpg` redistribution rights unconfirmed** — provenance is documented (resized from an owner-approved issue attachment, `assets/README.md`) but no explicit statement that the owner licenses it for redistribution under the chosen project license. Likely resolvable in one line by the owner; flagged rather than assumed. | Release blocker until owner confirms | `assets/README.md` |
+| B1 | **Project license unselected** — every workspace crate currently declares no `license` field (cargo metadata shows `[]` for all 14 members) and no `LICENSE` file exists. Blocks the release itself, and blocks AC #3 (LICENSE + consistent Cargo metadata). | **Resolved** — owner selected `MIT OR Apache-2.0`; `LICENSE-MIT`/`LICENSE-APACHE` added, all 15 members declare `license.workspace = true` (verified via `cargo metadata --no-deps`) | `Cargo.toml` files; `cargo metadata` |
+| B2 | **`assets/taisan-hero.jpg` redistribution rights unconfirmed** — provenance is documented (resized from an owner-approved issue attachment, `assets/README.md`) but no explicit statement that the owner licenses it for redistribution under the chosen project license. Likely resolvable in one line by the owner; flagged rather than assumed. | **Resolved** — owner confirmed repository inclusion and redistribution rights; the image is excluded from the dual license under its own terms in `assets/LICENSE.md` (scope: that file only) | `assets/README.md`; `assets/LICENSE.md` |
 | B3 | **`r-efi 6.0.0` ships no license text file** — SPDX expression `MIT OR Apache-2.0 OR LGPL-2.1-or-later` only. Not a practical blocker: the crate compiles solely for `target_os = "uefi"` (a getrandom backend not used by any planned target) and permissive options exist in the `OR`. Recorded so it is not silently smoothed over; if the project ever targets UEFI the missing license text would need an upstream request. | Anomaly — not blocking for planned targets | registry package contents |
 | B4 | **Publication disclosure review** — `docs/source-workflow-audit.md` retains source-internal names; publication previously required a disclosure review covering it and the git history. Dispositioned: the owner ruled under issue #438 that the names and owner identity are acceptable to disclose and the repository publishes in place with history kept (`docs/release-audit.md` §7); no disclosure review gates publication under that ruling. A publication gate rather than a copyright problem (the file is project-authored), recorded here because it gated the same release. | Dispositioned (non-license) — owner ruling #438 | `AGENTS.md` source-references rule; `docs/release-audit.md` §7 |
 
@@ -288,3 +290,32 @@ file(s).
   `cargo-deny` or `cargo-about` is installed; until then the §1 table
   is the audit record (reproduce with `cargo metadata --locked` +
   `cargo tree --locked`).
+
+## 6. Decision applied (2026-11-25)
+
+Owner selection: **`MIT OR Apache-2.0`** for code and unmarked project
+files; `assets/taisan-hero.jpg` is excluded under its own terms in
+`assets/LICENSE.md` (the exception scopes to that file only — not the
+whole `assets/` directory — and the standard MIT/Apache-2.0 texts carry
+no image exceptions).
+
+Applied artifacts: `LICENSE-MIT` (standard MIT text carrying the
+copyright line `2026 Shimpei Takamatsu`), `LICENSE-APACHE` (verbatim
+Apache Software Foundation text —
+https://www.apache.org/licenses/LICENSE-2.0.txt — the project
+copyright is recorded in `LICENSE-MIT` and here, not inside the
+standard text), `README.md` License section,
+`assets/LICENSE.md`, `CONTRIBUTING.md` (same dual license for
+contributions, no CLA/copyright assignment), `THIRD-PARTY.md` (87-crate
+inventory with per-package copyright or `authors` attribution),
+`LICENSES/` (full MIT, Apache-2.0, Unicode-3.0, BSD-2-Clause and
+Unlicense texts), `license.workspace = true` on all 15 member crates.
+
+**Distribution-path check (task: bundle completeness):** no crate is
+published (no `publish`/`package` configuration exists anywhere in the
+workspace) and no binary-tarball machinery exists yet — the source tree
+is currently the only distribution form, and it carries the full notice
+set in-tree. When binary or packaged releases are produced, the bundle
+must carry `LICENSE-MIT`, `LICENSE-APACHE`, `THIRD-PARTY.md`, and
+`LICENSES/`; any bundle that also ships `assets/taisan-hero.jpg` must
+carry `assets/LICENSE.md` alongside it.

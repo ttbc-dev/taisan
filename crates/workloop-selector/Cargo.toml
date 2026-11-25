@@ -1,6 +1,7 @@
 [package]
 name = "workloop-selector"
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 workloop-core = { path = "../workloop-core" }

@@ -1,6 +1,7 @@
 [package]
 name = "workloop-executor"
 edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "taisan-executor"

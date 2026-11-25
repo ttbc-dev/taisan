@@ -1,6 +1,7 @@
 [package]
 name = "workloop-tui"
 edition.workspace = true
+license.workspace = true
 default-run = "taisan-tui"
 description = "taisan management console"
 
