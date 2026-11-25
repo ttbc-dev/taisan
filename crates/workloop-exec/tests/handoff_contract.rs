@@ -2014,6 +2014,47 @@ fn contained_verification_refuses_a_missing_toolchain() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A declared cache path that is a symlink resolves on the host —
+/// `exists()` follows it — but the sandbox binds the declared path,
+/// never the link target, so the boundary dangles inside. The refusal
+/// names the symlink shape, not the misleading unreadable-path code
+/// the boundary digest would emit (#469).
+#[test]
+fn contained_verification_refuses_a_symlinked_cache() {
+    let root = tmp_root("verify-cachelink");
+    let (store, mut layout, scratch, aid) = acknowledged(&root, "vc-cachelink");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let port = workloop_exec::scripted::ScriptedProcessControl::new();
+    let (_bwrap, _relay, bwrap_log, _relay_log) =
+        install_sandbox(&mut layout, &root, port, vec![], vec![]);
+    // The real cache directory exists; the declared path is a symlink
+    // to it — the pilot's exact defect shape.
+    let link = root.join("cache-link");
+    std::os::unix::fs::symlink(root.join("deps-cache"), &link).unwrap();
+    if let Some(sandbox) = layout.verification.as_mut() {
+        sandbox.caches = vec![link];
+    }
+    let res = handoff::verify(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[0]",
+        &["/bin/sh".into(), "-c".into(), "true".into()],
+        &scratch,
+        &[],
+        &mut || 0,
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Inconclusive);
+    assert!(
+        res.output.contains("verification.cache_symlink"),
+        "{}",
+        res.output
+    );
+    assert!(!bwrap_log.exists(), "no launch on a linked cache path");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn contained_verification_refuses_when_the_containment_gate_fails() {
     let root = tmp_root("verify-gatefail");

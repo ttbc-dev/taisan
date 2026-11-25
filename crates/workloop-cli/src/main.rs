@@ -19,7 +19,7 @@ use workloop_config::preflight::{
     ProbeMode, check as preflight_check, init as preflight_init,
 };
 use workloop_config::profile::resolve_paths_from_env;
-use workloop_config::{Installation, load_or_create};
+use workloop_config::{Installation, load_existing, load_or_create};
 use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::identity::{
@@ -2018,6 +2018,21 @@ fn run_check(cli: &Cli, probe: bool) -> i32 {
         // request. The stage runs after (1)–(7), performs no reads and
         // no writes, and the report carries an empty operation log.
         options.probe = ProbeMode::Unavailable;
+    }
+    // The verification boundary paths live on the JSON installation
+    // record (`<db-stem>.config.json` beside `--db`), not the profile.
+    // Read it strictly read-only — never `load_or_create`, which would
+    // publish a fresh record on first use — so the Paths stage can
+    // inspect declared toolchain/cache paths for the symlink shape the
+    // sandbox cannot mount (#469). An absent or unreadable record
+    // leaves the paths uninspected.
+    if let Ok(Some(installation)) = load_existing(&cli.db.with_extension("config.json")) {
+        options.verification_toolchain = installation.verification_toolchain.map(PathBuf::from);
+        options.verification_cache_paths = installation
+            .verification_cache_paths
+            .iter()
+            .map(PathBuf::from)
+            .collect();
     }
     let report = preflight_check(&paths.config_path, &mut options);
     if report.success {
