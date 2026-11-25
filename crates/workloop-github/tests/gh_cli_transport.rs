@@ -606,6 +606,8 @@ case "$2" in
   repos/owner/repo/compare/a...broken) echo 'gh: Server Error (HTTP 500)' >&2; exit 1 ;;
   repos/owner/repo/compare/a...denied) echo 'gh: Forbidden (HTTP 403)' >&2; exit 1 ;;
   repos/owner/repo/compare/a...lost) echo 'gh: connection reset' >&2; exit 1 ;;
+  repos/owner/repo/compare/a...empty) echo '{}' ;;
+  repos/owner/repo/compare/a...odd) echo '{"status":"unrelated"}' ;;
 esac
 "#,
     );
@@ -635,6 +637,20 @@ esac
             Err(ApiError::Unknown { .. })
         ),
         "a lost response is never an absence"
+    );
+    assert!(
+        matches!(
+            api.contains_revision(&repo, "a", "empty"),
+            Err(ApiError::Unknown { .. })
+        ),
+        "a 200 without a comparison status is malformed, not 'absent'"
+    );
+    assert!(
+        matches!(
+            api.contains_revision(&repo, "a", "odd"),
+            Err(ApiError::Unknown { .. })
+        ),
+        "an undecidable comparison status is malformed, not 'absent'"
     );
 }
 

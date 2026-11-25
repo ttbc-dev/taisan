@@ -1553,10 +1553,16 @@ impl GitHubApi for GhCliApi {
                 });
             }
         };
-        Ok(matches!(
-            value.get("status").and_then(|v| v.as_str()),
-            Some("ahead" | "identical")
-        ))
+        match value.get("status").and_then(|v| v.as_str()) {
+            Some("ahead" | "identical") => Ok(true),
+            Some("diverged" | "behind") => Ok(false),
+            // A 200 without a decidable comparison status is a
+            // malformed success, not a "not contained" — never let it
+            // authorize the write.
+            _ => Err(ApiError::Unknown {
+                reason: format!("gh api {endpoint}: response missing comparison status"),
+            }),
+        }
     }
 
     fn read_issue(&mut self, issue: &IssueRef) -> Result<RemoteIssue, ApiError> {
