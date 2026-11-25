@@ -590,6 +590,54 @@ esac
     assert!(!api.contains_revision(&repo, "a", "c").unwrap());
 }
 
+/// Issue #450: a produced commit that is not pushed yet makes the
+/// compare read 404 — "commit unknown to the remote" is a definite
+/// not-contained, so a divergent republish reconciles to `Absent` and
+/// the leased write proceeds. Only the read itself failing may error.
+#[test]
+fn contains_revision_treats_an_unknown_revision_as_absent_not_failed() {
+    let dir = tempdir("compare-404");
+    let gh = stub_gh(
+        &dir,
+        "gh",
+        r#"
+case "$2" in
+  repos/owner/repo/compare/new1...head9) echo 'gh: Not Found (HTTP 404)' >&2; exit 1 ;;
+  repos/owner/repo/compare/a...broken) echo 'gh: Server Error (HTTP 500)' >&2; exit 1 ;;
+  repos/owner/repo/compare/a...denied) echo 'gh: Forbidden (HTTP 403)' >&2; exit 1 ;;
+  repos/owner/repo/compare/a...lost) echo 'gh: connection reset' >&2; exit 1 ;;
+esac
+"#,
+    );
+    let mut api = GhCliApi::with_gh(gh);
+    let repo = repository();
+    assert!(
+        !api.contains_revision(&repo, "new1", "head9").unwrap(),
+        "a revision the remote does not know is a definite absence"
+    );
+    assert!(
+        matches!(
+            api.contains_revision(&repo, "a", "broken"),
+            Err(ApiError::Unknown { .. })
+        ),
+        "a server-side failure stays an unreadable read"
+    );
+    assert!(
+        matches!(
+            api.contains_revision(&repo, "a", "denied"),
+            Err(ApiError::Refused { .. })
+        ),
+        "a non-404 refusal is not an absence"
+    );
+    assert!(
+        matches!(
+            api.contains_revision(&repo, "a", "lost"),
+            Err(ApiError::Unknown { .. })
+        ),
+        "a lost response is never an absence"
+    );
+}
+
 #[test]
 fn list_pulls_on_branch_filters_by_head_sha() {
     let dir = tempdir("list-pulls");

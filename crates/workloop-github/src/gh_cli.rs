@@ -1531,11 +1531,28 @@ impl GitHubApi for GhCliApi {
                 reason: format!("invalid revision: {descendant:?}"),
             });
         }
-        let value = self.api(
-            "GET",
-            &format!("repos/{slug}/compare/{ancestor}...{descendant}"),
-            None,
-        )?;
+        let endpoint = format!("repos/{slug}/compare/{ancestor}...{descendant}");
+        // A 404 is a definite answer, not a failed read: the remote
+        // cannot place one of the revisions. For a produced commit
+        // that is simply not pushed yet — the case the guarded write
+        // exists for — "not an ancestor" is exactly right; the lease
+        // on `expected_prior` is what makes the force write safe.
+        // Anything else (5xx, a lost response, an unparseable body)
+        // stays an error so the caller keeps the read indeterminate.
+        let value = match self.api_status("GET", &endpoint)? {
+            Ok(value) => value,
+            Err(404) => return Ok(false),
+            Err(status) if (400..500).contains(&status) => {
+                return Err(ApiError::Refused {
+                    reason: format!("gh api {endpoint}: HTTP {status}"),
+                });
+            }
+            Err(status) => {
+                return Err(ApiError::Unknown {
+                    reason: format!("gh api {endpoint}: HTTP {status}"),
+                });
+            }
+        };
         Ok(matches!(
             value.get("status").and_then(|v| v.as_str()),
             Some("ahead" | "identical")
