@@ -260,12 +260,16 @@ converged path, and the verified-outcome settle stayed unexercised —
 each blocked by a filed defect (#447/#448/#449/#450).
 
 Run 5 (#270, owner-authorized, guest `taisan-v03`, driver built from
-`179f6fe`) reached **M-1…M-6 PASS — proven twice** on independent
-Execution chains (e-3 → PR #66, e-4 → PR #67): intake, real coding,
+`179f6fe`) reached **M-1…M-6 PASS** on independent
+Execution chains (e-3 → PR #66, e-4 → PR #67) — proven twice for
+M-1, M-3, M-4, M-5 and M-6; M-2 (independent invariant coverage) is
+proven on the e-3 chain only, e-4's `inv-18` having completed
+`unavailable`/`provider_unavailable` — covering: intake, real coding,
 independent verification, H1 publish, bound-actor review finding →
 `paused_judgment`, `judge-findings`/`release-judgment` → judged fix,
 and the republish-converged H2 leg (`expected_prior` fast-forward,
-H2 checks SUCCESS) — including the path run 4 never reached. **M-7
+PR check runs observed SUCCESS under a `required_checks []`
+installation) — including the path run 4 never reached. **M-7
 verified outcome stayed unexercised**: the post-republish
 invariant checks (`inv-16`, `inv-20`) reported `provider_unavailable`
 at exit 0 — lane-terminal under #456, with the provider failure
