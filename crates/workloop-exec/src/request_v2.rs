@@ -52,6 +52,27 @@ const MAX_INPUT_BODY_BYTES: u64 = 8 * 1024 * 1024;
 /// Total retained-input bound across one request: the sum of every
 /// resolved body the Invocation will read.
 const MAX_INPUT_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+/// The bounded tail of a recorded verification `output` one evidence
+/// body carries. A recorded output is already a bounded tail — but up
+/// to 8 MiB each — so a handful of noisy runs would push the request
+/// inputs past `MAX_INPUT_TOTAL_BYTES` and refuse the check dispatch
+/// forever. The tail is what a judge reads: the failure summary lives
+/// at the end of a test run's output.
+const VERIFICATION_EVIDENCE_OUTPUT_TAIL_BYTES: usize = 64 * 1024;
+
+/// The tail an evidence body carries of a recorded `output`, cut on a
+/// char boundary — the recorded value is already a bounded tail, and
+/// the end is where a failed run's summary lives.
+fn evidence_output_tail(output: &str) -> String {
+    if output.len() <= VERIFICATION_EVIDENCE_OUTPUT_TAIL_BYTES {
+        return output.to_string();
+    }
+    let mut start = output.len() - VERIFICATION_EVIDENCE_OUTPUT_TAIL_BYTES;
+    while !output.is_char_boundary(start) {
+        start += 1;
+    }
+    output[start..].to_string()
+}
 
 /// The static budget bounds every v2 request carries; the deadline
 /// and remaining-runtime members are derived per request from the
@@ -872,8 +893,16 @@ pub fn build_request_body(
             // every recorded verification run on the assessed
             // artifact, retained immutably and bound by digest — the
             // workspace snapshot alone could never replay a test run.
+            // The wire bound is the same `max_verification_commands`
+            // the producing request's argv was checked against; a
+            // durable table that somehow holds more (a v1-produced
+            // artifact under a larger spec argv) degrades to the
+            // newest recorded results rather than refusing every
+            // check dispatch as `request.invalid` forever.
+            let keep = dispatch.budget.max_verification_commands as usize;
+            let skip = durable.verification.len().saturating_sub(keep);
             let mut verification_evidence = Vec::new();
-            for result in &durable.verification {
+            for result in &durable.verification[skip..] {
                 let body = VerificationEvidenceBody {
                     format: VERIFICATION_EVIDENCE_FORMAT.into(),
                     work_id: durable.work.id.0.clone(),
@@ -888,7 +917,7 @@ pub fn build_request_body(
                         VerificationOutcome::Fail => "fail".into(),
                         VerificationOutcome::Inconclusive => "inconclusive".into(),
                     },
-                    output: result.output.clone(),
+                    output: evidence_output_tail(&result.output),
                 };
                 let bytes = body.canonical_bytes();
                 let digest = body.wire_digest();

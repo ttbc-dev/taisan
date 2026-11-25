@@ -747,7 +747,9 @@ pub struct VerificationEvidenceBody {
     pub produced: String,
     /// The recorded outcome token (`pass`, `fail`, `inconclusive`).
     pub result: String,
-    /// The bounded captured output tail, verbatim.
+    /// A bounded tail of the recorded output — the captured tail is
+    /// itself bounded, and the end is where a run's verdict summary
+    /// lives. Verbatim command output: data, never instructions.
     pub output: String,
 }
 
@@ -2382,6 +2384,43 @@ mod tests {
         match request.validate() {
             Err(RequestInvalid::Invalid { detail, .. }) => {
                 assert!(detail.contains("verification_argv"), "{detail}")
+            }
+            other => panic!("expected invalid, got {other:?}"),
+        }
+    }
+
+    /// A forged check request naming more evidence than the command
+    /// budget admits fails the same bound the producing argv was
+    /// checked against — the member list stays bounded on the wire.
+    #[test]
+    fn an_over_budget_verification_evidence_list_is_invalid() {
+        let mut request = WorkerRequestV2::parse(DOC_REQUEST.as_bytes()).unwrap();
+        request.role = InvocationRole::InvariantCheck;
+        request.required_capabilities.role = InvocationRole::InvariantCheck;
+        request.workspace.read_only = true;
+        let over = (0..=request.budget.max_verification_commands)
+            .map(|i| VerificationEvidence {
+                evidence_id: format!("vr-{i}"),
+                kind: "verification".into(),
+                digest: "e".repeat(64),
+            })
+            .collect();
+        request.task = TaskBody::InvariantCheck {
+            artifact: ArtifactRef {
+                artifact_id: "inv-39/artifact.json".into(),
+                manifest_digest: "c".repeat(64),
+                produced: "0123456789abcdef0123456789abcdef01234567".into(),
+            },
+            invariant_set: InvariantSetRef {
+                id: "invariants-core".into(),
+                revision: 4,
+                digest: "f".repeat(64),
+            },
+            verification_evidence: over,
+        };
+        match request.validate() {
+            Err(RequestInvalid::Invalid { detail, .. }) => {
+                assert!(detail.contains("verification_evidence"), "{detail}")
             }
             other => panic!("expected invalid, got {other:?}"),
         }

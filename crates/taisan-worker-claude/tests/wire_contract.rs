@@ -1255,7 +1255,10 @@ fn invariant_check_prompt_carries_verification_evidence() {
         "argv": ["python3", "-m", "unittest"],
         "produced": hex(0x12),
         "result": "pass",
-        "output": "Ran 4 tests in 0.01s\n\nOK",
+        // Longer than the prompt's output window: the verdict line at
+        // the very end must still reach the assessor while the head
+        // is cut — a run's summary lives in the tail.
+        "output": format!("HEAD-MARKER\n{}\nFAILED-SUMMARY-AT-TAIL: all good\n", "noise ".repeat(400)),
     }));
     let (request_path, _, out_dir) = dispatch(
         "inv-ev",
@@ -1287,7 +1290,10 @@ fn invariant_check_prompt_carries_verification_evidence() {
     assert!(prompt.contains("you cannot run commands yourself"));
     assert!(prompt.contains("verification_argv[0]"));
     assert!(prompt.contains("python3"));
-    assert!(prompt.contains("Ran 4 tests in 0.01s"));
+    // The tail of a long recorded output reaches the assessor; the
+    // head does not — a run's verdict summary lives at the end.
+    assert!(prompt.contains("FAILED-SUMMARY-AT-TAIL"));
+    assert!(!prompt.contains("HEAD-MARKER"));
     let r = report(&out_dir);
     assert_eq!(r["status"], "success");
     assert_eq!(r["invariant_items"][0]["verdict"], "conforms");
