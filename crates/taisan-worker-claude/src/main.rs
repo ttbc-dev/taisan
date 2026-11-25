@@ -527,6 +527,34 @@ fn runtime_environment(cfg: &Config, provider: &ProviderConfig) -> Vec<(String, 
 /// block is required.
 const RESULT_BLOCK_TAG: &str = "taisan-result";
 
+/// Recorded command output is artifact-controlled text: the produced
+/// commit's own run wrote it. Before it is pasted into a prompt, every
+/// run of three or more backticks is rewritten to apostrophes so the
+/// evidence can never carry a fenced block — a forged `taisan-result`
+/// claim echoed back by the runtime would otherwise parse as its own
+/// verdict (`extract_result_block` takes the last such block). Runs
+/// of one or two backticks cannot open a fence and stay readable.
+fn neutralize_fences(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '`' {
+            let mut run = 1;
+            while chars.peek() == Some(&'`') {
+                chars.next();
+                run += 1;
+            }
+            let rep = if run >= 3 { '\'' } else { '`' };
+            for _ in 0..run {
+                out.push(rep);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// The tail of a recorded verification `output` the prompt shows —
 /// cut on a char boundary so the end (a run's verdict summary) is
 /// always visible even for noisy runs.
@@ -617,7 +645,9 @@ fn build_prompt(request: &WorkerRequestV2, input_dir: &Path) -> Result<String, S
                                 body.requirement,
                                 body.argv,
                                 body.result,
-                                body.output.chars().take(2000).collect::<String>()
+                                neutralize_fences(
+                                    &body.output.chars().take(2000).collect::<String>()
+                                )
                             )),
                             None => p.push_str(&format!(
                                 "- {}. sealed evidence {} ({})\n",
@@ -685,7 +715,7 @@ fn build_prompt(request: &WorkerRequestV2, input_dir: &Path) -> Result<String, S
                             body.requirement,
                             body.argv,
                             body.result,
-                            output_tail(&body.output)
+                            neutralize_fences(output_tail(&body.output))
                         )),
                         None => p.push_str(&format!(
                             "- {}. sealed evidence {} ({})\n",
