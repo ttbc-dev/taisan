@@ -12,7 +12,7 @@ taisan is the public project name. The orchestration model, adapter contracts, a
 | `workloop.db` | Unchanged default SQLite store path, relative to the working directory. |
 | `workloop.config.json` | Unchanged default installation config path, derived from the database path. `--config` still overrides it. |
 | Config keys, command origins, and idempotency keys | Unchanged. Both command names share the same storage and command semantics. |
-| `ttbc-dev/taisan` | Current GitHub repository and clone URL. The previous `shimpeiws/agent-workloop` URL redirects here. |
+| `ttbc-dev/taisan` | Current GitHub repository and clone URL. Previous slugs `shimpeiws/agent-workloop` and `shimpeiws/taisan` both redirect here. |
 
 ## Update existing installations
 
@@ -26,7 +26,7 @@ Generic terms such as work loop remain technical descriptions. Historical audit 
 
 ## Update Git remotes
 
-The GitHub repository is renamed from `shimpeiws/agent-workloop` to `ttbc-dev/taisan`. Update each existing clone:
+The GitHub repository moved from `shimpeiws/agent-workloop` to `ttbc-dev/taisan` via the intermediate slug `shimpeiws/taisan` — clones still pointing at either previous slug are redirected by GitHub. Update each existing clone:
 
 ```sh
 git remote set-url origin git@github.com:ttbc-dev/taisan.git
