@@ -1,7 +1,7 @@
 # License preparation: dependency inventory and options
 
 Status: preparation document for the license-selection gate
-([issue #369](https://github.com/shimpeiws/taisan/issues/369)). This
+([issue #369](https://github.com/ttbc-dev/taisan/issues/369)). This
 document inventories what the planned release would redistribute and
 what each component requires. It does **not** select a license, add a
 `LICENSE` file, or change Cargo metadata — the owner selects the license

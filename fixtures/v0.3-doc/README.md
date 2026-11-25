@@ -52,7 +52,7 @@ the run ended with the Execution `waiting` and **zero**
 `host_action_intents` rows — the capture predates the in-process
 `github` driver's `CapabilityReport` evidence, the composition gap
 closed by
-[#355](https://github.com/shimpeiws/taisan/issues/355). On this tree
+[#355](https://github.com/ttbc-dev/taisan/issues/355). On this tree
 the driver now emits a report every source pass, so a live run
 records publish intents once that report lands.
 

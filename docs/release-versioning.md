@@ -19,7 +19,7 @@ SHAs appear as owner-verifiable evidence locators.
 ## 1. Proposed release identity
 
 The milestone
-["Initial public release — validated v0.3"](https://github.com/shimpeiws/taisan/milestone/8)
+["Initial public release — validated v0.3"](https://github.com/ttbc-dev/taisan/milestone/8)
 names the delivered unit **v0.3** — the same ordinal the design
 documents use for the v0.1/v0.3 requirement slices. The proposal keeps
 that ordinal visible in the public identity:

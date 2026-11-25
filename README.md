@@ -52,7 +52,7 @@ The system can make routine implementation decisions within the supplied intent 
 Install Rust with support for edition 2024, then build from source. The v0.3 Worker path is documented in the [installation and operation guide](docs/v0.3-installation.md); live Worker and host acceptance remains owner-run.
 
 ```sh
-git clone https://github.com/shimpeiws/taisan.git
+git clone https://github.com/ttbc-dev/taisan.git
 cd taisan
 cargo build --workspace
 cargo run -p workloop-cli --bin taisan -- --help
@@ -64,7 +64,7 @@ To install the CLI from this checkout:
 cargo install --path crates/workloop-cli --bin taisan
 ```
 
-Install the agent skill from this checkout with `npx skills add ./skills/taisan` (or from the registry with `npx skills add shimpeiws/taisan`); the [skill walkthrough](docs/skill-walkthrough.md) documents setup, installation, invocation, and the direct-CLI fallback with captured output. See the [agent interface requirements](docs/agent-interface.md). The existing TUI remains available with `cargo run -p workloop-tui --bin taisan-tui -- --help` and can be installed with `cargo install --path crates/workloop-tui --bin taisan-tui`; it is not required for v0.1.
+Install the agent skill from this checkout with `npx skills add ./skills/taisan` (or from the registry with `npx skills add ttbc-dev/taisan`); the [skill walkthrough](docs/skill-walkthrough.md) documents setup, installation, invocation, and the direct-CLI fallback with captured output. See the [agent interface requirements](docs/agent-interface.md). The existing TUI remains available with `cargo run -p workloop-tui --bin taisan-tui -- --help` and can be installed with `cargo install --path crates/workloop-tui --bin taisan-tui`; it is not required for v0.1.
 
 The Cargo package names retain their existing names for compatibility. See [name migration](docs/name-migration.md) for legacy commands and state paths.
 
