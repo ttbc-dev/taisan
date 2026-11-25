@@ -752,6 +752,89 @@ fn sanitized_export_excludes_plan_content_but_retains_integrity_metadata() {
     assert!(!refused.exists());
 }
 
+/// A narrower re-run into the same directory must not leave an earlier
+/// wider run's excluded plan content behind. The bundle owns its
+/// `artifacts/` and `previews/` subtrees, so a sanitized export clears
+/// files the widened run wrote even though this run emits none of them.
+#[test]
+fn sanitized_rerun_clears_plan_files_left_by_a_wider_profile() {
+    let root = root("sanitized-downgrade");
+    let db = root.join("workloop.db");
+    populate(&db);
+    let (plan_id, plan_digest) = append_plan_artifact(&db);
+    let out_dir = root.join("downgraded-export");
+    let out = out_dir.to_string_lossy().into_owned();
+
+    // A wider profile first exports the plan content and its preview.
+    let output = output_at(
+        &root,
+        &[
+            "evidence",
+            "export",
+            "--limit",
+            "500",
+            "--profile",
+            "shared",
+            "--include-class",
+            "plan",
+            "--output",
+            &out,
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        files_under(&out_dir)
+            .into_iter()
+            .any(
+                |file| String::from_utf8_lossy(&std::fs::read(file).unwrap()).contains(PLAN_MARKER)
+            ),
+        "the widened export writes plan content"
+    );
+
+    // Re-export with the strict profile into the same directory.
+    let output = output_at(
+        &root,
+        &[
+            "evidence",
+            "export",
+            "--limit",
+            "500",
+            "--profile",
+            "sanitized",
+            "--output",
+            &out,
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let manifest: ExportManifest =
+        serde_json::from_slice(&std::fs::read(out_dir.join("manifest.json")).unwrap()).unwrap();
+    let entry = manifest
+        .excluded_artifact(&plan_id)
+        .expect("the exclusion keeps an integrity entry");
+    assert_eq!(entry.sha256, plan_digest);
+    assert!(entry.excluded);
+    assert!(!entry.content_included);
+    assert!(!entry.preview_included);
+
+    for file in files_under(&out_dir) {
+        let bytes = std::fs::read(&file).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(PLAN_MARKER),
+            "{} leaked excluded plan content from the wider run",
+            file.display()
+        );
+    }
+}
+
 #[test]
 fn invalid_profile_class_and_output_fail_closed() {
     let root = root("profile-errors");

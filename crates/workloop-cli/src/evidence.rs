@@ -9,6 +9,7 @@
 //! read-only: they replay recorded history and never invoke a worker,
 //! refresh a host or mutate orchestration state.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use super::envelope::{MESSAGE_BOUND, bounded};
@@ -305,8 +306,44 @@ fn write_bundle(dir: &Path, files: &[ExportedFile]) -> Result<(), String> {
         std::fs::remove_file(&manifest)
             .map_err(|e| format!("cannot clear the previous export manifest: {e}"))?;
     }
+    // A narrower re-run into the same directory must not leave content
+    // files an earlier wider profile wrote. Only the bundle-managed
+    // content subtrees are swept; `page.json` and `manifest.json` are
+    // rewritten, and files outside the bundle's own layout are not ours
+    // to delete.
+    let keep: BTreeSet<PathBuf> = files.iter().map(|file| dir.join(&file.path)).collect();
+    for subtree in ["artifacts", "previews"] {
+        sweep_stale_files(&dir.join(subtree), &keep)?;
+    }
     for file in files {
         write_file(&dir.join(&file.path), &file.bytes)?;
+    }
+    Ok(())
+}
+
+/// Remove files under `path` that the current bundle does not emit.
+/// Bundle content lives in the flat `artifacts/` and `previews/`
+/// subtrees; empty descendants are pruned so a narrower export leaves no
+/// stale tree behind. Symlinks are unlinked, never followed.
+fn sweep_stale_files(path: &Path, keep: &BTreeSet<PathBuf>) -> Result<(), String> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("cannot inspect the export directory: {e}")),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("cannot inspect the export directory: {e}"))?;
+        let child = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("cannot inspect the export directory: {e}"))?;
+        if file_type.is_dir() {
+            sweep_stale_files(&child, keep)?;
+            let _ = std::fs::remove_dir(&child);
+        } else if !keep.contains(&child) {
+            std::fs::remove_file(&child)
+                .map_err(|e| format!("cannot clear a stale export file: {e}"))?;
+        }
     }
     Ok(())
 }
