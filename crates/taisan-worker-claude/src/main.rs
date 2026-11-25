@@ -639,15 +639,16 @@ fn build_prompt(request: &WorkerRequestV2, input_dir: &Path) -> Result<String, S
                             .ok()
                             .and_then(|b| FailedEvidenceBody::parse(b.as_bytes()).ok())
                         {
+                            // The recorded output is a bounded tail
+                            // already; keep its end — a run's verdict
+                            // summary lives there, the head does not.
                             Some(body) => p.push_str(&format!(
                                 "- {}. requirement `{}` ran `{:?}` → {}:\n  {}\n",
                                 i + 1,
                                 body.requirement,
                                 body.argv,
                                 body.result,
-                                neutralize_fences(
-                                    &body.output.chars().take(2000).collect::<String>()
-                                )
+                                neutralize_fences(output_tail(&body.output))
                             )),
                             None => p.push_str(&format!(
                                 "- {}. sealed evidence {} ({})\n",
