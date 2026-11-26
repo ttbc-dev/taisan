@@ -28,10 +28,15 @@ Already met at writing:
 
 Still open at writing:
 
-- [ ] *owner* — disposition each flagged defect as blocking-then-fix
-      or deferred-documented: #313, #398/#399, #400, #437,
-      #453–#456, #468/#470/#471 (#469 fixed post-pin by #474),
-      plus the deferred residuals — ledger:
+- [ ] *owner* — defect dispositions are recorded in #365's closing
+      comment (2026-11-25): #313/#398/#399/#400 'fixed per §6',
+      #468/#470/#471 deferred to v0.6 (milestone 11) and the earlier
+      deferred set #453–#456 unchanged → v0.6,
+      #469 fixed post-pin by #474. Remaining owner acts: close the
+      dispositioned defect issues (#313/#358/#359/#361/#398/#399/
+      #400 — 'Fixed on the release candidate' group, all open), and
+      give #437 a recorded disposition (flagged for owner review,
+      absent from the comment) — ledger:
       [release-acceptance-v0.3.md](release-acceptance-v0.3.md) §6–§7;
       user-facing ones already sit in the notes' known-limitations.
 - [ ] Merge the open repair PR or defer it explicitly:

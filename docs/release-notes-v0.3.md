@@ -16,8 +16,11 @@ scheduled-intake pilot, and the #367 clean-Linux-install reproduction
 are complete and closed; the #368 public-content audit is
 dispositioned by the #438 owner ruling (in-place publication, history
 kept); and the #369 license is applied (MIT OR Apache-2.0). The
-acceptance issue #365 stays open until the owner dispositions the
-flagged defects — none of those dispositions is made here. The
+acceptance issue #365 is closed: the owner dispositioned the flagged
+defects in its closing comment (2026-11-25) — recorded in
+release-acceptance §6 — while #437 still awaits a recorded
+disposition and the dispositioned defect issues themselves stay
+open for the owner to close. The
 record's fold-in of the pilot/clean evidence landed via PR #472
 (merged `d87d5dc`); the run records cited here are the retained
 owner-side evidence, not that PR. Per `AGENTS.md`, the live-run
@@ -225,7 +228,8 @@ source-build path above remains supported independently.
   capacity/robustness claim.
 - **Pilot-discovered defects** — surfaced by the #271 pilot, filed
   and unfixed at record time; #469 is repaired post-pin by PR #474
-  (below), the rest are dispositions pending owner call:
+  (below), the rest are deferred to v0.6 (milestone 11) per #365's
+  closing comment — issues open:
   - **#468** — `taisan init` emits the numeric repository id, which
     the `public-issue-selector` GitHub backend cannot use; scheduled
     intake fails closed (`adapter_source_unavailable`) on the first
@@ -236,7 +240,8 @@ source-build path above remains supported independently.
     reports `cache_unreadable` and the assessment item stays
     `inconclusive` with no designed re-drive path (a `waiting/ci`
     execution can only be cancelled). **Fixed on `main` post-pin by
-    PR #474** (symlinked verification-boundary paths refused; the
+    PR #474, issue closed** (symlinked verification-boundary paths
+    refused; the
     invariant check re-drives on unjudged conclusive evidence).
   - **#470** — publish branches are named `work/w-N`
     deterministically, so repeated installs against the same
@@ -248,8 +253,9 @@ source-build path above remains supported independently.
     `max_candidates` budget each tick, so a permanently-replayed
     issue can starve new proposals. Workaround used in the pilot:
     raise `pending_queue_limit`.
-- **Earlier flagged defects, dispositions pending owner call** —
-  recorded open in release-acceptance §6: #313 (two unrecorded
+- **Earlier flagged defects, dispositioned in #365's closing
+  comment** — recorded 'fixed per §6' there, issues still open
+  (release-acceptance §6): #313 (two unrecorded
   same-signature processes can hold an unidentified launch
   unresolved — honest-uncertain wedge, not a false absence), #398
   and #399 (`file:` credential sources can stay readable inside
@@ -265,7 +271,9 @@ source-build path above remains supported independently.
   the candidate line; #419 (`artifact.json` collision) has repair PR
   #431 open.
 - **Open operator-facing defects** — recorded in release-acceptance
-  §7 and unfixed: #453 (cancel does not withdraw pending outbox
+  §7 and unfixed; the earlier deferred set stays deferred to v0.6
+  per #365's closing comment — issues open: #453 (cancel does not
+  withdraw pending outbox
   intents — a cancelled Execution whose intent never reconciles parks
   permanently at `stopping`; run 4 needed a manual claim/slot
   release), #454 (capability reports refresh only on

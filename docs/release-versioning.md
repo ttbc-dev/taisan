@@ -6,9 +6,12 @@ will follow. It is a draft prepared before the final candidate is
 frozen — the evidence issues behind the acceptance record are complete
 (#270 manual acceptance owner-approved, #271 pilot and #367 clean
 install closed, #368 dispositioned by the #438 ruling, #369 license
-applied), while #365 itself stays open until the owner dispositions
-the flagged defects. What remains is those dispositions plus the
-owner's version choice and candidate sign-off. **No tag exists, no
+applied), and #365 itself is closed — the owner dispositioned the
+flagged defects in its closing comment (2026-11-25), recorded in
+release-acceptance §6 (#437 still awaits a recorded disposition).
+What remains is the owner's version choice and candidate sign-off,
+plus the §7 owner acts — closing the dispositioned defect issues
+and #437's call. **No tag exists, no
 release exists, and no
 commit named here is a release candidate.** Nothing in this document
 authorizes a tag, a GitHub release, a version-metadata change, a
@@ -80,9 +83,11 @@ exact `origin/main` HEAD (`git log -1`, full SHA, merge subject) and
 the merges the evidence depends on. The freeze extends it:
 
 1. After the owner's candidate sign-off — the acceptance evidence is
-   met and the gating fixes (#344/#363/#364, #447–#450, #466) have
-   landed; what remains open is the disposition call on each flagged
-   defect and the open repair PRs, tracked in
+   met, the gating fixes (#344/#363/#364, #447–#450, #466) have
+   landed, and the defect dispositions are recorded in #365's
+   closing comment; what remains open is closing the dispositioned
+   defect issues, #437's recorded disposition, and the open repair
+   PR #431 (for #419), tracked in
    [release-acceptance-v0.3.md](release-acceptance-v0.3.md) §6–§7 and
    the [freeze checklist](release-freeze-checklist.md) — record the
    candidate:
@@ -211,7 +216,7 @@ binaries**, not as a registry package.
 
 | Decision | Options | This draft |
 | --- | --- | --- |
-| Release version | `0.3.0` (proposed) / `1.0.0` | **owner-pending** — the only undecided *decision* row in this table; owner acts outside it (defect dispositions, candidate sign-off) remain — status paragraph, freeze checklist |
+| Release version | `0.3.0` (proposed) / `1.0.0` | **owner-pending** — the only undecided *decision* row in this table; owner acts outside it (closing the dispositioned defect issues, #437's call, candidate sign-off) remain — status paragraph, freeze checklist |
 | Candidate commit | recorded `origin/main` SHA at sign-off (§3) | procedure only; **not named** — the freeze records it |
 | Publication route | in-place, history kept | **decided** — #438 ruling ([release audit](release-audit.md) §7) |
 | Distribution route | cargo-dist → GitHub Releases + Homebrew tap + cargo-binstall; no crates.io | **decided** — #370 comment, 2026-11-25 (§6); workflow is #441's lane |
