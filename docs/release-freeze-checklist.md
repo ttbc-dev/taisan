@@ -30,26 +30,30 @@ Still open at writing:
 
 - [ ] *owner* — defect dispositions are recorded in #365's closing
       comment (2026-11-25): #313/#398/#399/#400 'fixed per §6'
-      (owner's disposition wording — the four defects are confirmed
-      present on the candidate per
-      [release-acceptance-v0.3.md](release-acceptance-v0.3.md) §6;
-      the label is not a code-state claim),
+      (owner's disposition wording — per
+      [release-acceptance-v0.3.md](release-acceptance-v0.3.md) §6,
+      #313/#400 are confirmed present on the candidate while
+      #398/#399 are repaired on the post-pin branch
+      `issue-398-399-fix` pending merge; the label is not a
+      code-state claim),
       #468/#470/#471 deferred to v0.6 (milestone 11) and the earlier
       deferred set #453–#456 unchanged → v0.6,
       #469 fixed post-pin by #474. Remaining owner acts: close the
       dispositioned defect issues (#313/#358/#359/#361/#398/#399/
       #400 — 'Fixed on the release candidate' group, all open; the
       group label is the owner's disposition wording for issue
-      closure, not a code-state claim — #313/#398/#399/#400 remain
-      confirmed present and open with no milestone (#398/#400 also
+      closure, not a code-state claim — #313/#400 remain confirmed
+      present and open with no milestone, and #398/#399 stay open
+      while their repair branch is unmerged (#398/#400 also
       needs-human), so closing them
       is a disposition act, not evidence a fix landed), and
       give #437 a recorded disposition (flagged for owner review,
       absent from the comment) — ledger:
       [release-acceptance-v0.3.md](release-acceptance-v0.3.md) §6–§7;
       user-facing ones already sit in the notes' known-limitations.
-- [ ] Merge the open repair PR or defer it explicitly:
-      #431 (#419). (#472's ledger fold-in merged as `d87d5dc` — the
+- [ ] Merge the open repair PRs or defer them explicitly:
+      #431 (#419), #479 (#398/#399). (#472's ledger fold-in merged as
+      `d87d5dc` — the
       notes cite the retained owner-side run records, not that PR —
       and #427 merged as `52a5493`.)
 - [ ] *owner* — pick the release version: `0.3.0` (proposed) or
