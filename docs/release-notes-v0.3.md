@@ -8,7 +8,12 @@ candidate is frozen at
 version-metadata alignment (PR #477) is the last change inside it.
 No tag exists yet — the tag, the cargo-dist artifacts, and the
 repository visibility flip are the remaining release acts (freeze
-checklist §5–§6). The upstream evidence these notes
+checklist §5–§6). One structural note on reading the tag: the
+pinned tree necessarily carries this file's *pre-freeze draft*
+(a commit cannot contain the record of its own pin), so tagging
+`00fed69` ships the draft copy — this finalized text lives on
+`main` after the freeze-record merge and is the version of record.
+The upstream evidence these notes
 depended on is now in hand: the #270 manual real-Worker acceptance
 (runs 1–6, owner-approved at comment `7171973494`), the #271
 scheduled-intake pilot, and the #367 clean-Linux-install reproduction

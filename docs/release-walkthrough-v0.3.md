@@ -12,9 +12,16 @@ span `28afb72`/`179f6fe`/`c445feee` (runs 4–6), earlier heads (runs
 `00fed69` —
 every section is
 labelled "retained" and was re-marked at freeze (see the closing
-checklist): the only behavioral drift the freeze introduced is the
-version self-report (`0.0.0` in the retained captures → `0.3.0` on
-the candidate, noted where it surfaces). A fresh live-demonstration segment on the frozen commit
+checklist). The candidate differs from the retained drivers in two
+ways, both noted where they surface: the version self-report
+(`0.0.0` in the retained captures → `0.3.0` on the candidate), and
+behavioral repairs merged between the newest retained driver and
+the pin — #466 (post-exit output flood now promotes to
+`output_limit_reached`), #469 (symlinked verification-boundary paths
+are refused and the invariant check re-drives unjudged conclusive
+evidence — this changes the §6 w-2 path), #419 (`artifact.json`
+collision plus a component-wise symlink guard), and #323
+(sibling-PR conflict detection). A fresh live-demonstration segment on the frozen commit
 remains a separate owner decision (closing checklist); this document
 deliberately ships the retained-run form only.
 
@@ -198,6 +205,10 @@ would overstate the release:
   Work was cancelled after the symlink was replaced with a real
   directory (`22-cache-fix.txt`, `23-resume-w2.json`,
   `24-work-detail-w2-pre-cancel.json`) — filed as #469.
+  *Retained — predates candidate:* on `00fed69` this path resolves
+  differently — the symlinked verification-boundary path is refused
+  up front, and the invariant check re-drives an unjudged conclusive
+  item instead of leaving a sticky `inconclusive` (#474).
 
 ## 7. Boundaries — stated, not demonstrated
 
@@ -237,9 +248,10 @@ cited to the release notes' known-limitations section
       (`00fed690cf2993e220116901f1c2d14584305e18`, pinned 2026-11-26;
       see
       [release-freeze-checklist.md](release-freeze-checklist.md)).
-- [x] Each retained section re-marked: the only drift the freeze
-      introduced — version self-reports (`0.0.0` → `0.3.0`) — is
-      labelled where it surfaces; everything else the walkthrough
-      quotes is unchanged by the freeze.
+- [x] Each retained section re-marked: the drift between the
+      retained drivers and `00fed69` — version self-reports
+      (`0.0.0` → `0.3.0`) and the post-pin repairs #466/#469/
+      #419/#323 — is labelled where it surfaces (§6 w-2 carries the
+      #469 re-mark inline).
 - [ ] Owner decision: whether to add a fresh live-demonstration
       segment on the frozen commit (re-authorization required).
