@@ -1,9 +1,13 @@
 # Release freeze checklist — mechanical steps
 
-Status: **procedure only** (issue #370). This is the ordered,
-mechanical checklist the freeze follows once the owner signs off.
-Nothing in it is done yet — **no candidate is pinned, no version
-metadata is bumped, no tag exists, and no release is published.**
+Status: **executed through §4** (issue #370). The owner signed off
+2026-11-26 (version `0.3.0`; defect issues closed; #437 deferred to
+v0.6); the candidate is pinned at
+`00fed690cf2993e220116901f1c2d14584305e18` and the §4 gates re-ran on
+it — the record lives in
+[release-notes-v0.3.md](release-notes-v0.3.md)'s Verification
+record. **No tag exists and no release is published** — §5.2/§5.3 and
+the owner acts (live-demo segment, visibility flip) remain.
 Steps marked *owner* require an explicit owner decision; everything
 else is mechanical. Items are in execution order: each step gates
 the next, and any merge to `main` after step 3 invalidates the
@@ -26,9 +30,9 @@ Already met at writing:
       Homebrew tap + cargo-binstall; no crates.io (#370, §6 of
       [release-versioning.md](release-versioning.md))
 
-Still open at writing:
+Resolved at freeze (2026-11-26):
 
-- [ ] *owner* — defect dispositions are recorded in #365's closing
+- [x] *owner* — defect dispositions are recorded in #365's closing
       comment (2026-11-25): #313/#398/#399/#400 'fixed per §6'
       (owner's disposition wording — the four defects are confirmed
       present on the candidate per
@@ -36,24 +40,24 @@ Still open at writing:
       the label is not a code-state claim),
       #468/#470/#471 deferred to v0.6 (milestone 11) and the earlier
       deferred set #453–#456 unchanged → v0.6,
-      #469 fixed post-pin by #474. Remaining owner acts: close the
-      dispositioned defect issues (#313/#358/#359/#361/#398/#399/
-      #400 — 'Fixed on the release candidate' group, all open; the
-      group label is the owner's disposition wording for issue
-      closure, not a code-state claim — #313/#398/#399/#400 remain
-      confirmed present and open with no milestone (#398/#400 also
-      needs-human), so closing them
-      is a disposition act, not evidence a fix landed), and
-      give #437 a recorded disposition (flagged for owner review,
-      absent from the comment) — ledger:
+      #469 fixed post-pin by #474. Owner acts completed
+      2026-11-26: the dispositioned defect issues #313/#358/#359/
+      #361/#398/#399/#400 were closed under the owner's 'Fixed on
+      the release candidate' wording (a disposition act, not
+      evidence a fix landed — #313/#398/#399/#400 remain confirmed
+      present), and #437 received its recorded disposition —
+      deferred to v0.6 (milestone 11). Ledger:
       [release-acceptance-v0.3.md](release-acceptance-v0.3.md) §6–§7;
-      user-facing ones already sit in the notes' known-limitations.
-- [ ] Merge the open repair PR or defer it explicitly:
-      #431 (#419). (#472's ledger fold-in merged as `d87d5dc` — the
+      user-facing ones sit in the notes' known-limitations.
+- [x] Merge the open repair PR or defer it explicitly:
+      #431 (#419) — **merged `e0e31e9` 2026-11-26**, inside the
+      pinned candidate. (#472's ledger fold-in merged as `d87d5dc` — the
       notes cite the retained owner-side run records, not that PR —
       and #427 merged as `52a5493`.)
-- [ ] *owner* — pick the release version: `0.3.0` (proposed) or
-      `1.0.0` ([release-versioning.md](release-versioning.md) §7).
+- [x] *owner* — pick the release version: **`0.3.0`** decided
+      2026-11-26 ([release-versioning.md](release-versioning.md) §7);
+      the version-metadata alignment landed as PR #477, inside the
+      pinned candidate.
 
 ## 2. Merge order
 
@@ -139,10 +143,16 @@ git rev-list -n 1 v<version>           # must equal <recorded-sha>
 
 ## 6. Final sweep before the release is announced
 
-- [ ] Re-mark every walkthrough section: "retained — predates
+- [x] Re-mark every walkthrough section: "retained — predates
       candidate" where the frozen commit differs from the exercised
-      code, or re-record (owner decides on a live-demo segment).
-- [ ] Consistency pass: README, notes, walkthrough tell one story;
-      no claim exceeds the ledger.
+      code — done in the freeze record: the only drift is the
+      version self-report (`0.0.0` → `0.3.0`), labelled in
+      [release-walkthrough-v0.3.md](release-walkthrough-v0.3.md);
+      re-recording a live-demo segment stays an owner decision.
+- [x] Consistency pass: README, notes, walkthrough tell one story;
+      no claim exceeds the ledger — verified in the freeze record
+      (disposition wording everywhere reads as disposition labels,
+      not code-state claims; every "issue open" stale for the closed
+      dispositioned defects was corrected).
 - [ ] Publication is in-place per #438 — flipping repository
       visibility is the owner's own act; this checklist does not do it.

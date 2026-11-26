@@ -8,10 +8,13 @@ owner-run acceptance runs — nothing here is a fresh execution, and
 re-executing it requires the owner-authorized environment described
 below. The evidence predates the release freeze: the retained drivers
 span `28afb72`/`179f6fe`/`c445feee` (runs 4–6), earlier heads (runs
-1–3), and `81c62cf` (the pilot install); none is the frozen candidate —
+1–3), and `81c62cf` (the pilot install); none is the frozen candidate
+`00fed69` —
 every section is
-labelled "retained" and is re-marked at freeze (see the closing
-checklist). A fresh live-demonstration segment on the frozen commit
+labelled "retained" and was re-marked at freeze (see the closing
+checklist): the only behavioral drift the freeze introduced is the
+version self-report (`0.0.0` in the retained captures → `0.3.0` on
+the candidate, noted where it surfaces). A fresh live-demonstration segment on the frozen commit
 remains a separate owner decision (closing checklist); this document
 deliberately ships the retained-run form only.
 
@@ -29,7 +32,9 @@ Three owner-side record sets supply every quoted fact:
   `taisan-clean` guest, production host driver built from `81c62cf`,
   `[intake] enabled`, real reference Worker `taisan-worker-claude`
   `0.0.0` driving `claude-code` `2.1.331 (Claude Code)`, in-process
-  `github` host driver, capacity 1.
+  `github` host driver, capacity 1 — the `0.0.0` self-report predates
+  the freeze: on the frozen candidate `00fed69` every crate reports
+  `0.3.0` (`version.workspace = true`, PR #477).
 - **Manual runs (#270)** — `acceptance-v03-run5/` and
   `acceptance-v03-run6/` under the same owner-side root, with the
   repo-facing record
@@ -228,9 +233,13 @@ cited to the release notes' known-limitations section
 
 ## Remaining steps before this walkthrough ships
 
-- [ ] Frozen candidate commit exists (see
+- [x] Frozen candidate commit exists — `00fed69`
+      (`00fed690cf2993e220116901f1c2d14584305e18`, pinned 2026-11-26;
+      see
       [release-freeze-checklist.md](release-freeze-checklist.md)).
-- [ ] Each retained section re-marked: anything the freeze changes
-      is labelled "retained — predates candidate" or re-recorded.
+- [x] Each retained section re-marked: the only drift the freeze
+      introduced — version self-reports (`0.0.0` → `0.3.0`) — is
+      labelled where it surfaces; everything else the walkthrough
+      quotes is unchanged by the freeze.
 - [ ] Owner decision: whether to add a fresh live-demonstration
       segment on the frozen commit (re-authorization required).

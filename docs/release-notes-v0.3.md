@@ -1,15 +1,14 @@
-# Draft release notes — taisan (release version pending; 0.3.0 proposed)
+# Release notes — taisan 0.3.0
 
-Status: **draft release materials, pending the frozen candidate**
-(issue #370). The filename follows the v0.3 milestone unit, not a
-decided release version — the owner still chooses between `0.3.0`
-(proposed) and `1.0.0` per
-[release-versioning.md](release-versioning.md) §7, and the final
-title/version line is stamped at that decision. These notes are
-prepared from pre-freeze source materials only. The final candidate
-is not yet frozen — no commit named here is the release candidate and
-no tag exists — so every **TODO at freeze** below is discharged at
-freeze, on the recorded commit. The upstream evidence these notes
+Status: **release materials on the frozen candidate**
+(issue #370). The owner decided `0.3.0` on 2026-11-26
+([release-versioning.md](release-versioning.md) §7) and the
+candidate is frozen at
+`00fed690cf2993e220116901f1c2d14584305e18` — the workspace `0.3.0`
+version-metadata alignment (PR #477) is the last change inside it.
+No tag exists yet — the tag, the cargo-dist artifacts, and the
+repository visibility flip are the remaining release acts (freeze
+checklist §5–§6). The upstream evidence these notes
 depended on is now in hand: the #270 manual real-Worker acceptance
 (runs 1–6, owner-approved at comment `7171973494`), the #271
 scheduled-intake pilot, and the #367 clean-Linux-install reproduction
@@ -135,10 +134,11 @@ is an owner-supplied swap behind the same ports
 Exact runtime identity, from the retained owner-run `describe`
 captures (`describe-run5.json` in `acceptance-v03-run5/`; identical
 values in the pilot install): `adapter: "taisan-worker-claude"`,
-`adapter_version: "0.0.0"` (pre-version-bump — the §4 metadata
+`adapter_version: "0.0.0"` (pre-version-bump retained value — the §4 metadata
 alignment in
-[release-versioning.md](release-versioning.md) makes released
-binaries self-report the release version), `runtime.product:
+[release-versioning.md](release-versioning.md) was applied at
+freeze, so the released binaries on the `00fed69` candidate
+self-report `0.3.0`), `runtime.product:
 "claude-code"`, `runtime.version: "2.1.331 (Claude Code)"`,
 `protocol_versions: ["taisan.worker.request/2",
 "taisan.worker.report/2"]`, roles `coding`, `fix`,
@@ -179,27 +179,29 @@ declared `--runtime-arg --verbose` knob for stream-json mode
 
 ## Verification record
 
-Gates run on `origin/main` HEAD **before** this draft landed (the
-draft adds docs only; the recorded commit is the tested commit):
+Gates re-run on the **frozen candidate** — `origin/main` HEAD at
+freeze (2026-11-26, retrieval `date -u`): the workspace `0.3.0`
+version-metadata alignment (PR #477) is the last change inside the
+candidate.
 
 ```text
-git rev-parse HEAD
-119dcb72ce047bdcc4c44fb4a7915ffe2d7fd6ee
-git log -1 --format='%h %s' 119dcb72ce047bdcc4c44fb4a7915ffe2d7fd6ee
-119dcb7 Merge pull request #435 from shimpeiws/issue-376-agent
+git rev-parse origin/main
+00fed690cf2993e220116901f1c2d14584305e18
+git log -1 --format='%H%n%ad%n%s' --date=iso-strict origin/main
+00fed690cf2993e220116901f1c2d14584305e18
+2026-11-26T07:15:28+09:00
+Merge pull request #477 from ttbc-dev/issue-370-freeze
 ```
 
 | Gate | Result |
 | --- | --- |
 | `cargo fmt --check` | Passed |
 | `cargo build --workspace` | Passed |
-| `cargo test --workspace` | Passed — 1753 tests, 0 failures, 6 ignored (the `u36e_live` cases requiring `TAISAN_U36E_*` credentials and owner authorization; fixture-selector/fixture-worker contract tests ran against `target/debug/` binaries produced by the build gate) |
+| `cargo test --workspace` | Passed — 1866 tests, 0 failures, 6 ignored (the `u36e_live` cases requiring `TAISAN_U36E_*` credentials and owner authorization; fixture-selector/fixture-worker contract tests ran against `target/debug/` binaries produced by the build gate) |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
 
 Build precedes test because contract tests spawn
-`target/debug/workloop-fixture-worker`. **TODO at freeze:** re-run all
-four gates on the recorded candidate commit and replace this table —
-a freeze never inherits a check record from a different commit.
+`target/debug/workloop-fixture-worker`.
 
 **Distribution route (owner-decided 2026-11-25, issue #370):**
 prebuilt binaries via **cargo-dist** on GitHub Releases — matrix
@@ -221,9 +223,10 @@ supported independently.
 - **Remote execution shipped but unexercised** — the remote executor
   surface (contract #374, wire types/bindings #375, reference
   endpoint #377, bounded transfer/collection #376) is on the
-  candidate as v0.4 groundwork, with one open defect (#437:
+  candidate as v0.4 groundwork, with one confirmed defect (#437:
   zero-byte required artifact reported `Present` where local reports
-  `Missing`). No end-to-end remote run exists; remote execution and
+  `Missing`) deferred to v0.6 per the owner's 2026-11-26
+  disposition. No end-to-end remote run exists; remote execution and
   remote review are follow-ups, not part of this release.
 - **No automatic merge or deploy** — publication ends at a reviewed
   change request; merge and deploy remain human acts.
@@ -233,9 +236,9 @@ supported independently.
   this is a tiny-pilot sample on one installation, not a
   capacity/robustness claim.
 - **Pilot-discovered defects** — surfaced by the #271 pilot, filed
-  and unfixed at record time; #469 is repaired post-pin by PR #474
-  (below), the rest are deferred to v0.6 (milestone 11) per #365's
-  closing comment — issues open:
+  and unfixed at record time; #469 is repaired on the candidate by
+  PR #474 (below), the rest are deferred to v0.6 (milestone 11) per
+  #365's closing comment — issues open:
   - **#468** — `taisan init` emits the numeric repository id, which
     the `public-issue-selector` GitHub backend cannot use; scheduled
     intake fails closed (`adapter_source_unavailable`) on the first
@@ -245,7 +248,7 @@ supported independently.
     sandbox root dangles inside containment: every verification
     reports `cache_unreadable` and the assessment item stays
     `inconclusive` with no designed re-drive path (a `waiting/ci`
-    execution can only be cancelled). **Fixed on `main` post-pin by
+    execution can only be cancelled). **Fixed on the candidate by
     PR #474, issue closed** (symlinked verification-boundary paths
     refused; the
     invariant check re-drives on unjudged conclusive evidence).
@@ -260,11 +263,12 @@ supported independently.
     issue can starve new proposals. Workaround used in the pilot:
     raise `pending_queue_limit`.
 - **Earlier flagged defects, dispositioned in #365's closing
-  comment** — recorded 'fixed per §6' there, issues still open
-  (release-acceptance §6); 'fixed per §6' is the owner's
-  disposition wording for closing the issues, not a code-state
-  claim — all four are confirmed present on the candidate and
-  open with no milestone (#398/#400 also needs-human): #313 (two
+  comment** — recorded 'fixed per §6' there and closed
+  2026-11-26 under that owner disposition (release-acceptance §6);
+  'fixed per §6' was the owner's disposition wording for closing
+  the issues, not a code-state claim — all four remain confirmed
+  present on the candidate (release notes carry them as
+  limitations): #313 (two
   unrecorded same-signature processes can hold an unidentified
   launch unresolved — honest-uncertain wedge, not a false
   absence), #398
@@ -276,10 +280,10 @@ supported independently.
 - **Fixed defects worth noting** — #344 (absence proof), #363
   (spent-deadline ordering), #364 (staged runtime-auth cleanup),
   #447–#450 (refusal budget burn, judged-role resume, runtime
-  residue, divergent-head republish), and #466 (fast-exiting output
-  flood misclassified `success` — fixed by PR #467) are repaired on
-  the candidate line; #419 (`artifact.json` collision) has repair PR
-  #431 open.
+  residue, divergent-head republish), #466 (fast-exiting output
+  flood misclassified `success` — fixed by PR #467), and #419
+  (`artifact.json` collision — fixed by PR #431) are repaired on
+  the candidate line.
 - **Open operator-facing defects** — recorded in release-acceptance
   §7 and unfixed; the earlier deferred set stays deferred to v0.6
   per #365's closing comment — issues open: #453 (cancel does not
