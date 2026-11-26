@@ -36,9 +36,13 @@ Excluded and why:
   binaries are built inside their packages but kept out of the
   release artifacts and installers
   (`[package.metadata.dist.binaries]`); they are scenario/dev tools,
-  not the install surface. `cargo binstall --git` installs every bin
-  a package builds, so the binstall route still places them on PATH
-  — binstall cannot select a subset.
+  not the install surface. cargo-binstall requests every bin a
+  package declares unless given `--bin`, and a declared bin missing
+  from the archive fails the prebuilt fetch — so the documented
+  binstall commands below pass `--bin` and place only the shipped
+  binary on PATH. Omitting `--bin` makes binstall fall back to
+  compiling the package from source, which builds and installs all
+  of its bins.
 - `workloop-fixture-selector`, `workloop-contract-worker`, and
   `taisan-executor` are test fixtures or unshipped surface and are not
   in `packages`.
@@ -92,10 +96,15 @@ brew install shimpeiws/tap/workloop-fixture-worker
 
 **cargo-binstall** — each disted package carries
 `[package.metadata.binstall]` pointing at the same release archives,
-so `--git` installs fetch prebuilt binaries:
+so `--git` installs fetch prebuilt binaries. `workloop-cli` and
+`workloop-tui` declare extra bins that are not in the archive, so
+the command must select the shipped one with `--bin` (skipping
+missing unrequested bins needs cargo-binstall ≥ 1.14.0); the other
+packages declare a single bin and need no selection:
 
 ```sh
-cargo binstall --git https://github.com/ttbc-dev/taisan workloop-cli
+cargo binstall --git https://github.com/ttbc-dev/taisan workloop-cli --bin taisan
+# for the console: workloop-tui --bin taisan-tui
 ```
 
 ## Owner-side prerequisites

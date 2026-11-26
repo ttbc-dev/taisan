@@ -78,8 +78,9 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 # Homebrew (owner's personal tap)
 brew install shimpeiws/tap/taisan
 
-# cargo-binstall (fetches the prebuilt archive, no compile)
-cargo binstall --git https://github.com/ttbc-dev/taisan workloop-cli
+# cargo-binstall (fetches the prebuilt archive, no compile;
+# --bin selects the shipped binary of the multi-bin package)
+cargo binstall --git https://github.com/ttbc-dev/taisan workloop-cli --bin taisan
 ```
 
 Install the agent skill from this checkout with `npx skills add ./skills/taisan` (or from the registry with `npx skills add ttbc-dev/taisan`); the [skill walkthrough](docs/skill-walkthrough.md) documents setup, installation, invocation, and the direct-CLI fallback with captured output. See the [agent interface requirements](docs/agent-interface.md). The existing TUI remains available with `cargo run -p workloop-tui --bin taisan-tui -- --help` and can be installed with `cargo install --path crates/workloop-tui --bin taisan-tui`; it is not required for v0.1.

@@ -25,10 +25,12 @@ aarch64-apple-darwin = ["taisan"]
 x86_64-unknown-linux-gnu = ["taisan"]
 aarch64-unknown-linux-gnu = ["taisan"]
 
-# cargo-binstall manifest so `cargo binstall --git` fetches the
-# cargo-dist prebuilt archives instead of compiling from source.
+# cargo-binstall manifest so `cargo binstall --git ... --bin taisan`
+# fetches the cargo-dist prebuilt archive instead of compiling (the
+# archive holds only taisan; without --bin binstall requires every
+# declared bin and falls back to a source build).
 [package.metadata.binstall]
-pkg-url = "{ repo-url }/releases/download/v{ version }/{ name }-v{ version }-{ target }.{ archive-format }"
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.{ archive-format }"
 bin-dir = "{ bin }{ binary-ext }"
 pkg-fmt = "txz"
 

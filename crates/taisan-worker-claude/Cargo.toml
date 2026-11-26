@@ -13,7 +13,7 @@ dist = true
 
 # cargo-binstall manifest for cargo-dist prebuilt archives.
 [package.metadata.binstall]
-pkg-url = "{ repo-url }/releases/download/v{ version }/{ name }-v{ version }-{ target }.{ archive-format }"
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.{ archive-format }"
 bin-dir = "{ bin }{ binary-ext }"
 pkg-fmt = "txz"
 
