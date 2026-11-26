@@ -30,20 +30,22 @@ Still open at writing:
 
 - [ ] *owner* — disposition each flagged defect as blocking-then-fix
       or deferred-documented: #313, #398/#399, #400, #437,
-      #453–#456, #468–#471, plus the deferred residuals — ledger:
+      #453–#456, #468/#470/#471 (#469 fixed post-pin by #474),
+      plus the deferred residuals — ledger:
       [release-acceptance-v0.3.md](release-acceptance-v0.3.md) §6–§7;
       user-facing ones already sit in the notes' known-limitations.
-- [ ] Merge open repair/evidence PRs or defer them explicitly:
-      #472 (ledger fold-in — merge first, the notes cite its facts),
-      #427 (#323), #431 (#419).
+- [ ] Merge the open repair PR or defer it explicitly:
+      #431 (#419). (#472's ledger fold-in merged as `d87d5dc` — the
+      notes cite the retained owner-side run records, not that PR —
+      and #427 merged as `52a5493`.)
 - [ ] *owner* — pick the release version: `0.3.0` (proposed) or
       `1.0.0` ([release-versioning.md](release-versioning.md) §7).
 
 ## 2. Merge order
 
 1. Land any repair PRs the owner dispositioned as blocking.
-2. Land the docs updates (these release materials; the ledger
-   fold-in #472).
+2. Land the docs updates (these release materials — the #472 ledger
+   fold-in already landed).
 3. Land the version-metadata alignment (§5.1) as its own commit —
    or fold it into the freeze commit; it must be inside the
    recorded candidate.

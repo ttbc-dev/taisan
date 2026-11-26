@@ -18,9 +18,9 @@ dispositioned by the #438 owner ruling (in-place publication, history
 kept); and the #369 license is applied (MIT OR Apache-2.0). The
 acceptance issue #365 stays open until the owner dispositions the
 flagged defects — none of those dispositions is made here. The
-record's fold-in of the pilot/clean evidence lands via PR #472 (open
-at writing); the run records cited here are the retained owner-side
-evidence, not that PR. Per `AGENTS.md`, the live-run
+record's fold-in of the pilot/clean evidence landed via PR #472
+(merged `d87d5dc`); the run records cited here are the retained
+owner-side evidence, not that PR. Per `AGENTS.md`, the live-run
 target is the private isolated repository
 `shimpeiws/coding-worker-smoke` — retained verbatim as an
 owner-only reference (links and `#N` citations resolve only for the
@@ -223,8 +223,9 @@ source-build path above remains supported independently.
   `succeeded` completions and 5 honest operator-cancelled terminals;
   this is a tiny-pilot sample on one installation, not a
   capacity/robustness claim.
-- **Pilot-discovered defects, dispositions pending owner call** —
-  surfaced by the #271 pilot, filed and unfixed at record time:
+- **Pilot-discovered defects** — surfaced by the #271 pilot, filed
+  and unfixed at record time; #469 is repaired post-pin by PR #474
+  (below), the rest are dispositions pending owner call:
   - **#468** — `taisan init` emits the numeric repository id, which
     the `public-issue-selector` GitHub backend cannot use; scheduled
     intake fails closed (`adapter_source_unavailable`) on the first
@@ -234,8 +235,9 @@ source-build path above remains supported independently.
     sandbox root dangles inside containment: every verification
     reports `cache_unreadable` and the assessment item stays
     `inconclusive` with no designed re-drive path (a `waiting/ci`
-    execution can only be cancelled). Workaround: replace the
-    symlink with a real directory.
+    execution can only be cancelled). **Fixed on `main` post-pin by
+    PR #474** (symlinked verification-boundary paths refused; the
+    invariant check re-drives on unjudged conclusive evidence).
   - **#470** — publish branches are named `work/w-N`
     deterministically, so repeated installs against the same
     repository collide with earlier `work/w-N` branches: publish

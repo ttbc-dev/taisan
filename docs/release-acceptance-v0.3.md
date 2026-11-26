@@ -5,9 +5,13 @@ validated v0.3** milestone (issue #365). This document assembles the
 release decision around the retained v0.3 acceptance evidence; it does
 not authorize publication, any merge or deploy, credential changes,
 repository visibility changes, or any new live run, and it does not
-itself approve any unverified claim. Per `AGENTS.md` no private source
-repository is named: the live-run target is described as *the isolated
-repository* and private counterpart systems are named by role only.
+itself approve any unverified claim. Per `AGENTS.md` no private
+*source* repository is named: private counterpart systems appear by
+role only. The live-run target — *the isolated repository* — is named
+verbatim as `shimpeiws/coding-worker-smoke`, a **private/owner-only**
+reference under the #438 ruling and
+[docs/provenance.md](provenance.md): its issue/PR citations resolve
+only for the owner.
 Issue/PR numbers and revision SHAs appear throughout as
 owner-verifiable evidence locators.
 
@@ -186,7 +190,8 @@ the guest at `/opt/taisan-v03/evidence/`).
 - New defects surfaced (recorded in §6/§7): #468 (`init` emits a
   numeric repository id the selector's gh backend cannot use —
   intake-1 `adapter_source_unavailable`), #469 (sandboxed cache
-  symlink → sticky `inconclusive` lane with no re-drive path), #470
+  symlink → sticky `inconclusive` lane — **fixed post-pin by PR
+  #474**, §6/§7), #470
   (`work/w-N` publish-branch collisions across installations), #471
   (replayed candidates consuming `max_candidates` and starving new
   proposals).
@@ -248,7 +253,7 @@ names):
 | #302, #306, #139 | **Open — backlog, not re-verified this pass** | Older defects (v2 negotiation capability identifiers, workspace-prepare direct fetch deviating from the rejected transport design, deferred PR #128 shadow findings); recorded open — no disposition claimed. |
 | #466 — fast-exiting output flood reports `success` instead of `limit_reached` | **Fixed on `main` post-pin** (repair PR #467 merged `80cb059` — not an ancestor of the pinned `119dcb7`; lands on the provisional candidate's `main` line) | Diagnosed to the monitor loop's child-exit drain path skipping the `log_truncated` → `limit = output_limit_reached` promotion (CI run 45690519468 flake exposed the real race). PR #467 promotes truncation once after the loop exits, first-wins preserved, with deterministic regression tests for both fast-exit and still-running floods. |
 | #468 — `init` emits a numeric repository id the selector cannot use | **Open defect — discovered in the #271 pilot; disposition pending owner call** | Scheduled intake fails closed out of the box (`adapter_source_unavailable` on tick 1); pilot workaround was a manual config edit. Doc-level workaround exists, so a docs-now/code-later split is plausible. |
-| #469 — symlinked `caches/*` dangles in the sandbox + sticky `inconclusive` lane | **Open defect — discovered in the #271 pilot; flag for owner review** | Two coupled gaps: (a) install/check does not warn on sandbox-escaping `caches/*` symlinks — verification degrades to permanent `inconclusive`; (b) a `waiting/ci` execution on a stale inconclusive lane has no designed re-drive — w-2 could only be cancelled. (b) is on the released outcome-classification surface. |
+| #469 — symlinked `caches/*` dangles in the sandbox + sticky `inconclusive` lane | **Fixed on `main` post-pin** (repair PR #474 merged — not an ancestor of the pinned `119dcb7`; discovered in the #271 pilot, lands on the provisional candidate line) | Two coupled gaps it closed: (a) symlinked verification-boundary paths are now refused instead of degrading verification to permanent `inconclusive`; (b) the invariant check re-drives on unjudged conclusive evidence, so a stale inconclusive lane is no longer a dead end. (b) is on the released outcome-classification surface. |
 | #470 — `work/w-N` publish-branch collisions across installations | **Open defect — discovered in the #271 pilot; disposition pending owner call** | Guarded refusal behaved correctly (never overwrote a foreign head); the deterministic name just makes collisions certain on shared/repeated installs. 4/7 pilot works hit it (w-1/w-3/w-4/w-5 — §7). |
 | #471 — replayed candidates consume `max_candidates` | **Open defect — discovered in the #271 pilot; disposition pending owner call** | A permanently-replayed issue can starve new proposals; pilot unblocked by raising `pending_queue_limit` — tuning workaround exists. |
 
@@ -277,7 +282,7 @@ the pinned SHA):
 | #453 — cancel does not withdraw pending outbox intents | None (open) | Run 4/5: run-4's `e-1` sits durably `stopping` — a cancelled Execution's held claim + capacity slot had to be released by hand before run 5 could submit (`issue_claims`/`slots` rows) |
 | #454 — capability reports only refresh on unscoped passes | None (open) | Run 5 (`179f6fe`): a `run --work`-scoped loop deadlocked publication on a poisoned capability ledger (obs 41 all-`unknown`); one bounded unscoped pass recorded a fresh authorized `CapabilityReport` (obs 55) and unblocked the publish gate |
 | #468 — `init` emits a numeric repo id the selector rejects | None (open) | Pilot: intake-1 `scheduled_startup` failed `adapter_source_unavailable` until the config id was hand-edited to the slug (`09-intake-1-detail.json`, `02b-check-after-id-fix.txt`) |
-| #469 — sandbox-dangling `caches` symlink + sticky `inconclusive` lane | None (open) | Pilot: w-2 `waiting/ci` after publish+sealed review — every verification reported `cache_unreadable` until the symlink was replaced with a real dir; `resume`/`retry` correctly refused (`22-cache-fix.txt`, `23-resume-w2.json`) |
+| #469 — sandbox-dangling `caches` symlink + sticky `inconclusive` lane | PR #474 (merged, post-pin — not an ancestor of `119dcb7`) | Pilot: w-2 `waiting/ci` after publish+sealed review — every verification reported `cache_unreadable` until the symlink was replaced with a real dir; `resume`/`retry` correctly refused (`22-cache-fix.txt`, `23-resume-w2.json`) |
 | #470 — `work/w-N` branch collision across installations | None (open) | Pilot: w-1/w-3/w-4/w-5 publish `stale_head` → bounded retries → `paused_judgment` → operator cancel; guarded refusal confirmed never to overwrite a foreign head (`15-ack-w1.json` et al.) |
 | #471 — replayed candidates starve the queue | None (open) | Pilot: issue #70 replayed into the single `max_candidates` slot each tick until `pending_queue_limit` was raised 2→4 (`38-intake-runs-final.json`) |
 | #466 — post-exit flood misclassified `success` | PR #467 (merged `80cb059`, post-pin — not an ancestor of `119dcb7`) | CI flake exposed the race; fix verified by deterministic wire-contract tests on both exit paths |
@@ -285,9 +290,11 @@ the pinned SHA):
 | #456 — `unavailable`/`provider_unavailable` check at exit 0 is lane-terminal | None (open) | Run 5 ×3 reproduction: `inv-16`/`inv-18`/`inv-20` (invariant_check) reported `provider_unavailable` at exit 0 — `checked`=true so no bounded re-request, assessment stays `complete:false`, completion permanently closed; worker log shows `api_error: connection_failed` after ~473 s while coding/fix Invocations went 4/4 |
 
 Repairs in flight at record time: PR #427 (sibling-PR conflict
-detection, #323) and PR #431 (`artifact.json` collision, #419) are
-open against the candidate; the candidate is provisional until they
-resolve.
+detection, #323) resolved post-pin — merged `52a5493` on `main`,
+not an ancestor of the pinned `119dcb7`, landing on the provisional
+candidate line — while PR #431 (`artifact.json` collision, #419)
+remains open against the candidate; the candidate is provisional
+until it resolves.
 
 Run 4 (#270, owner-authorized, guest `taisan-v03`, driver built from
 `28afb72`) ended on the owner STOP decision at the #450 wedge and was
@@ -364,12 +371,12 @@ while their owner decisions remain open. States verified 2026-11-25:
 | #269 — clean-install + real-Worker acceptance docs | Implemented | PR #356 (`9a79664`); runbook corrections merged via #465 (`827b9c0`, post-pin) | reproduction done — #367 closed the loop (row below); recommend owner close |
 | #410 / #411 / #412 — live-run finding fixes | Implemented | PR #413 (`bfa0412`) | verified live in runs 2–3 (§7); recommend close |
 | #366 — pluggable public Selector/Worker references | Closed | PR #404 (`f883d6e`) | done |
-| #368 — public-content/history/metadata audit | Audit delivered | PR #432 (`b0b81f6`) | `release-audit.md` §5 blockers stay gated on the publication-route decision — an open owner choice, not picked here |
-| #369 — license selection prep | License selected and applied | PR #433 (`aff8721`) prep; PR #464 (open at record time) applies | Owner chose MIT OR Apache-2.0: `LICENSE-MIT`/`LICENSE-APACHE` placed, workspace + 15-crate `license` metadata, README/`assets/LICENSE.md` exception for `taisan-hero.jpg` only, CONTRIBUTING dual-contribution note, `THIRD-PARTY.md` (87-crate inventory) + `LICENSES/` texts staged for source distribution |
+| #368 — public-content/history/metadata audit | Audit delivered | PR #432 (`b0b81f6`) | `release-audit.md` §5 items resolved under the #438 ruling (recorded in its §7): in-place publication, history kept, private names acceptable — no disclosure review gates publication |
+| #369 — license selection prep | License selected and applied | PR #433 (`aff8721`) prep; PR #464 (merged `2f1a825`) applies | Owner chose MIT OR Apache-2.0: `LICENSE-MIT`/`LICENSE-APACHE` placed, workspace + 15-crate `license` metadata, README/`assets/LICENSE.md` exception for `taisan-hero.jpg` only, CONTRIBUTING dual-contribution note, `THIRD-PARTY.md` (87-crate inventory) + `LICENSES/` texts staged for source distribution |
 | #270 — manual real-Worker acceptance | M-1…M-7 exercised live | runs 1–6 retained owner-side | Run 6 done (run-6 authorization issue #270 comment `7161879297`; driver `c445feee` incl. the #458 fix, post-pin): M-7 verified outcome exercised — post-republish `invariant_check` → assessment `complete:true` → `succeeded` on e-5 (`RUN-RECORD-2026-11-25-RUN6.md`, sanitized copy `acceptance-v03-run6/`); M-7 row filled in `docs/evidence/v0.3-manual-acceptance.md`. Attribution recorded honestly: run 6's H1 review round sealed with zero occurrences, so the finding→judged-fix→republish legs (M-4/M-5/M-6) are evidenced by run 5's e-3/e-4 chains — the M-1…M-6 rows are recorded via the run-5 record (#457, merged post-pin). Owner approval of the record posted 2026-11-25 (comment `7171973494`, recorded in record §8); the restart-clean store-recovery variant left unexercised by runs 1–6 was evidenced by the #271 pilot (§5 — planned SIGINT plus an unplanned guest VM restart, orphaned invocations re-minted). Residual: none against #270 itself |
-| #271 — scheduled pilot acceptance | **Exercised — all acceptance criteria met** | `RUN-RECORD-2026-11-26-PILOT.md` + 66 sanitized evidence files owner-side (`acceptance-v03-pilot/`; guest originals `/opt/taisan-v03/evidence/`) | Authorized pilot (comment `7171885803`) on the clean #367 install: 7 Works admitted across scheduled ticks, w-6/w-7 `succeeded` via the verified real path; queue_full/replay/selector-outage/restart×2 (planned + unplanned VM)/disable-reenable all durable; `issue_claims` single ownership; per-Work interventions, wall time and usage recorded honestly. Surfaced defects #468–#471 (§6/§7 — dispositions pending owner call). Recommend owner close after §5 review |
-| #367 — clean-Linux-install reproduction | **Done** | `RUN-RECORD-2026-11-25-CLEAN.md` + 26 sanitized evidence files owner-side (`acceptance-v03-clean/`) | Fresh OrbStack guest `taisan-clean` (Ubuntu noble arm64): runbook steps verified verbatim or as typed documented failures; 4 binaries installed; full ops cycle on the fixture binding; all 10 sandbox probes passed; real Worker `describe` + offline `select` proven. Doc gaps fixed and merged via #465 (`827b9c0`, post-pin). One blocker gap stands: `git clone` unverifiable while the repo is private — tied to the #368 publication decision. Recommend owner close |
-| #370 / #371 — candidate freeze; go/no-go | Not started | — | gated on this ledger, the route decision, and the license selection |
+| #271 — scheduled pilot acceptance | **Exercised — all acceptance criteria met** | `RUN-RECORD-2026-11-26-PILOT.md` + 66 sanitized evidence files owner-side (`acceptance-v03-pilot/`; guest originals `/opt/taisan-v03/evidence/`) | Authorized pilot (comment `7171885803`) on the clean #367 install: 7 Works admitted across scheduled ticks, w-6/w-7 `succeeded` via the verified real path; queue_full/replay/selector-outage/restart×2 (planned + unplanned VM)/disable-reenable all durable; `issue_claims` single ownership; per-Work interventions, wall time and usage recorded honestly. Surfaced defects #468–#471 (§6/§7 — #469 fixed post-pin by PR #474; the rest dispositions pending owner call). Recommend owner close after §5 review |
+| #367 — clean-Linux-install reproduction | **Done** | `RUN-RECORD-2026-11-25-CLEAN.md` + 26 sanitized evidence files owner-side (`acceptance-v03-clean/`) | Fresh OrbStack guest `taisan-clean` (Ubuntu noble arm64): runbook steps verified verbatim or as typed documented failures; 4 binaries installed; full ops cycle on the fixture binding; all 10 sandbox probes passed; real Worker `describe` + offline `select` proven. Doc gaps fixed and merged via #465 (`827b9c0`, post-pin). One verification gap stands: `git clone` unverifiable while the repo is private — no longer release-blocking under the #438 publication ruling; it closes when the owner flips visibility. Recommend owner close |
+| #370 / #371 — candidate freeze; go/no-go | #370 in flight (this PR); #371 not started | — | gated on this ledger and the owner's defect dispositions/candidate sign-off — the route (#438) and license (#464) are decided |
 | #267 — stop/restart/recovery integration | In flight (`agent:running`) | — | feeds the §4 restart/recovery row |
 
 ## 9. Verification baseline on the candidate
@@ -433,8 +440,8 @@ this document.
   line as it advances. New flags for owner review: #398/#399
   (credential masking — the same class #364 gated on), #313
   (ambiguous-match convergence wedge), #400 (v2 report-retention
-  regression), and the pilot-discovered #468–#471 — of which #469's
-  sticky-`inconclusive` lane is the one touching the released
-  outcome-classification surface. The `release-audit.md` §5 exposure
-  blockers remain gated on the publication-route decision, which
-  stays an open owner choice.
+  regression), and the pilot-discovered #468, #470, #471 — #469, the
+  one touching the released outcome-classification surface, was
+  repaired post-pin by PR #474. The `release-audit.md` §5 exposure
+  items are resolved under the #438 publication-route ruling —
+  in-place publication with history kept (recorded in its §7).

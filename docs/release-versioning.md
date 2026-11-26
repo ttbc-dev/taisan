@@ -211,9 +211,9 @@ binaries**, not as a registry package.
 
 | Decision | Options | This draft |
 | --- | --- | --- |
-| Release version | `0.3.0` (proposed) / `1.0.0` | **owner-pending** — the one remaining decision |
+| Release version | `0.3.0` (proposed) / `1.0.0` | **owner-pending** — the only undecided *decision* row in this table; owner acts outside it (defect dispositions, candidate sign-off) remain — status paragraph, freeze checklist |
 | Candidate commit | recorded `origin/main` SHA at sign-off (§3) | procedure only; **not named** — the freeze records it |
 | Publication route | in-place, history kept | **decided** — #438 ruling ([release audit](release-audit.md) §7) |
 | Distribution route | cargo-dist → GitHub Releases + Homebrew tap + cargo-binstall; no crates.io | **decided** — #370 comment, 2026-11-25 (§6); workflow is #441's lane |
-| Crate version alignment | workspace `0.3.0` inheritance (proposed) / leave `0.0.0` | proposed, not applied |
+| Crate version alignment | workspace `0.3.0` inheritance (proposed) / leave `0.0.0` | proposed, not applied — a metadata step that follows the version choice, not an independent decision |
 | Tag creation | annotated `v<version>` on the recorded candidate | procedure only; no tag exists |

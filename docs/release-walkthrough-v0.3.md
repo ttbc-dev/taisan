@@ -71,8 +71,10 @@ the purpose:
   `taisan-worker-claude` `describe` declaration and an offline
   `select` from `public-issue-selector` both returned correctly.
 - Sole gap the run could not close: `git clone` of the public URL —
-  the repository was still private; closed by the #438 publication
-  decision, not by more testing.
+  the repository was still private, so the step stays unverifiable
+  until the owner flips visibility. The #438 ruling decided in-place
+  publication, so the gap no longer blocks the release decision — it
+  closes at publication, not by more testing.
 
 ## 2. Scheduled admission — retained run
 
@@ -202,10 +204,12 @@ cited to the release notes' known-limitations section
 
 ## Sanitization rules applied
 
-- The isolated repository, its PRs, and all private run state are
-  cited by role and issue/PR number — private/owner-only references,
-  matching the convention in release-acceptance-v0.3.md. No private
-  host names, paths, or actor identities beyond what the acceptance
+- The isolated repository is named verbatim
+  (`shimpeiws/coding-worker-smoke`) and its issue/PR numbers and all
+  private run state are cited by number — private/owner-only
+  references that resolve only for the owner, matching the
+  convention in release-acceptance-v0.3.md. No private host names,
+  paths, or actor identities beyond what the acceptance
   record already publishes.
 - Credential surfaces show reference names (`env:NAME`,
   `file:/abs/path`) only — never values; a captured surface
