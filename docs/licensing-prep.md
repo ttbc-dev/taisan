@@ -162,17 +162,24 @@ What the release redistributes, beyond source:
 | `taisan-tui` binary (`crates/workloop-tui`) | Management console (deferred from release requirements, still built/distributed) | Same as above |
 | `public-issue-selector` binary (`crates/workloop-selector`) | Packaged public reference Selector | Same as above |
 | `taisan-worker-claude` binary (`crates/taisan-worker-claude`) | Packaged reference Worker adapter | Same as above. It **invokes an external, user-installed agent runtime CLI** — it does not embed or redistribute any part of that runtime. The runtime is an installation prerequisite, not a bundled component. |
-| Test/fixture binaries (`workloop-fixture-worker`, `workloop-fixture-selector`, `workloop-contract-worker`, `s1_bridge`) | Deterministic fixture workers and contract-test helpers used by the test suite and docs evidence | Project code; same license as project once chosen. Ship in source; whether prebuilt copies are release artifacts is a packaging decision. |
+| `workloop-fixture-worker` binary (`crates/workloop-fixture-worker`) | Deterministic fixture worker shipped as a release binary — the Worker the non-live bindings use; listed in `[workspace.metadata.dist].packages` | Project code; `MIT OR Apache-2.0` |
+| Non-shipped binaries (`workloop-executor`'s `taisan-executor`, `workloop-fixture-selector`, `workloop-contract-worker`, `s1_bridge`) | Internal executor, contract-test helpers, and the scenario bridge used by the test suite and docs evidence; excluded from release artifacts (`dist = false` on each standalone crate; `s1_bridge` is a bin target of `workloop-cli` dropped by its `[package.metadata.dist.binaries]` override) | Project code; `MIT OR Apache-2.0`; ships in source only |
 | **SQLite amalgamation** (compiled in via `rusqlite` feature `bundled` → `libsqlite3-sys`) | The sqlite3.c amalgamation is compiled into every binary that links `workloop-store` | SQLite itself is **public domain**; no notice legally required. `libsqlite3-sys` crate is MIT. Recommend still recording it in third-party notices for transparency. |
 | `skills/taisan/SKILL.md` | Agent skill installed into users' coding agents via `npx skills add` | Project-authored text; same license as project |
 | `assets/taisan-hero.jpg` | README/hero image, resized from an owner-approved issue attachment (provenance recorded in `assets/README.md`) | Owner-supplied asset — see §5 for the required confirmation |
 | `scripts/` (Python + shell), `fixtures/` (JSON), `docs/` | Verification scripts, seeded fixture data, documentation | Project-authored; same license as project |
-| `gh` CLI, agent runtimes, Rust toolchain | External tools invoked or installed at operation time (`scripts/worker/setup.sh` downloads rustup at run time, in the target environment) | **Not redistributed** — external prerequisites |
+| `gh` CLI, agent runtimes, Rust toolchain, cargo-dist | External tools invoked or installed at operation time (`scripts/worker/setup.sh` downloads rustup at run time, in the target environment; the release workflow downloads and installs cargo-dist in CI) | **Not redistributed** — external prerequisites |
 | CI workflow (`.github/workflows/rust.yml`) | References GitHub-hosted actions by name | Referenced, not vendored; no bundled third-party code |
+| CI workflow (`.github/workflows/release.yml`) | cargo-dist-generated release workflow vendored in-tree, with hand-applied permission/identity patches (see `docs/distribution.md`) | **Third-party-generated content embedded in the tree** — header carries `Copyright 2022-2024, axodotdev` / `SPDX-License-Identifier: MIT or Apache-2.0`; both license texts already ship in `LICENSES/` |
 
-No `vendor/` directory, no `.crate` archives, and no third-party source
-embedded in the tree (checked: no foreign copyright/license headers in
-`crates/`, `scripts/`, `skills/`, `docs/`).
+No `vendor/` directory and no `.crate` archives. The only third-party
+material embedded in the tree is `.github/workflows/release.yml`
+(cargo-dist-generated, axodotdev copyright — the row above). A
+tree-wide scan for `copyright` / `SPDX-License-Identifier` headers
+(excluding `.git`, `target/`, the `LICENSES/` texts, `THIRD-PARTY.md`,
+and `Cargo.lock`) finds no other foreign copyright or license headers —
+`crates/`, `scripts/`, `skills/`, `docs/`, `fixtures/`, and the rest of
+`.github/` are otherwise clean.
 
 ## 3. Compatibility summary and candidate licenses
 
@@ -216,6 +223,14 @@ developer tool and not listed as a primary candidate.
 
 **Apache-2.0 `NOTICE` files:** none. No dependency ships a `NOTICE`
 file, so Apache-2.0 §4(d) adds no mandatory notice text to propagate.
+
+**Vendored `.github/workflows/release.yml`:** the cargo-dist-generated
+workflow carries `Copyright 2022-2024, axodotdev` under `MIT OR
+Apache-2.0` (§2). Both licenses require retaining the copyright notice
+and license text; the verbatim copyright/SPDX header in the file itself
+satisfies that for source distribution, and both license texts already
+ship in `LICENSES/`. The workflow is not part of any binary bundle, so
+no bundle-level notice is required for it.
 
 **License-text retention (required under every candidate):** binary
 distributions must carry the copyright and license text of each
@@ -313,9 +328,12 @@ Unlicense texts), `license.workspace = true` on all 15 member crates.
 
 **Distribution-path check (task: bundle completeness):** no crate is
 published (no `publish`/`package` configuration exists anywhere in the
-workspace) and no binary-tarball machinery exists yet — the source tree
-is currently the only distribution form, and it carries the full notice
-set in-tree. When binary or packaged releases are produced, the bundle
-must carry `LICENSE-MIT`, `LICENSE-APACHE`, `THIRD-PARTY.md`, and
-`LICENSES/`; any bundle that also ships `assets/taisan-hero.jpg` must
-carry `assets/LICENSE.md` alongside it.
+workspace). Binary-tarball machinery exists — cargo-dist is wired via
+`[workspace.metadata.dist]` (config in `Cargo.toml`, workflow in
+`.github/workflows/release.yml`, details in `docs/distribution.md`).
+Every binary bundle must carry `LICENSE-MIT`, `LICENSE-APACHE`,
+`THIRD-PARTY.md`, and `LICENSES/` — the dist `include` list
+(`auto-includes = false`) copies exactly that set, plus `README.md`,
+into every app's release archive, so the requirement is already met.
+No archive ships `assets/taisan-hero.jpg`, so `assets/LICENSE.md` is
+not required in the bundles.
