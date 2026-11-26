@@ -237,12 +237,15 @@ pub fn run_intake_with_owner(
     // can carry.
     //
     // Residual limit: `max_candidates` is capped at the protocol's
-    // 32, so once at least `MAX_CANDIDATES - free` replay identities
-    // exist the ask is already saturated. A selector that ranks every
-    // replay ahead of every fresh Issue can then still fill the
-    // response with replays. Removing that would require the selector
-    // protocol to accept replay identities; until then the documented
-    // operator lever is raising `pending_queue_limit`.
+    // 32, so once at least `MAX_CANDIDATES` replay identities exist
+    // the ask is saturated and a selector that ranks every replay
+    // ahead of every fresh Issue can fill the response with replays,
+    // leaving no slot for new work regardless of the free count.
+    // Below that bound the ask still leaves room for up to
+    // `MAX_CANDIDATES - known_replays` fresh proposals. Eliminating
+    // the saturation would require the selector protocol to accept
+    // replay identities; raising `pending_queue_limit` helps only
+    // while fewer than `MAX_CANDIDATES` replays exist.
     let known_replays = decided.len() as u64;
     // The run record copies the *held* lease's owner identity — the
     // storage contract's provenance for "who held this invocation" —
