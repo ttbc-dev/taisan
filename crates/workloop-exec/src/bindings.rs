@@ -52,9 +52,11 @@ const MAX_FIELD_CHARS: usize = 1024;
 /// - `endpoint` — optional; a non-empty bounded string naming the
 ///   provider endpoint the runtime calls.
 /// - `proxy_endpoint` — optional; a non-empty bounded string naming a
-///   proxy endpoint the adapter may additionally honor. The
-///   supervisor-delivered `HTTPS_PROXY` environment is authoritative
-///   for egress either way.
+///   proxy endpoint the adapter may additionally honor. Worker-owned
+///   override: the adapter may replace the supervisor-delivered
+///   `HTTPS_PROXY` pair for the runtime child with this endpoint
+///   (`docs/runtime-bindings.md`); under containment the override can
+///   never widen egress past the supervisor's CONNECT allowlist.
 pub fn validate(path: &Path, credential_bytes: Option<&[u8]>) -> Result<(), String> {
     let metadata =
         std::fs::symlink_metadata(path).map_err(|e| format!("provider_config.unreadable: {e}"))?;
@@ -94,18 +96,65 @@ pub fn validate(path: &Path, credential_bytes: Option<&[u8]>) -> Result<(), Stri
     // The resolved credential embedded anywhere in the document is a
     // configuration error, never a tolerated convenience: the
     // credential's only delivery path is the staged
-    // `/taisan/runtime-auth` file.
-    if let Some(secret) = credential_bytes
-        && !secret.is_empty()
-        && credentials::contains_secret(&bytes, secret)
-    {
-        return Err(
-            "provider_config.contains_credential: the provider configuration embeds \
-             the resolved credential value"
-                .into(),
-        );
+    // `/taisan/runtime-auth` file. The check runs on the value as a
+    // consumer reads it — adapters trim the staged file, so a `file:`
+    // credential's trailing newline cannot slip the effective value
+    // past the check — and on the decoded document, so a secret
+    // spelled through JSON escapes still matches. An all-whitespace
+    // credential trims to nothing deliverable: it cannot be embedded,
+    // and matching its raw bytes would refuse ordinary indentation.
+    if let Some(secret) = credential_bytes {
+        let needle = effective_secret(secret);
+        if !needle.is_empty()
+            && (credentials::contains_secret(&bytes, needle)
+                || document_contains(&document, needle))
+        {
+            return Err(
+                "provider_config.contains_credential: the provider configuration embeds \
+                 the resolved credential value"
+                    .into(),
+            );
+        }
     }
     Ok(())
+}
+
+/// The credential as a consumer reads it: adapters trim the staged
+/// value before use, so containment is checked against the trimmed
+/// bytes — a `file:` credential's trailing newline would otherwise
+/// let the effective value sit in the document unrefused. A non-UTF-8
+/// value is checked raw (a consumer that cannot decode it cannot use
+/// it); a value that trims to nothing is returned empty — the caller
+/// skips the check because an undeliverable credential cannot be
+/// embedded.
+fn effective_secret(secret: &[u8]) -> &[u8] {
+    match std::str::from_utf8(secret) {
+        Ok(value) => value.trim().as_bytes(),
+        Err(_) => secret,
+    }
+}
+
+/// Whether the *decoded* document carries the credential: raw-byte
+/// scanning misses a secret spelled through JSON escapes (`\uXXXX`,
+/// `\n`) or inside a non-string leaf (`1.2e3` for `1200`), but the
+/// adapter that parses the mounted document receives it. Member
+/// names are document content too — the extension space is
+/// adapter-owned and arbitrary.
+fn document_contains(document: &serde_json::Value, needle: &[u8]) -> bool {
+    match document {
+        serde_json::Value::String(text) => credentials::contains_secret(text.as_bytes(), needle),
+        serde_json::Value::Number(number) => {
+            credentials::contains_secret(number.to_string().as_bytes(), needle)
+        }
+        serde_json::Value::Bool(flag) => {
+            credentials::contains_secret(flag.to_string().as_bytes(), needle)
+        }
+        serde_json::Value::Array(items) => items.iter().any(|item| document_contains(item, needle)),
+        serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+            credentials::contains_secret(key.as_bytes(), needle) || document_contains(value, needle)
+        }),
+        serde_json::Value::Null => false,
+    }
 }
 
 /// One fixed member's shape rule: absent-or-null is allowed only for
@@ -220,12 +269,10 @@ impl<'de> serde::de::Visitor<'de> for UniqueVisitor {
         let mut object = serde_json::Map::new();
         while let Some((key, UniqueMembers(value))) = map.next_entry::<String, UniqueMembers>()? {
             if object.contains_key(&key) {
-                // Member names are part of the contract — the
-                // diagnostic may name a bounded prefix of one.
-                let name: String = key.chars().take(64).collect();
-                return Err(serde::de::Error::custom(format!(
-                    "duplicate member name '{name}'"
-                )));
+                // A member name is document content — an extension
+                // key may carry the credential itself — so the
+                // diagnostic names the rule and never echoes it.
+                return Err(serde::de::Error::custom("duplicate member name"));
             }
             object.insert(key, value);
         }
@@ -320,6 +367,84 @@ mod tests {
             "{err}"
         );
         assert!(!err.contains("xx-secret-yy"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The check matches the credential as a consumer reads it: a
+    /// `file:` credential's trailing newline must not let the trimmed
+    /// value sit in the document, and a secret spelled through JSON
+    /// escapes — absent from the raw bytes — is delivered verbatim
+    /// when the adapter parses the mounted document.
+    #[test]
+    fn the_effective_credential_is_refused_whatever_its_spelling() {
+        let dir = tmp("effective");
+        for (content, credential) in [
+            // Staged bytes carry a trailing newline; the document
+            // embeds the trimmed value.
+            (
+                "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\",\"note\":\"x-sekrit-y\"}",
+                "sekrit\n",
+            ),
+            // The document spells the secret through a JSON escape —
+            // absent from the raw bytes, delivered verbatim on parse.
+            (
+                "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\",\"note\":\"x-sek\\u0072it-y\"}",
+                "sekrit",
+            ),
+            // A member name is document content too.
+            (
+                "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\",\"x-sekrit-y\":1}",
+                "sekrit",
+            ),
+            // A numeric leaf spells the secret in canonical form —
+            // `1.2e3` parses to the number `1200`, which raw-byte
+            // scanning never sees spelled this way.
+            (
+                "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\",\"padding\":1.2e3}",
+                "1200",
+            ),
+        ] {
+            let path = write(&dir, "dirty.json", content);
+            let err = validate(&path, Some(credential.as_bytes())).unwrap_err();
+            assert!(
+                err.starts_with("provider_config.contains_credential"),
+                "{err} for {content}"
+            );
+            assert!(!err.contains("sekrit"), "{err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An all-whitespace credential trims to nothing deliverable —
+    /// checking its raw bytes would match the document's own
+    /// indentation and refuse a clean config.
+    #[test]
+    fn a_whitespace_only_credential_never_matches_indentation() {
+        let dir = tmp("wscred");
+        let path = write(
+            &dir,
+            "clean.json",
+            "{\n    \"format_version\": \"taisan.worker.bindings/1\",\n    \"model\": \"m\"\n}",
+        );
+        validate(&path, Some(b"  \n  ")).expect("an undeliverable credential embeds nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repeated member name is a refusal — and the diagnostic names
+    /// the rule, never the member: an extension key may carry the
+    /// credential itself, and the error is recorded as a launch
+    /// repair.
+    #[test]
+    fn a_duplicate_member_name_is_not_echoed() {
+        let dir = tmp("dupname");
+        let path = write(
+            &dir,
+            "dup.json",
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\",\"sekrit-key\":1,\"sekrit-key\":2}",
+        );
+        let err = validate(&path, None).unwrap_err();
+        assert!(err.contains("duplicate member name"), "{err}");
+        assert!(!err.contains("sekrit-key"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

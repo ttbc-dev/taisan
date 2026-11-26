@@ -50,10 +50,10 @@ the failed rule, never the document's content:
 
 | Diagnostic | Cause |
 | --- | --- |
-| `provider_config.unreadable` | Path absent or not readable |
-| `provider_config.contract_invalid` | Not a regular file, over the size bound, not a JSON object, a repeated member name anywhere in the document, or a fixed member violates its shape rule (missing `model`, empty/over-long/wrong-typed value) |
+| `provider_config.unreadable` | Path absent or not readable — also the bounded identity digest's verdict for an oversized source, which it refuses unread before validation runs |
+| `provider_config.contract_invalid` | Not a regular file, over the size bound at validation, not a JSON object, a repeated member name anywhere in the document, or a fixed member violates its shape rule (missing `model`, empty/over-long/wrong-typed value) |
 | `provider_config.contract_version` | `format_version` absent or not exactly `taisan.worker.bindings/1` |
-| `provider_config.contains_credential` | The resolved credential value appears in the document bytes |
+| `provider_config.contains_credential` | The resolved credential value — as a consumer reads it, trimmed and JSON-decoded — appears anywhere in the document |
 
 An invalid or missing required binding refuses the launch; there is
 no partial mount and no ambient fallback. The preflight identity hash
@@ -74,8 +74,11 @@ grant can never rewrite the path a pending launch is about to bind,
 and a refused re-resolve never unlinks it. A boundary removes only
 the files it staged: a boundary that was constructed but never
 resolved (a `run` that lost the lease) removes nothing at the shared
-staging dir, while every resolve sweeps `runtime-auth*` leftovers a
-crashed predecessor left behind as stale secret material.
+staging dir, while every resolve sweeps only the boundary's own
+staging shapes (`runtime-auth`, `runtime-auth.<seq>`, and their
+`.tmp` siblings) a crashed predecessor left behind as stale secret
+material — a path the resolved configuration names, or any other
+file under the shared staging dir, is never removed.
 
 The credential value never enters argv, the request body,
 `runtime.log`, the report, evidence, the provider contract document,

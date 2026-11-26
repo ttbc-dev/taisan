@@ -1750,3 +1750,59 @@ fn read_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
     }
     fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `proxy_endpoint` must leave exactly one proxy pair in the
+    /// environment *vector*: `Command::envs` applies last-wins, so a
+    /// stale supervisor pair retained alongside the override would be
+    /// invisible in the child's env yet still dead state the vector
+    /// must not carry.
+    #[test]
+    fn proxy_endpoint_replaces_the_supervisor_pair_in_the_env_vector() {
+        let prior: Vec<(&str, Option<String>)> = ["HTTPS_PROXY", "https_proxy"]
+            .into_iter()
+            .map(|key| (key, std::env::var(key).ok()))
+            .collect();
+        // SAFETY: test-only env mutation; the prior values are
+        // restored before the test returns.
+        unsafe {
+            std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:18080");
+            std::env::set_var("https_proxy", "http://127.0.0.1:18080");
+        }
+        let cfg = Config {
+            runtime_argv: vec![],
+            runtime_auth: PathBuf::from("/nonexistent-runtime-auth"),
+            provider_config: PathBuf::from("/nonexistent-provider-config"),
+        };
+        let provider = ProviderConfig {
+            proxy_endpoint: Some("http://127.0.0.1:9123".into()),
+            ..ProviderConfig::default()
+        };
+        let env = runtime_environment(&cfg, &provider);
+        let pairs: Vec<&(String, String)> = env
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case("https_proxy"))
+            .collect();
+        for (key, value) in prior {
+            // SAFETY: restoring the test's own mutation.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        assert_eq!(
+            pairs.len(),
+            2,
+            "exactly one proxy pair reaches the vector: {pairs:?}"
+        );
+        assert!(
+            pairs.iter().all(|(_, v)| v == "http://127.0.0.1:9123"),
+            "both entries carry the configured endpoint: {pairs:?}"
+        );
+    }
+}

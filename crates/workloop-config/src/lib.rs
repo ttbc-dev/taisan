@@ -152,8 +152,10 @@ pub struct Installation {
     pub worker_isolation_profile: Option<String>,
     /// The single runtime credential the contained Worker may receive,
     /// as an `env:`/`file:`/`command:` provider reference — never a
-    /// secret value (`docs/v0.3.md` §14.3). Resolved once at the
-    /// supervisor boundary and delivered only through the approved
+    /// secret value (`docs/v0.3.md` §14.3). Resolved and staged fresh
+    /// at the supervisor boundary on every contained launch and
+    /// `describe` probe — the next Invocation observes the latest
+    /// provider value — and delivered only through the approved
     /// `/taisan/runtime-auth` path; absent means the Worker gets no
     /// runtime credential.
     #[serde(default)]

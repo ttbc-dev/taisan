@@ -388,7 +388,7 @@ Named checks for the configuration contract suite (CF). Planned contract scenari
 | CF-23 | Sanitized example parses | The documented example loads under the same validator |
 | CF-24 | Interrupted `init` publish | Either no config or a complete config exists; scratch residue never loads |
 | CF-25 | v2 operational profile missing a required key or containing a non-`in_process` driver | Load refused naming the key; no partial profile and no v1 fallback |
-| CF-26 | v2 provider config contains a secret, is workspace-supplied, or is not read-only | Refused/ignored; only the supervisor-rendered read-only config is used |
+| CF-26 | v2 provider config contains a secret, is workspace-supplied, or is not read-only | Refused/ignored; only the installation-authored, supervisor-validated read-only config is used |
 | CF-27 | v2 model-API host set contains a URL, port, wildcard, empty entry, host overlap, or verification-host overlap | Load error; no wildcard-like grant reaches the proxy |
 | CF-28 | v2 runtime credential is absent, unresolvable, or resolves to a host token | Environment repair; dispatch refused; the value never appears in output |
 | CF-29 | v2 verification toolchain/cache missing or writable | Preflight fails closed; verification never installs dependencies from an open network |

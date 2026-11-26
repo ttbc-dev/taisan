@@ -165,7 +165,8 @@ impl RuntimeBoundary {
         // A refused ensure still swept foreign staging files inside
         // `grant_locked`; a failed stage removes its own partial copy.
         // It never touches an earlier grant's file — that file may be
-        // a pending launch's only credential surface.
+        // a pending launch's only credential surface — nor a path the
+        // configuration itself names.
         self.grant_locked(&mut state)
     }
 
@@ -182,7 +183,7 @@ impl RuntimeBoundary {
                 BoundaryState::Ready(ready) => &ready.staged,
                 BoundaryState::Unresolved => &[],
             };
-            self.sweep_foreign_staging(owned)?;
+            self.sweep_foreign_staging(owned, &self.configured_paths())?;
         }
         let resolved = match &self.config.credential_ref {
             None => None,
@@ -252,13 +253,31 @@ impl RuntimeBoundary {
                 self.config.runtime_dir.display()
             )
         })?;
-        let tag = ready.next_grant;
-        ready.next_grant += 1;
-        let path = self.config.runtime_dir.join(format!("runtime-auth.{tag}"));
-        let tmp = self
-            .config
-            .runtime_dir
-            .join(format!("runtime-auth.{tag}.tmp"));
+        // A staging name that exists after the sweep is not ours to
+        // overwrite — it is a configured input the sweep deliberately
+        // kept, or another owner's live file (a second boundary
+        // sharing the dir counts its own grants from 0 too). Skip to
+        // a free name rather than rename over it; the `.tmp` sibling
+        // carries the same secret bytes the moment it is created, so
+        // it is checked as well. Past a bounded run of collisions the
+        // stage refuses rather than scan forever.
+        let mut tag = ready.next_grant;
+        let (path, tmp) = loop {
+            let path = self.config.runtime_dir.join(format!("runtime-auth.{tag}"));
+            let tmp = self
+                .config
+                .runtime_dir
+                .join(format!("runtime-auth.{tag}.tmp"));
+            tag += 1;
+            if std::fs::symlink_metadata(&path).is_err() && std::fs::symlink_metadata(&tmp).is_err()
+            {
+                break (path, tmp);
+            }
+            if tag - ready.next_grant > 64 {
+                return Err("credential.stage_failed: no free staging name".into());
+            }
+        };
+        ready.next_grant = tag;
         match write_staged_credential(&tmp, &path, credential) {
             Ok(()) => {
                 ready.staged.push(path.clone());
@@ -274,34 +293,74 @@ impl RuntimeBoundary {
         }
     }
 
+    /// The canonical paths the configuration names — the provider
+    /// config and a `file:` credential's source — which the sweep
+    /// must never unlink. Either may sit inside `runtime_dir` under
+    /// a `runtime-auth*` name: the prefix is not reserved, and a
+    /// deleted operator file cannot be restored by retry. The `file:`
+    /// source comes from the reference's shape parse — not the
+    /// resolution — so the sweep can protect it before resolve runs;
+    /// `resolve_file` canonicalizes the same path, so the sets agree.
+    fn configured_paths(&self) -> Vec<PathBuf> {
+        let source = self
+            .config
+            .credential_ref
+            .as_deref()
+            .and_then(|reference| {
+                workloop_core::credential::CredentialProvider::parse_str(reference).ok()
+            })
+            .and_then(|provider| match provider {
+                workloop_core::credential::CredentialProvider::File { path } => Some(path),
+                _ => None,
+            });
+        [self.config.provider_config.clone(), source]
+            .into_iter()
+            .flatten()
+            .filter_map(|path| path.canonicalize().ok())
+            .collect()
+    }
+
     /// Remove staging files in `runtime_dir` this instance does not
     /// own — a crashed supervisor's `runtime-auth*` leftovers are
     /// stale secret material and every resolve sweeps them. Owned
     /// files are skipped: a grant's file is a live credential surface
-    /// until its launch binds it. Only regular files and links can
-    /// hold the secret — a same-named directory is an obstruction the
-    /// stage itself refuses on, not secret material. An already-absent
-    /// file is not an error; a real removal failure refuses the
-    /// resolve — the boundary cannot certify a clean staging dir it
-    /// failed to clean.
-    fn sweep_foreign_staging(&self, owned: &[PathBuf]) -> Result<(), String> {
+    /// until its launch binds it. Only the exact staging shapes are
+    /// swept (`runtime-auth`, `runtime-auth.<seq>`, and their `.tmp`
+    /// siblings) and a path the resolved configuration names — the
+    /// provider config, a `file:` credential's source — is never
+    /// removed: `.runtime` is operator-writable, the prefix is not
+    /// reserved, and ambiguity always resolves toward keeping the
+    /// file. Only regular files and links can hold the secret — a
+    /// same-named directory is an obstruction the stage itself
+    /// refuses on, not secret material. An already-absent file is not
+    /// an error; a real removal failure refuses the resolve — the
+    /// boundary cannot certify a clean staging dir it failed to
+    /// clean.
+    fn sweep_foreign_staging(
+        &self,
+        owned: &[PathBuf],
+        protected: &[PathBuf],
+    ) -> Result<(), String> {
         let entries = match std::fs::read_dir(&self.config.runtime_dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(format!("credential.unstage_failed: {e}")),
         };
+        let owned: std::collections::HashSet<&Path> = owned.iter().map(PathBuf::as_path).collect();
         let mut failed = None;
         for entry in entries {
             let entry = entry.map_err(|e| format!("credential.unstage_failed: {e}"))?;
-            if !entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("runtime-auth")
-            {
+            if !is_staging_name(&entry.file_name().to_string_lossy()) {
                 continue;
             }
             let path = entry.path();
-            if owned.contains(&path) {
+            if owned.contains(path.as_path()) {
+                continue;
+            }
+            if path
+                .canonicalize()
+                .is_ok_and(|canon| protected.contains(&canon))
+            {
                 continue;
             }
             match entry.file_type() {
@@ -359,6 +418,20 @@ impl Drop for RuntimeBoundary {
             let _ = std::fs::remove_file(path);
         }
     }
+}
+
+/// Whether a `runtime_dir` entry name is one of the boundary's own
+/// staging shapes — the per-grant `runtime-auth.<seq>` and its
+/// `runtime-auth.<seq>.tmp` sibling, or the pre-per-grant
+/// `runtime-auth` / `runtime-auth.tmp` a crashed older supervisor may
+/// have left. Any other `runtime-auth*` name is operator content the
+/// sweep must never treat as stale staging.
+fn is_staging_name(name: &str) -> bool {
+    let base = name.strip_suffix(".tmp").unwrap_or(name);
+    base == "runtime-auth"
+        || base
+            .strip_prefix("runtime-auth.")
+            .is_some_and(|seq| !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Write the credential to `tmp` owner-only, fsync it, and rename it
@@ -812,26 +885,168 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A stage that fails after the tmp file carries secret bytes —
-    /// here the rename refuses because the staged name is a directory —
-    /// must remove the partial copy rather than leave it at the
-    /// predictable staging path.
+    /// A configured input inside the staging dir is never swept: an
+    /// operator may point `worker_provider_config` or a `file:`
+    /// credential at a `.runtime/runtime-auth*` path — the prefix is
+    /// not reserved. A file merely sharing the `runtime-auth` prefix
+    /// without the staging shape is operator content too. Deleting
+    /// either fails the launch it is configured for, and retry cannot
+    /// restore an operator's file.
+    #[test]
+    fn the_sweep_keeps_configured_inputs_and_foreign_names() {
+        let dir = tmp("keepinputs");
+        let runtime = dir.join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        // A provider document under a staging-shaped name — only the
+        // resolved-reference protection keeps it.
+        let provider = runtime.join("runtime-auth.41");
+        std::fs::write(
+            &provider,
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\"}\n",
+        )
+        .unwrap();
+        // A `file:` credential source under a staging-shaped name.
+        let source = runtime.join("runtime-auth.7");
+        std::fs::write(&source, "configured-secret").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // An operator file merely sharing the prefix — not ours.
+        let foreign = runtime.join("runtime-auth-provider.json");
+        std::fs::write(&foreign, "{}").unwrap();
+        let mut cfg = config(&dir);
+        cfg.credential_ref = Some(format!("file:{}", source.display()));
+        cfg.provider_config = Some(provider.clone());
+        let boundary = RuntimeBoundary::new(cfg);
+        let grant = boundary.ensure().unwrap();
+        assert!(
+            provider.exists(),
+            "the configured provider document survives the sweep"
+        );
+        assert!(
+            source.exists(),
+            "the configured credential source survives the sweep"
+        );
+        assert!(
+            foreign.exists(),
+            "a `runtime-auth*` file without the staging shape is never ours"
+        );
+        // The grant still staged its own unique file.
+        let staged = grant.credential_file.expect("credential staged");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"configured-secret");
+        assert_ne!(staged, source);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The stage's rename target is never a path the configuration
+    /// named: a provider document or `file:` source sitting on a
+    /// staging-shaped name survives the sweep *and* the stage, which
+    /// advances to a free tag instead of overwriting it.
+    #[test]
+    fn staging_never_overwrites_a_configured_input() {
+        let dir = tmp("stageprotect");
+        let runtime = dir.join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        // The provider document takes the first staging name.
+        let provider = runtime.join("runtime-auth.0");
+        let provider_bytes = "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\"}\n";
+        std::fs::write(&provider, provider_bytes).unwrap();
+        // The credential source takes the second.
+        let source = runtime.join("runtime-auth.1");
+        std::fs::write(&source, "configured-secret").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut cfg = config(&dir);
+        cfg.credential_ref = Some(format!("file:{}", source.display()));
+        cfg.provider_config = Some(provider.clone());
+        let boundary = RuntimeBoundary::new(cfg);
+        let grant = boundary.ensure().unwrap();
+        assert_eq!(
+            std::fs::read(&provider).unwrap(),
+            provider_bytes.as_bytes(),
+            "the stage must not overwrite the configured provider document"
+        );
+        assert_eq!(
+            std::fs::read(&source).unwrap(),
+            b"configured-secret",
+            "the stage must not overwrite the configured credential source"
+        );
+        assert_eq!(
+            grant.credential_file.expect("credential staged"),
+            runtime.join("runtime-auth.2"),
+            "occupied staging names are skipped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A staging name that exists after the sweep is never rewritten
+    /// — here a same-named directory, which the sweep deliberately
+    /// leaves — so the stage advances to the next free tag.
+    #[test]
+    fn an_occupied_staging_name_is_skipped_not_rewritten() {
+        let dir = tmp("stageskip");
+        let runtime = dir.join("runtime");
+        std::fs::create_dir_all(runtime.join("runtime-auth.0")).unwrap();
+        // SAFETY: test-only env mutation.
+        unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_TOKEN8", "sekrit8") };
+        let mut cfg = config(&dir);
+        cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_TOKEN8".into());
+        let boundary = RuntimeBoundary::new(cfg);
+        let grant = boundary.ensure().unwrap();
+        unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN8") };
+        assert!(
+            runtime.join("runtime-auth.0").is_dir(),
+            "an existing staging-named entry is never rewritten"
+        );
+        assert_eq!(
+            grant.credential_file.expect("credential staged"),
+            runtime.join("runtime-auth.1"),
+            "the stage advances to a free staging name"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The sweep runs before resolution, so a broken credential ref
+    /// still clears foreign staging files — a crashed predecessor's
+    /// stale secret does not linger while the config stays broken.
+    #[test]
+    fn a_failed_resolve_still_sweeps_foreign_staging() {
+        let dir = tmp("sweepfail");
+        let runtime = dir.join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let stale = runtime.join("runtime-auth.9");
+        std::fs::write(&stale, "stale-secret").unwrap();
+        let mut cfg = config(&dir);
+        cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_MISSING".into());
+        let boundary = RuntimeBoundary::new(cfg);
+        let err = boundary.ensure().unwrap_err();
+        assert!(err.contains("credential"), "{err}");
+        assert!(
+            !stale.exists(),
+            "a refused ensure still swept the foreign staging file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stage that cannot create its tmp copy — here because the
+    /// staging dir is read-only — refuses the resolve and leaves no
+    /// credential bytes behind.
     #[test]
     fn a_failed_stage_removes_the_tmp_credential() {
         let dir = tmp("stagefail");
+        let runtime = dir.join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o555)).unwrap();
         // SAFETY: test-only env mutation.
         unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_TOKEN8", "sekrit8") };
-        std::fs::create_dir_all(dir.join("runtime/runtime-auth.0")).unwrap();
         let mut cfg = config(&dir);
         cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_TOKEN8".into());
         let boundary = RuntimeBoundary::new(cfg);
         let err = boundary.ensure().unwrap_err();
+        unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN8") };
         assert!(err.contains("credential.stage_failed"), "{err}");
         assert!(
-            !dir.join("runtime/runtime-auth.0.tmp").exists(),
-            "a failed stage must not leave the tmp credential copy"
+            staged_entries(&dir).is_empty(),
+            "a failed stage must not leave any credential copy"
         );
-        unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN8") };
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
