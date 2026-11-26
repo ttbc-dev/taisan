@@ -587,7 +587,7 @@ pub(crate) fn verify_git_dir_safe(git_dir: &Path) -> Result<(), PreparationError
 /// reports the same canonical name), while an absolute or
 /// parent-traversing declaration produces `None`: a path porcelain can
 /// never report inside the repo is never tolerated.
-fn declared_porcelain_path(path: &str) -> Option<String> {
+pub(crate) fn declared_porcelain_path(path: &str) -> Option<String> {
     let mut parts = Vec::new();
     for component in Path::new(path).components() {
         match component {

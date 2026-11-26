@@ -4007,6 +4007,16 @@ fn seed_completion_evidence_minus_assessment(
             },
         ],
     );
+    seed_publish_and_lane_evidence(store, w, eid, key);
+}
+
+/// The publish receipts and lane-evidence half of
+/// `seed_completion_evidence_minus_assessment`, for fixtures that
+/// place their own writer set: the applied intents, the opened-change
+/// receipt, and the head's check/review facts — everything completion
+/// requires except the producing writer's artifact and the final
+/// assessment.
+fn seed_publish_and_lane_evidence(store: &SqliteStore, w: &WorkId, eid: &ExecutionId, key: &str) {
     // Completion requires the applied publish intents for the Work.
     for (action_id, action) in [
         (
@@ -4164,6 +4174,362 @@ fn sweep_reassessment_settles_a_waiting_execution_whose_evidence_completed_off_p
         e.outcome.as_ref().and_then(|o| o.code.as_deref()),
         Some("succeeded")
     );
+}
+
+/// Insert a superseded writer — resolved `Done` after its replacement
+/// was admitted — carrying one stale artifact `fact` bound to its own
+/// Invocation identity, evidence no later observation can supersede
+/// under that identity.
+fn superseded_done_writer(store: &SqliteStore, eid: &ExecutionId, key: &str, fact: ArtifactFact) {
+    let mut stale = recorded_invocation(eid, &format!("{key}-stale"));
+    stale.state = InvocationState::Done;
+    stale.request_id = format!("{}:inv:stale", eid.0);
+    stale.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: None,
+    }];
+    apply_effects(
+        store,
+        &[
+            Effect::InsertInvocation { invocation: stale },
+            Effect::InsertObservation {
+                observation: Observation {
+                    delivery: None,
+                    subject_work_id: None,
+                    subject_execution_id: Some(eid.clone()),
+                    fact: ObservationFact::Artifact {
+                        invocation_id: InvocationId(format!("{key}-stale")),
+                        required_artifact: "artifact.json".into(),
+                        state: fact,
+                    },
+                    observed_unix_seconds: NOW,
+                },
+            },
+        ],
+    );
+}
+
+/// A superseded writer's declared artifact set is stale exactly like
+/// its evidence (WC-REV-01): the collision it recorded can never be
+/// re-reported under its own identity, so holding the completion gate
+/// on its required set would park the Execution in `waiting` until the
+/// runtime bound — never succeeding on the current writer's complete
+/// evidence, never failing with `artifact_unfulfillable`.
+#[test]
+fn a_superseded_writers_unsatisfied_required_set_never_blocks_completion() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("sup1"), NOW).unwrap());
+    superseded_done_writer(
+        &store,
+        &e1,
+        "sup1",
+        ArtifactFact::Unfulfillable {
+            reason: "workspace-root artifact.json is tracked repository content".into(),
+        },
+    );
+    // The current writer's complete evidence set: its own `Present`
+    // artifact, the publish receipts, and the lane evidence.
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "sup1");
+    emit_work_fact(&store, &w, positive_assessment("sha-1"));
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Succeeded,
+        "the superseded writer's unsatisfiable declared set is stale evidence, not a live obligation: {e:?}"
+    );
+}
+
+/// The same waiver covers every stale terminal fact class: a
+/// superseded writer whose latest fact is `Missing` is just as
+/// unrefreshable under its own identity — recovery reports under the
+/// CURRENT writer — so its declared set cannot gate either.
+#[test]
+fn a_superseded_writers_missing_fact_never_blocks_completion() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("sup2"), NOW).unwrap());
+    superseded_done_writer(&store, &e1, "sup2", ArtifactFact::Missing);
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "sup2");
+    emit_work_fact(&store, &w, positive_assessment("sha-1"));
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Succeeded,
+        "a superseded writer's `Missing` is stale evidence, not a live obligation: {e:?}"
+    );
+}
+
+/// Supersession waives only the stale writer's obligation, never the
+/// current one's: a later `Missing` reported under the CURRENT
+/// writer's own identity re-opens the declared-set gate and the
+/// Execution drops back to bounded recovery instead of completing.
+#[test]
+fn the_current_writers_own_missing_fact_still_gates_completion() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("sup3"), NOW).unwrap());
+    superseded_done_writer(
+        &store,
+        &e1,
+        "sup3",
+        ArtifactFact::Unfulfillable {
+            reason: "workspace-root artifact.json is tracked repository content".into(),
+        },
+    );
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "sup3");
+    // The current writer's newest evidence reports the artifact gone:
+    // the latest-fact-per-kind selection every artifact gate shares.
+    handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: Some(e1.clone()),
+            fact: ObservationFact::Artifact {
+                invocation_id: InvocationId("sup3-coding".into()),
+                required_artifact: "artifact.json".into(),
+                state: ArtifactFact::Missing,
+            },
+            observed_unix_seconds: NOW + 1,
+        },
+        NOW + 1,
+    )
+    .unwrap();
+    emit_work_fact(&store, &w, positive_assessment("sha-1"));
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Waiting,
+        "the current writer's own unsatisfied set still gates: {e:?}"
+    );
+    assert_eq!(
+        e.waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "the hold is bounded artifact recovery, not a stall: {e:?}"
+    );
+}
+
+/// Supersession requires a *resolved* successor: a later writer that
+/// never reached `Done` took over nothing, and the last Done writer's
+/// declared set still gates — an `Abandoned` tail writer cannot waive
+/// it and let the Execution drift to `succeeded` on receipts alone.
+#[test]
+fn a_non_done_successor_does_not_waive_the_previous_writers_declared_set() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("sup4"), NOW).unwrap());
+    force_state(&store, &e1, ExecutionState::Waiting);
+    // The producing writer resolved `Done` without ever reporting its
+    // declared artifact; the successor dispatched after it was
+    // abandoned before it could produce anything.
+    let mut writer = recorded_invocation(&e1, "sup4-coding");
+    writer.state = InvocationState::Done;
+    writer.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: None,
+    }];
+    let mut successor = recorded_invocation(&e1, "sup4-fix");
+    successor.role = InvocationRole::Fix;
+    successor.state = InvocationState::Abandoned;
+    successor.request_id = format!("{}:inv:fix", e1.0);
+    successor.required_artifacts = writer.required_artifacts.clone();
+    let mut check = recorded_invocation(&e1, "sup4-check");
+    check.role = InvocationRole::InvariantCheck;
+    check.state = InvocationState::Done;
+    check.request_id = format!("{}:inv:check", e1.0);
+    apply_effects(
+        &store,
+        &[
+            Effect::InsertInvocation { invocation: writer },
+            Effect::InsertInvocation {
+                invocation: successor,
+            },
+            Effect::InsertInvocation { invocation: check },
+            Effect::InsertObservation {
+                observation: check_exit_observation(&e1, "sup4-check"),
+            },
+        ],
+    );
+    // Receipts and lane evidence all satisfied: the declared-set gate
+    // is the only thing that can hold this Execution.
+    seed_publish_and_lane_evidence(&store, &w, &e1, "sup4");
+    emit_work_fact(&store, &w, positive_assessment("sha-1"));
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Waiting,
+        "an abandoned successor transferred no obligation: {e:?}"
+    );
+}
+
+/// The refusal and the declared-set gate share the same producer
+/// binding (latest writer resolved `Done`): with only an abandoned
+/// tail after it, the producing writer's own collision is still the
+/// current evidence and fails fast `artifact_unfulfillable` instead of
+/// parking until the runtime bound.
+#[test]
+fn an_abandoned_tail_does_not_stale_the_producing_writers_collision() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (_w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("sup5"), NOW).unwrap());
+    force_state(&store, &e1, ExecutionState::Waiting);
+    let mut writer = recorded_invocation(&e1, "sup5-coding");
+    writer.state = InvocationState::Done;
+    writer.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: None,
+    }];
+    let mut tail = recorded_invocation(&e1, "sup5-fix");
+    tail.role = InvocationRole::Fix;
+    tail.state = InvocationState::Abandoned;
+    tail.request_id = format!("{}:inv:fix", e1.0);
+    apply_effects(
+        &store,
+        &[
+            Effect::InsertInvocation { invocation: writer },
+            Effect::InsertInvocation { invocation: tail },
+            Effect::InsertObservation {
+                observation: Observation {
+                    delivery: None,
+                    subject_work_id: None,
+                    subject_execution_id: Some(e1.clone()),
+                    fact: ObservationFact::Artifact {
+                        invocation_id: InvocationId("sup5-coding".into()),
+                        required_artifact: "artifact.json".into(),
+                        state: ArtifactFact::Unfulfillable {
+                            reason: "workspace-root artifact.json is tracked repository content"
+                                .into(),
+                        },
+                    },
+                    observed_unix_seconds: NOW,
+                },
+            },
+        ],
+    );
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(report.terminal_failures, 1, "{report:?}");
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Failed,
+        "the producing writer's collision stays current evidence: {e:?}"
+    );
+    assert_eq!(e.terminal_code.as_deref(), Some("artifact_unfulfillable"));
+}
+
+/// The same binding never reads the abandoned tail's own stale facts:
+/// a `Done` writer's complete evidence settles `succeeded` even when a
+/// later `Abandoned` record carries an `Unfulfillable` it could never
+/// have produced — that record is not the producing Invocation.
+#[test]
+fn an_abandoned_tails_stale_collision_never_fails_the_execution() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("sup6"), NOW).unwrap());
+    // Complete evidence under the producing writer first.
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "sup6");
+    // Then a successor is dispatched, abandoned, and its durable
+    // record somehow carries a collision — stale by construction.
+    let mut tail = recorded_invocation(&e1, "sup6-fix");
+    tail.role = InvocationRole::Fix;
+    tail.state = InvocationState::Abandoned;
+    tail.request_id = format!("{}:inv:fix", e1.0);
+    tail.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: None,
+    }];
+    apply_effects(
+        &store,
+        &[
+            Effect::InsertInvocation { invocation: tail },
+            Effect::InsertObservation {
+                observation: Observation {
+                    delivery: None,
+                    subject_work_id: None,
+                    subject_execution_id: Some(e1.clone()),
+                    fact: ObservationFact::Artifact {
+                        invocation_id: InvocationId("sup6-fix".into()),
+                        required_artifact: "artifact.json".into(),
+                        state: ArtifactFact::Unfulfillable {
+                            reason: "workspace-root artifact.json is tracked repository content"
+                                .into(),
+                        },
+                    },
+                    observed_unix_seconds: NOW + 1,
+                },
+            },
+        ],
+    );
+    emit_work_fact(&store, &w, positive_assessment("sha-1"));
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Succeeded,
+        "an abandoned record is never the producing Invocation: {e:?}"
+    );
+}
+
+/// Re-assessment settles in both directions: a Waiting Execution
+/// whose recorded evidence proves a terminal refusal — the producing
+/// writer's `Unfulfillable` artifact collision — fails on the sweep
+/// pass, and the report counts that failure in `terminal_failures`
+/// like any bound exhaustion instead of reporting an unchanged pass.
+#[test]
+fn sweep_reassessment_failure_counts_as_a_terminal_failure() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (_w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("rf1"), NOW).unwrap());
+    force_state(&store, &e1, ExecutionState::Waiting);
+    let mut invocation = recorded_invocation(&e1, "rf1-coding");
+    invocation.state = InvocationState::Done;
+    invocation.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: None,
+    }];
+    apply_effects(
+        &store,
+        &[
+            Effect::InsertInvocation { invocation },
+            // The collision fact lands as a durable record with no
+            // ingest assessment — the same off-path shape the
+            // completion re-assessment exists for.
+            Effect::InsertObservation {
+                observation: Observation {
+                    delivery: None,
+                    subject_work_id: None,
+                    subject_execution_id: Some(e1.clone()),
+                    fact: ObservationFact::Artifact {
+                        invocation_id: InvocationId("rf1-coding".into()),
+                        required_artifact: "artifact.json".into(),
+                        state: ArtifactFact::Unfulfillable {
+                            reason: "workspace-root artifact.json is tracked repository content"
+                                .into(),
+                        },
+                    },
+                    observed_unix_seconds: NOW,
+                },
+            },
+        ],
+    );
+    assert_eq!(
+        read_execution(&store, &e1).state,
+        ExecutionState::Waiting,
+        "no ingest assessment ran — the sweep owns the settle"
+    );
+
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(report.terminal_failures, 1, "{report:?}");
+    assert_eq!(report.completed, 0, "{report:?}");
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Failed);
+    assert_eq!(e.terminal_code.as_deref(), Some("artifact_unfulfillable"));
 }
 
 /// Re-assessment re-applies the same gates: a superseded-target

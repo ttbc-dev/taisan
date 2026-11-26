@@ -4480,6 +4480,15 @@ fn assess_artifact(
                 expected_state: execution.state.clone(),
             })
         }
+        // A structurally impossible artifact never improves on retry:
+        // a tracked workspace-root `artifact.json` is repository
+        // content the worker shim never rewrites, so it can never
+        // become this Invocation's bound manifest. The finish path
+        // reports artifact facts before the terminal process fact, so
+        // the failure is settled by `assess_completion` once the
+        // writer is proven done — never by charging the bounded
+        // recovery budget for the collision.
+        ArtifactFact::Unfulfillable { .. } => Ok(()),
         ArtifactFact::Present { .. }
             if execution.state == ExecutionState::Waiting
                 || execution.state == ExecutionState::Running =>
@@ -4890,6 +4899,35 @@ fn produced_revision(
     })
 }
 
+/// The latest `Artifact` fact `invocation` recorded for `kind`, if
+/// any — the single latest-fact-per-kind selection every artifact
+/// gate shares, ordered by `(observed_unix_seconds, index)` so the
+/// required-set check and the collision check can never drift apart
+/// on what the Invocation's current evidence is.
+fn latest_artifact_fact<'o>(
+    observations: &'o [Observation],
+    invocation: &Invocation,
+    kind: &str,
+) -> Option<&'o ArtifactFact> {
+    let mut latest: Option<(i64, usize, &'o ArtifactFact)> = None;
+    for (index, o) in observations.iter().enumerate() {
+        if let ObservationFact::Artifact {
+            invocation_id,
+            required_artifact,
+            state,
+        } = &o.fact
+            && invocation_id == &invocation.id
+            && required_artifact == kind
+        {
+            let replace = latest.is_none_or(|(t, i, _)| (t, i) < (o.observed_unix_seconds, index));
+            if replace {
+                latest = Some((o.observed_unix_seconds, index, state));
+            }
+        }
+    }
+    latest.map(|(_, _, fact)| fact)
+}
+
 /// The digests of `Present` artifacts covering every required artifact
 /// of the invocation; empty when the set is not yet complete and valid.
 /// A `Present` fact with a missing or mismatched digest is invalid and
@@ -4902,25 +4940,8 @@ fn artifact_digests(
     let observations = tx.observations_for_execution(execution_id)?;
     let mut digests = Vec::new();
     for required in &invocation.required_artifacts {
-        let mut latest: Option<(i64, usize, &ArtifactFact)> = None;
-        for (index, o) in observations.iter().enumerate() {
-            if let ObservationFact::Artifact {
-                invocation_id,
-                required_artifact,
-                state,
-            } = &o.fact
-                && invocation_id == &invocation.id
-                && required_artifact == &required.kind
-            {
-                let replace =
-                    latest.is_none_or(|(t, i, _)| (t, i) < (o.observed_unix_seconds, index));
-                if replace {
-                    latest = Some((o.observed_unix_seconds, index, state));
-                }
-            }
-        }
-        match latest {
-            Some((_, _, ArtifactFact::Present { digest }))
+        match latest_artifact_fact(&observations, invocation, &required.kind) {
+            Some(ArtifactFact::Present { digest })
                 if !digest.is_empty()
                     && required
                         .expected_digest
@@ -4978,6 +4999,31 @@ fn satisfied_invariant_check(
         return Ok(false);
     };
     Ok(latest.state == InvocationState::Done && check_exited_zero(tx, execution_id, latest)?)
+}
+
+/// The producing Invocation's artifact collision, if any: a required
+/// artifact kind whose latest recorded fact under that Invocation is
+/// `Unfulfillable`. The refusal binds to the Invocation that recorded
+/// it — a collision under a superseded Invocation is stale evidence,
+/// and within the producing Invocation a later `Present`/`Missing`
+/// fact for the same kind supersedes an earlier refusal. A kind whose
+/// current evidence is `Unfulfillable` can never become `Present`
+/// under this Invocation, so it must fail the request instead of
+/// entering bounded artifact recovery.
+fn unfulfillable_artifact(
+    tx: &dyn ReadView,
+    execution_id: &ExecutionId,
+    invocation: &Invocation,
+) -> Result<Option<String>, StoreError> {
+    let observations = tx.observations_for_execution(execution_id)?;
+    for required in &invocation.required_artifacts {
+        if let Some(ArtifactFact::Unfulfillable { reason }) =
+            latest_artifact_fact(&observations, invocation, &required.kind)
+        {
+            return Ok(Some(reason.clone()));
+        }
+    }
+    Ok(None)
 }
 
 /// New conclusive evidence the lane's satisfied check never judged
@@ -5086,17 +5132,80 @@ fn assess_completion(tx: &mut dyn TxView, execution: &Execution) -> Result<(), S
     if invocations.iter().any(|i| i.state.is_unresolved_writer()) {
         return Ok(());
     }
+    // The producing writer for both the refusal and the declared-set
+    // gate below: the latest Coding/Fix Invocation that resolved
+    // `Done`. A successor that never reached `Done` produced nothing,
+    // so it supersedes nothing — the last Done writer's evidence and
+    // obligations remain current.
+    let producing_done = invocations.iter().rposition(|i| {
+        matches!(i.role, InvocationRole::Coding | InvocationRole::Fix)
+            && i.state == InvocationState::Done
+    });
+    // A recorded artifact collision is structural for the Invocation
+    // that produced it: the declared artifact can never become
+    // `Present` under that Invocation, so bounded recovery would only
+    // burn its budget. The refusal reads the latest producing writer's
+    // own current evidence — a collision recorded under a superseded
+    // Invocation is stale fact, never this writer's outcome. The
+    // writer is resolved above, so settle the request now with the
+    // collision spelled out instead of retrying it.
+    if let Some(writer) = producing_done.map(|i| &invocations[i])
+        && let Some(reason) = unfulfillable_artifact(tx, &execution.id, writer)?
+    {
+        // The terminal-settle rule every other failure path applies:
+        // a pending or unknown delivery-bound intent may still be
+        // drained, and it must not land under an already-recorded
+        // failure. The reconciling `host_action_result` — or the
+        // sweep's level-triggered re-assessment — re-runs this check
+        // once the outbox settles.
+        if defer_terminal_while_outstanding(
+            tx,
+            &execution.work_id,
+            &execution.id,
+            "artifact_unfulfillable",
+        )? {
+            // The deferred settle is decided, not recovering: an
+            // Execution still parked on `artifact_recovery` would keep
+            // being selected by the recovery pass — charging attempts —
+            // and could be settled by the sweep as
+            // `artifact_recovery_exhausted` ahead of the outbox. The
+            // refused slot never consumes the bounded-recovery policy,
+            // so the wait re-reasons to the outbox like every other
+            // deferred terminal outcome.
+            if execution.waiting_reason == Some(WaitingReason::ArtifactRecovery) {
+                let mut next = execution.clone();
+                next.waiting_reason = Some(WaitingReason::Reconciliation);
+                tx.apply(&Effect::UpdateExecution {
+                    execution: next,
+                    expected_state: execution.state.clone(),
+                })?;
+            }
+            return Ok(());
+        }
+        return fail_terminal(tx, execution, "artifact_unfulfillable", &reason);
+    }
     if !invocations.iter().any(|i| {
         matches!(i.role, InvocationRole::Coding | InvocationRole::Fix)
             && i.state == InvocationState::Done
     }) {
         return Ok(());
     }
-    for invocation in &invocations {
+    // Only the latest resolved writer's declared set gates: a
+    // superseded writer's declared set is stale exactly like its facts
+    // (WC-REV-01) — the obligation moved to the successor that
+    // replaced it, and a collision or absence bound to its own
+    // identity can never be re-reported, so gating on it would park
+    // the Execution in `waiting` until the runtime bound.
+    for (index, invocation) in invocations.iter().enumerate() {
         // Only declared artifacts gate completion: a read-only role
         // (the invariant check) records an explicitly empty required
         // set — its lifecycle and receipts are the evidence.
+        let superseded_writer = matches!(
+            invocation.role,
+            InvocationRole::Coding | InvocationRole::Fix
+        ) && Some(index) != producing_done;
         if invocation.state == InvocationState::Done
+            && !superseded_writer
             && !invocation.required_artifacts.is_empty()
             && artifact_digests(tx, &execution.id, invocation)?.is_empty()
         {
@@ -5422,7 +5531,9 @@ pub struct SweepReport {
     pub examined: usize,
     /// Executions moved to `stopping` by a runtime or time bound.
     pub stops_recorded: usize,
-    /// Executions settled terminal by an exhausted bound.
+    /// Executions settled terminal: by an exhausted bound, or by a
+    /// structural refusal (e.g. `artifact_unfulfillable`) the
+    /// level-triggered re-assessment settled on this pass.
     pub terminal_failures: usize,
     /// Waiting Executions whose recorded evidence already satisfied
     /// every completion gate and were settled `succeeded` by the
@@ -5548,11 +5659,11 @@ fn clear_sweep_conflict(tx: &mut dyn TxView, execution_id: &ExecutionId) -> Resu
     Ok(())
 }
 
-/// A terminal decision (spent budget or a passed deadline) must wait
-/// for outstanding host writes to reconcile (lifecycle.md): intents are
-/// delivery-bound and would still apply under a recorded failure, so the
-/// stall is recorded as `outbox_reconciliation` instead of the terminal
-/// outcome. An intent that can never be attempted — `pending` under a
+/// A terminal decision (spent budget, a passed deadline, or a
+/// structural refusal) must wait for outstanding host writes to
+/// reconcile (lifecycle.md): intents are delivery-bound and would still
+/// apply under a recorded failure, so the stall is recorded as
+/// `outbox_reconciliation` instead of the terminal outcome. An intent that can never be attempted — `pending` under a
 /// denied `host_write` grant — does not defer: there is no in-flight
 /// effect to wait for. Returns true while the deferral stands.
 fn defer_terminal_while_outstanding(
@@ -5690,7 +5801,10 @@ fn sweep_one(
     // runs only inside observation ingest. Re-running it here
     // re-derives every gate from the durable record under the same
     // transaction; it can never succeed on stale, partial, or
-    // superseded-target evidence. Protective bounds above keep
+    // superseded-target evidence. A re-assessment that instead
+    // settles the Execution terminal — the artifact-collision
+    // refusal, for one — is a terminal outcome the report counts,
+    // never an unchanged pass. Protective bounds above keep
     // precedence: an Execution this sweep stops or fails never
     // reaches re-assessment in the same pass.
     if execution.state == ExecutionState::Waiting {
@@ -5712,11 +5826,10 @@ fn sweep_one(
         // pass's re-assessment.
         if execution.state == ExecutionState::Waiting {
             assess_completion(tx, &execution)?;
-            if tx
-                .execution(&execution.id)?
-                .is_some_and(|e| e.state == ExecutionState::Succeeded)
-            {
-                return Ok(SweepOutcome::Completed);
+            match tx.execution(&execution.id)?.map(|e| e.state) {
+                Some(ExecutionState::Succeeded) => return Ok(SweepOutcome::Completed),
+                Some(ExecutionState::Failed) => return Ok(SweepOutcome::TerminalFailure),
+                _ => {}
             }
         }
     }
