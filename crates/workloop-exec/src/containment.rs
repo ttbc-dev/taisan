@@ -351,12 +351,29 @@ pub fn ca_trust_binds(profile: &IsolationProfile) -> Vec<PathBuf> {
 }
 
 /// Refuse a mount plan whose binds would cover or enter the
-/// supervisor-owned sandbox surface. Every bind the plan mounts at
-/// its own spelling is checked — caches, argv-derived binds, the
-/// writable metadata binds, the toolchain's own-path bind, and the
-/// worker — and a fixed-destination source (toolchain, provider
-/// config) must not resolve to the host root, which would mount the
-/// whole host filesystem read-only inside the sandbox.
+/// supervisor-owned sandbox surface, or whose sources the contract
+/// never admits. Every bind the plan mounts at its own spelling is
+/// checked — caches, argv-derived binds, the writable metadata
+/// binds, the toolchain's own-path bind, and the worker — and a
+/// fixed-destination source (toolchain, provider config) must not
+/// resolve to the host root, which would mount the whole host
+/// filesystem read-only inside the sandbox. Two more source rules
+/// close the contract's "host `/`, a container socket, and the
+/// owner's home are never bind sources" guarantee
+/// (`docs/runtime-bindings.md`): no bind source resolves to the
+/// owner's home directory or an ancestor of it — a workspace-class
+/// bind of `$HOME` would expose the whole tree, while a path
+/// strictly beneath it mounts only the named path under the tmpfs
+/// `/home` — and no own-path source is a socket, device, fifo, or
+/// other special file, which would grant a host IPC endpoint rather
+/// than file content (the fixed-destination `/taisan/proxy.sock`
+/// bind is a socket by contract and exempt) — and a directory
+/// source directly holding such an entry is refused too, since the
+/// bind would carry the endpoint in with it. The sealed/covered
+/// destination check applies only to binds spelled at their own
+/// path: a fixed-destination source like the workspace mounts under
+/// `/workspace` whatever its host spelling, so a host path beneath
+/// the sandbox spelling is admissible there.
 /// `Some(reason)` is a typed boundary refusal;
 /// `None` admits the plan. Callers check before rendering argv: a
 /// refused plan never reaches `bwrap`.
@@ -377,15 +394,51 @@ pub fn plan_denial(plan: &MountPlan) -> Option<String> {
             ));
         }
     }
-    let own_path_binds = plan
-        .toolchain
-        .iter()
-        .chain(plan.caches.iter())
-        .chain(plan.ca_bundles.iter())
-        .chain(plan.extra_binds.iter())
-        .chain(plan.extra_rw_binds.iter())
-        .chain(plan.worker.iter());
-    for bind in own_path_binds {
+    let own_path_binds = || {
+        plan.toolchain
+            .iter()
+            .chain(plan.caches.iter())
+            .chain(plan.ca_bundles.iter())
+            .chain(plan.extra_binds.iter())
+            .chain(plan.extra_rw_binds.iter())
+            .chain(plan.worker.iter())
+    };
+    // The owner's home directories, canonicalized once: a bind
+    // spelled at the home directory itself — or an ancestor of it —
+    // would expose the whole tree, so the comparison is made on the
+    // resolved spelling and cannot be dodged by a symlinked path.
+    let owner_homes = owner_home_dirs();
+    let all_sources = [
+        plan.workspace.as_ref().map(|(path, _)| path),
+        plan.request.as_ref(),
+        plan.input.as_ref(),
+        plan.out.as_ref(),
+        plan.gitconfig.as_ref(),
+        plan.runtime_auth.as_ref(),
+        plan.provider_config.as_ref(),
+        plan.proxy_sock.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(own_path_binds());
+    for bind in all_sources {
+        let resolved = bind.canonicalize().unwrap_or_else(|_| bind.clone());
+        if resolved.parent().is_none() {
+            return Some(format!(
+                "mount plan bind '{}' resolves to the host root — \
+                 the host root is never a bind source",
+                bind.display()
+            ));
+        }
+        if owner_homes.iter().any(|home| home.starts_with(&resolved)) {
+            return Some(format!(
+                "mount plan bind '{}' resolves to the owner's home — \
+                 the home directory and its ancestors are never bind sources",
+                bind.display()
+            ));
+        }
+    }
+    for bind in own_path_binds() {
         let resolved = bind.canonicalize().unwrap_or_else(|_| bind.clone());
         if shadows_sandbox_mount(bind) || shadows_sandbox_mount(&resolved) {
             return Some(format!(
@@ -393,7 +446,115 @@ pub fn plan_denial(plan: &MountPlan) -> Option<String> {
                 bind.display()
             ));
         }
+        let Ok(metadata) = std::fs::metadata(&resolved) else {
+            continue;
+        };
+        if !metadata.is_file() && !metadata.is_dir() {
+            return Some(format!(
+                "mount plan bind '{}' is not a regular file or directory — \
+                 host sockets, devices, and fifos are never bind sources",
+                bind.display()
+            ));
+        }
+        // A directory bind carries its entries with it: a source
+        // spelled as the socket's parent directory would expose the
+        // endpoint inside even though the directory itself is
+        // regular. The scan stays shallow — one streaming readdir
+        // per plan, proportional to the top-level entry count — and
+        // a symlinked entry is left to resolve inside the sandbox
+        // where its target is the sandbox's own tree. An entry whose
+        // type cannot be determined is refused rather than skipped.
+        if metadata.is_dir()
+            && std::fs::read_dir(&resolved).is_ok_and(|mut entries| {
+                entries.any(|entry| {
+                    entry
+                        .and_then(|entry| entry.file_type())
+                        .map(|kind| !(kind.is_file() || kind.is_dir() || kind.is_symlink()))
+                        .unwrap_or(true)
+                })
+            })
+        {
+            return Some(format!(
+                "mount plan bind '{}' is a directory holding a socket, device, or fifo — \
+                 the bind would expose a host IPC endpoint inside the sandbox",
+                bind.display()
+            ));
+        }
     }
+    None
+}
+
+/// The launching uid's home directories: `$HOME` when it names a
+/// usable path, plus the account-database entry — the environment
+/// spelling can be missing in a system-service context or point at
+/// an unrelated directory, and only the passwd entry keeps the
+/// contract's home guarantee from silently lapsing in both cases.
+/// Canonicalized so a symlinked home spelling cannot dodge the
+/// comparison. A home that does not exist cannot be exposed, so a
+/// spelling that fails to resolve simply drops out.
+fn owner_home_dirs() -> Vec<PathBuf> {
+    owner_home_dirs_from(std::env::var_os("HOME"))
+}
+
+fn owner_home_dirs_from(env_home: Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    if let Some(home) = env_home
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .and_then(|home| home.canonicalize().ok())
+    {
+        homes.push(home);
+    }
+    if let Some(home) = passwd_home_dir().and_then(|home| home.canonicalize().ok())
+        && !homes.contains(&home)
+    {
+        homes.push(home);
+    }
+    homes
+}
+
+/// The account-database home for the effective uid, resolved
+/// independently of the environment.
+#[cfg(unix)]
+fn passwd_home_dir() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    // The buffer holds the entry's strings; an unusually long
+    // record signals ERANGE, so grow it a bounded number of times
+    // rather than letting the guard's spelling silently drop out.
+    for size in [4096usize, 16384, 65536] {
+        let mut buffer = vec![0u8; size];
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::geteuid(),
+                &mut entry,
+                buffer.as_mut_ptr().cast::<libc::c_char>(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            continue;
+        }
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+        let dir = unsafe { (*result).pw_dir };
+        if dir.is_null() {
+            return None;
+        }
+        let bytes = unsafe { std::ffi::CStr::from_ptr(dir) }.to_bytes();
+        if bytes.is_empty() {
+            return None;
+        }
+        return Some(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())));
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn passwd_home_dir() -> Option<PathBuf> {
     None
 }
 
@@ -1713,6 +1874,112 @@ mod tests {
         // The fixture plan itself admits.
         plan.extra_rw_binds = vec![];
         assert!(plan_denial(&plan).is_none());
+    }
+
+    /// An own-path source that is not a regular file or directory is
+    /// a host IPC endpoint, never file content: an argv-named
+    /// container-runtime socket under `/run` would otherwise ride the
+    /// tmpfs-covered prefix into the sandbox live.
+    #[test]
+    fn plan_denial_refuses_a_socket_bind_source() {
+        let dir = tmp("sockbind");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("containerd.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let mut plan = plan_fixture();
+        plan.extra_binds = vec![sock];
+        let reason = plan_denial(&plan).expect("a socket source refuses");
+        assert!(
+            reason.contains("not a regular file or directory"),
+            "{reason}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The owner's home is never a bind source: spelled at the home
+    /// directory itself — or an ancestor of it — the bind would
+    /// expose the whole tree. A path strictly beneath it mounts only
+    /// the named path; the tmpfs `/home` keeps the rest invisible.
+    #[test]
+    fn plan_denial_refuses_the_owners_home_as_a_bind_source() {
+        let Some(home) = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+        else {
+            return;
+        };
+        let mut plan = plan_fixture();
+        plan.extra_binds = vec![home.clone()];
+        let reason = plan_denial(&plan).expect("the home directory refuses");
+        assert!(reason.contains("owner's home"), "{reason}");
+        let beneath = home.join(format!("workloop-home-bind-{}", std::process::id()));
+        std::fs::write(&beneath, "x").unwrap();
+        plan.extra_binds = vec![beneath.clone()];
+        assert!(
+            plan_denial(&plan).is_none(),
+            "a path beneath the home still binds only the named file"
+        );
+        let _ = std::fs::remove_file(&beneath);
+    }
+
+    /// The home guard must not lapse with the environment spelling:
+    /// a missing or misleading `$HOME` still leaves the
+    /// account-database home refused as a bind source.
+    #[test]
+    fn owner_home_dirs_hold_the_passwd_home_past_a_misleading_env() {
+        let Some(passwd_home) = passwd_home_dir().and_then(|home| home.canonicalize().ok()) else {
+            return;
+        };
+        for env_home in [None, Some(std::ffi::OsString::from("/"))] {
+            let homes = owner_home_dirs_from(env_home.clone());
+            assert!(
+                homes.contains(&passwd_home),
+                "env spelling {env_home:?} dropped the passwd home: {homes:?}"
+            );
+            let mut plan = plan_fixture();
+            plan.extra_binds = vec![passwd_home.clone()];
+            let reason = plan_denial(&plan).expect("the passwd home refuses");
+            assert!(reason.contains("owner's home"), "{reason}");
+        }
+    }
+
+    /// A directory bind carries its entries with it: naming the
+    /// socket's parent directory instead of the socket itself must
+    /// not reopen the endpoint — a `/run/containerd`-style spelling
+    /// rides the tmpfs-covered prefix in live either way.
+    #[test]
+    fn plan_denial_refuses_a_directory_bind_holding_a_socket() {
+        let dir = tmp("sockdir");
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("file"), "x").unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(dir.join("daemon.sock")).unwrap();
+        let mut plan = plan_fixture();
+        plan.extra_binds = vec![dir.clone()];
+        let reason = plan_denial(&plan).expect("a socket-holding directory refuses");
+        assert!(reason.contains("directory holding"), "{reason}");
+        plan.extra_binds = vec![dir.join("nested")];
+        assert!(
+            plan_denial(&plan).is_none(),
+            "a directory of regular entries still binds"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fixed-destination source mounts under its sandbox spelling
+    /// whatever its host path, so the sealed/covered destination
+    /// check does not apply to it: a host workspace spelled
+    /// `/workspace` — a container-style checkout — still launches.
+    /// The host root itself stays refused for every source kind.
+    #[test]
+    fn plan_denial_admits_a_workspace_spelled_under_the_sandbox_workspace() {
+        let mut plan = plan_fixture();
+        plan.workspace = Some((PathBuf::from("/workspace"), false));
+        assert!(plan_denial(&plan).is_none());
+        plan.workspace = Some((PathBuf::from("/workspace/repo"), false));
+        assert!(plan_denial(&plan).is_none());
+        plan.workspace = Some((PathBuf::from("/"), false));
+        let reason = plan_denial(&plan).expect("a root workspace refuses");
+        assert!(reason.contains("host root"), "{reason}");
     }
 
     /// A fixed-destination source that resolves to the host root

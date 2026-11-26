@@ -516,6 +516,35 @@ fn packaged_runtime_files_stay_under_the_narrow_read_only_binds() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Sources the contract never admits refuse the launch rather than
+/// render: an argv-named host socket and the owner's home directory
+/// itself are denied by `plan_denial` before the outer argv is built.
+#[test]
+fn forbidden_bind_sources_refuse_the_launch() {
+    let dir = tmp("forbidden");
+    let sock = dir.join("runtime.sock");
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let inner = vec![
+        "/pkg/bin/managed-worker".to_string(),
+        sock.to_string_lossy().into_owned(),
+    ];
+    let err = contained_launch(&dir, RuntimeBoundary::new(boundary_config(&dir)), &inner)
+        .expect_err("an argv-named host socket refuses");
+    assert!(err.contains("not a regular file or directory"), "{err}");
+
+    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
+        return;
+    };
+    let inner = vec![
+        "/pkg/bin/managed-worker".to_string(),
+        PathBuf::from(home).to_string_lossy().into_owned(),
+    ];
+    let err = contained_launch(&dir, RuntimeBoundary::new(boundary_config(&dir)), &inner)
+        .expect_err("the owner's home refuses as a bind source");
+    assert!(err.contains("owner's home"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The documented packaging example stays a real layout: the worker
 /// root sits beneath a bound system prefix and the example explains
 /// the writable scratch areas.

@@ -71,9 +71,14 @@ latest provider value is what the next Invocation observes. Each
 grant stages its own `0600` supervisor-owned file under a unique
 per-grant name, bound read-only at `/taisan/runtime-auth` — a later
 grant can never rewrite the path a pending launch is about to bind,
-and a refused re-resolve never unlinks it. A boundary removes only
-the files it staged: a boundary that was constructed but never
-resolved (a `run` that lost the lease) removes nothing at the shared
+and a refused re-resolve never unlinks it. Retention is bounded:
+only the newest staged grants are kept — a staged file is live until
+its launch mounts it, a window every caller completes promptly after
+the grant — so older grant files are unlinked as stale secret
+material rather than accumulating for the supervisor's life. A
+boundary removes only the files it staged: a boundary that was
+constructed but never resolved (a `run` that lost the lease) removes
+nothing at the shared
 staging dir, while every resolve sweeps only the boundary's own
 staging shapes (`runtime-auth`, `runtime-auth.<seq>`, and their
 `.tmp` siblings) a crashed predecessor left behind as stale secret
@@ -132,9 +137,18 @@ the argv[0] executable and every absolute-path argv element bind at
 their own path, but sibling dependencies the argv does not name stay
 invisible. Packages that need a directory of dependencies must live
 under a bound prefix (as in the example layout), name each required
-absolute path in argv, or ship a self-contained executable. Host `/`,
-a container socket, and the owner's home are never bind sources;
-nothing packaged is bound writable. Writable locations inside the
+absolute path in argv, or ship a self-contained executable. Bind
+sources the contract never admits are refused by `plan_denial`
+before the plan renders: host `/`, the owner's home directory or an
+ancestor of it (the home is resolved from `$HOME` and the account
+database, so an unset or misleading environment spelling cannot
+lapse the guard; a path strictly beneath the home still binds only
+the named path while the tmpfs `/home` keeps the rest invisible),
+and any own-path source that is not a regular file or directory — a
+host socket, device, or fifo grants an IPC endpoint, never file
+content — including a directory source directly holding such an
+entry, so an argv-named container-runtime socket cannot be mounted.
+Nothing packaged is bound writable. Writable locations inside the
 sandbox are only `/workspace` (role-dependent), `/taisan/out`, `HOME`
 (tmpfs), and `TMPDIR` (`/tmp`). See
 [examples/managed-worker](examples/managed-worker/README.md)

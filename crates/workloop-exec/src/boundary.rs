@@ -81,15 +81,27 @@ pub struct BoundaryGrant {
     pub proxy_sock: Option<PathBuf>,
 }
 
+/// How many of the newest staged grant files a boundary keeps. A
+/// grant's file is live only until its launch's mount — every caller
+/// issues exactly one spawn promptly after `ensure` returns, and the
+/// mount consumes the path at exec — so the set of grants whose mount
+/// could still be pending is far smaller than the bound. Older files
+/// are stale secret material (including rotated provider values) and
+/// are unlinked at the next stage rather than at process exit; a
+/// launch stalled across this many grant cycles fails closed on the
+/// missing `--ro-bind` source, never on a substituted file.
+const RETAINED_GRANT_FILES: usize = 8;
+
 struct BoundaryReady {
     provider_config: Option<PathBuf>,
-    /// The staged credential files this instance created — one
-    /// unique path per grant. A grant's file must survive until its
-    /// launch has mounted it, and the boundary cannot observe the
-    /// mount, so owned files are removed only by this instance's
-    /// `Drop`: a boundary that staged nothing removes nothing, and a
-    /// later grant can never rewrite or unlink a file a pending
-    /// launch is about to bind.
+    /// The staged credential files this instance created and still
+    /// owns — one unique path per grant, bounded to the newest
+    /// [`RETAINED_GRANT_FILES`]. A later grant can never rewrite a
+    /// pending grant's path, and only the retention bound unlinks
+    /// owned files before this instance's `Drop`: a launch stalled
+    /// across more than the bound's grant cycles loses its staged
+    /// file and fails closed on the missing `--ro-bind` source. A
+    /// boundary that staged nothing removes nothing.
     staged: Vec<PathBuf>,
     /// The next per-grant staging suffix — the unique name is what
     /// keeps a later grant's restage from clobbering an earlier
@@ -281,6 +293,16 @@ impl RuntimeBoundary {
         match write_staged_credential(&tmp, &path, credential) {
             Ok(()) => {
                 ready.staged.push(path.clone());
+                // Retention: only the newest grants can still have a
+                // pending mount, so files past the bound are stale
+                // secret material. A failed unlink still drops
+                // ownership — the next ensure's foreign sweep
+                // reclaims the entry (staging-shaped, unowned, and
+                // never configured).
+                while ready.staged.len() > RETAINED_GRANT_FILES {
+                    let evicted = ready.staged.remove(0);
+                    let _ = std::fs::remove_file(evicted);
+                }
                 Ok(path)
             }
             // The staging sibling carries the same secret bytes the
@@ -1034,13 +1056,14 @@ mod tests {
         let runtime = dir.join("runtime");
         std::fs::create_dir_all(&runtime).unwrap();
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o555)).unwrap();
-        // SAFETY: test-only env mutation.
-        unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_TOKEN8", "sekrit8") };
+        // SAFETY: test-only env mutation; the name is unique to this
+        // test — parallel env-driven tests must never share a variable.
+        unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_TOKEN10", "sekrit10") };
         let mut cfg = config(&dir);
-        cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_TOKEN8".into());
+        cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_TOKEN10".into());
         let boundary = RuntimeBoundary::new(cfg);
         let err = boundary.ensure().unwrap_err();
-        unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN8") };
+        unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN10") };
         assert!(err.contains("credential.stage_failed"), "{err}");
         assert!(
             staged_entries(&dir).is_empty(),
@@ -1100,6 +1123,43 @@ mod tests {
         assert_ne!(staged, first_file, "each grant stages its own file");
         assert_eq!(std::fs::read(&staged).unwrap(), b"sekrit7");
         unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN7") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Staged credentials do not accumulate for the boundary's life:
+    /// only the newest [`RETAINED_GRANT_FILES`] grant files are kept —
+    /// the oldest files' mounts have long consumed them (or their
+    /// launch failed), so they are unlinked as stale secret material
+    /// at the next stage rather than at process exit.
+    #[test]
+    fn staged_credentials_are_retained_within_a_bound() {
+        let dir = tmp("retention");
+        let source = dir.join("token");
+        std::fs::write(&source, "credential").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut cfg = config(&dir);
+        cfg.credential_ref = Some(format!("file:{}", source.display()));
+        let boundary = RuntimeBoundary::new(cfg);
+        for _ in 0..RETAINED_GRANT_FILES + 2 {
+            boundary.ensure().expect("each grant stages its own file");
+        }
+        let entries = staged_entries(&dir);
+        assert_eq!(
+            entries.len(),
+            RETAINED_GRANT_FILES,
+            "only the newest grant files are kept: {entries:?}"
+        );
+        // The oldest grants' files — every mount they could serve is
+        // long past — are unlinked; the newest files stay for their
+        // still-pending consumers.
+        assert!(!dir.join("runtime/runtime-auth.0").exists());
+        assert!(!dir.join("runtime/runtime-auth.1").exists());
+        for seq in 2..RETAINED_GRANT_FILES + 2 {
+            assert!(
+                dir.join(format!("runtime/runtime-auth.{seq}")).exists(),
+                "the newest grant files are retained: {seq}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
