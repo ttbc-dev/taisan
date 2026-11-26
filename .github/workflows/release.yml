@@ -2,10 +2,14 @@
 #
 # LOCAL MODIFICATION — do not regenerate blindly:
 # GITHUB_TOKEN permissions are hand-scoped per job below (workflow-level
-# contents:read; contents:write only on the tag-gated `host` job).
-# cargo-dist 0.34.0 cannot express permissions for its built-in jobs, so
-# `[workspace.metadata.dist].allow-dirty = ["ci"]` keeps `dist generate`
-# from clobbering this patch. See docs/distribution.md "Release flow".
+# contents:read; contents:write on the `plan` and `host` jobs — `plan`
+# runs `dist host --steps=create` on tag pushes, which creates the
+# GitHub Release). Tag names reach run: blocks only through env vars,
+# never via ${{ }} interpolation (a crafted tag could otherwise inject
+# shell commands). cargo-dist 0.34.0 cannot express permissions for its
+# built-in jobs, so `[workspace.metadata.dist].allow-dirty = ["ci"]`
+# keeps `dist generate` from clobbering this patch.
+# See docs/distribution.md "Release flow".
 #
 # Copyright 2022-2024, axodotdev
 # SPDX-License-Identifier: MIT or Apache-2.0
@@ -22,7 +26,8 @@
 
 name: Release
 # Hand-scoped (see header note): jobs inherit read-only GITHUB_TOKEN;
-# `host` escalates to contents:write because it creates the Release.
+# `plan` (tag path) and `host` escalate to contents:write because they
+# create the GitHub Release.
 permissions:
   "contents": "read"
 
@@ -56,6 +61,12 @@ on:
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
+    # Hand-scoped (see header note): on tag pushes this job runs
+    # `dist host --steps=create`, which creates the GitHub Release, so it
+    # needs contents:write. On pull requests it runs `dist plan`
+    # (read-only), but GitHub cannot scope job permissions per event.
+    permissions:
+      "contents": "write"
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
@@ -85,8 +96,16 @@ jobs:
       # (PRs run on the *source* but secrets are usually on the *target* -- that's *good*
       # but also really annoying to build CI around when it needs secrets to work right.)
       - id: plan
+        env:
+          # The tag name must reach the shell via env (see header note).
+          RELEASE_TAG: ${{ !github.event.pull_request && github.ref_name || '' }}
+          PUBLISHING: ${{ !github.event.pull_request }}
         run: |
-          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+          if [ "$PUBLISHING" = "true" ]; then
+            dist host --steps=create "--tag=$RELEASE_TAG" --output-format=json > plan-dist-manifest.json
+          else
+            dist plan --output-format=json > plan-dist-manifest.json
+          fi
           echo "dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -149,9 +168,13 @@ jobs:
         run: |
           ${{ matrix.packages_install }}
       - name: Build artifacts
+        env:
+          # The tag name must reach the shell via env (see header note);
+          # ${TAG_FLAG:+...} keeps the flag absent on pull_request runs.
+          TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
           # Actually do builds and make zips and whatnot
-          dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          dist build ${TAG_FLAG:+$TAG_FLAG} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
       - id: cargo-dist
         name: Post-build
@@ -203,8 +226,11 @@ jobs:
           merge-multiple: true
       - id: cargo-dist
         shell: bash
+        env:
+          # The tag name must reach the shell via env (see header note).
+          TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
-          dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
+          dist build ${TAG_FLAG:+$TAG_FLAG} --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
           # Parse out what we just built and upload it to scratch storage
@@ -222,8 +248,8 @@ jobs:
             ${{ env.BUILD_MANIFEST_NAME }}
   # Determines if we should publish/announce
   host:
-    # Hand-scoped (see header note): only this tag-gated job may write —
-    # it uploads artifacts to and creates the GitHub Release.
+    # Hand-scoped (see header note): this tag-gated job may write —
+    # it uploads artifacts to and publishes the GitHub Release.
     permissions:
       "contents": "write"
     needs:
@@ -257,8 +283,11 @@ jobs:
           merge-multiple: true
       - id: host
         shell: bash
+        env:
+          # The tag name must reach the shell via env (see header note).
+          TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
-          dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release --output-format=json > dist-manifest.json
+          dist host ${TAG_FLAG:+$TAG_FLAG} --steps=upload --steps=release --output-format=json > dist-manifest.json
           echo "artifacts uploaded and released successfully"
           cat dist-manifest.json
           echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -285,11 +314,12 @@ jobs:
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
+          RELEASE_TAG: "${{ needs.plan.outputs.tag }}"
         run: |
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
-          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
   publish-homebrew-formula:
     needs:
