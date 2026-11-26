@@ -160,7 +160,7 @@ git fetch origin main          # the pin checkout does not carry
 #    release docs only — every changed path must be documentation;
 #    this check MUST print nothing:
 git diff --name-only 5f134b96 "$TAG_SHA" | \
-  grep -vE '^(docs/|README\.md$)'
+  grep -vE '^docs/|^README\.md$'
 #    (any output is a non-documentation change — a five-path check
 #     would miss LICENSES/, fixtures/, skills/, which cargo-dist
 #     archives bundle; stop and re-run §3/§4 instead)
