@@ -17,9 +17,10 @@ dispositioned by the #438 owner ruling (in-place publication, history
 kept); and the #369 license is applied (MIT OR Apache-2.0). The
 acceptance issue #365 is closed: the owner dispositioned the flagged
 defects in its closing comment (2026-11-25) — recorded in
-release-acceptance §6 — while #437 still awaits a recorded
-disposition and the dispositioned defect issues themselves stay
-open for the owner to close. The
+release-acceptance §6 — and on 2026-11-26 the owner dispositioned
+#437 to v0.6 and closed the seven dispositioned defect issues under
+the recorded wording (the confirmed-present code states stand and
+are listed below). The
 record's fold-in of the pilot/clean evidence landed via PR #472
 (merged `d87d5dc`); the run records cited here are the retained
 owner-side evidence, not that PR. Per `AGENTS.md`, the live-run
