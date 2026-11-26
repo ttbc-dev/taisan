@@ -1,5 +1,6 @@
 [package]
 name = "workloop-selector"
+version.workspace = true
 edition.workspace = true
 description = "public-issue-selector — taisan reference Selector adapter"
 license.workspace = true

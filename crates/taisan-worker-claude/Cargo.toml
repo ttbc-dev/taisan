@@ -1,5 +1,6 @@
 [package]
 name = "taisan-worker-claude"
+version.workspace = true
 edition.workspace = true
 description = "taisan-worker-claude — taisan reference Worker adapter"
 license.workspace = true

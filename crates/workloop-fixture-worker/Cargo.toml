@@ -1,5 +1,6 @@
 [package]
 name = "workloop-fixture-worker"
+version.workspace = true
 edition.workspace = true
 description = "deterministic fixture Worker for taisan contract tests"
 license.workspace = true

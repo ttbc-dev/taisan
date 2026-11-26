@@ -1,5 +1,6 @@
 [package]
 name = "workloop-fixture-selector"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 
