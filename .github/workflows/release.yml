@@ -2,16 +2,22 @@
 #
 # LOCAL MODIFICATION — do not regenerate blindly:
 # GITHUB_TOKEN permissions are hand-scoped per job below (workflow-level
-# contents:read; contents:write on the `plan` and `host` jobs — `plan`
-# runs `dist host --steps=create` on tag pushes, which creates the
-# GitHub Release). Tag names reach run: blocks only through env vars,
-# never via ${{ }} interpolation (a crafted tag could otherwise inject
-# shell commands). The `publish-homebrew-formula` job's git identity is
-# overridden from dist's "axo bot" default to github-actions[bot] so
-# commits to the owner's tap are attributed to CI, not a third-party
-# name. cargo-dist 0.34.0 cannot express permissions for its
-# built-in jobs, so `[workspace.metadata.dist].allow-dirty = ["ci"]`
-# keeps `dist generate` from clobbering this patch.
+# contents:read; contents:write on the `host` job only — it creates and
+# publishes the GitHub Release via `gh release create`, and its
+# `publishing == 'true'` gate must not be weakened, since it is what
+# keeps a write token out of pull_request runs). `dist host
+# --steps=create` under hosting="github" performs no GitHub write — it
+# only enriches the manifest with artifact download URLs — so `plan`,
+# which also runs on pull_request, stays read-only and no PR-controlled
+# run ever holds a write token). Tag names reach run: blocks only
+# through env vars, never via ${{ }} interpolation (a crafted tag
+# could otherwise inject shell commands). The `publish-homebrew-formula`
+# job's git identity is overridden from dist's "axo bot" default to
+# github-actions[bot] so commits to the owner's tap are attributed to
+# CI, not a third-party name. cargo-dist 0.34.0 cannot express
+# permissions for its built-in jobs, so
+# `[workspace.metadata.dist].allow-dirty = ["ci"]` keeps `dist generate`
+# from clobbering this patch.
 # See docs/distribution.md "Release flow".
 #
 # Copyright 2022-2024, axodotdev
@@ -29,8 +35,7 @@
 
 name: Release
 # Hand-scoped (see header note): jobs inherit read-only GITHUB_TOKEN;
-# `plan` (tag path) and `host` escalate to contents:write because they
-# create the GitHub Release.
+# only `host` escalates to contents:write (it runs `gh release create`).
 permissions:
   "contents": "read"
 
@@ -64,12 +69,10 @@ on:
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
-    # Hand-scoped (see header note): on tag pushes this job runs
-    # `dist host --steps=create`, which creates the GitHub Release, so it
-    # needs contents:write. On pull requests it runs `dist plan`
-    # (read-only), but GitHub cannot scope job permissions per event.
-    permissions:
-      "contents": "write"
+    # Hand-scoped (see header note): this job also runs on pull_request,
+    # so it stays read-only. On tag pushes `dist host --steps=create`
+    # still performs no GitHub write (it only enriches the manifest);
+    # the release itself is created by `gh release create` in `host`.
     runs-on: "ubuntu-22.04"
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
