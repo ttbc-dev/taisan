@@ -29,6 +29,7 @@ use crate::store::{
     Effect, HostAction, HostActionIntent, IntakeSettingsRecord, ReadView, RecoveryIntent,
     RecoveryIntentState, Store, StoreError, TxView,
 };
+use crate::worker_v2::{TaskBody, WorkerRequestV2};
 
 /// The resolved installation binding template: which host installation,
 /// repository, adapter contract, and role actors every accepted Work
@@ -4600,7 +4601,15 @@ fn maybe_publish(
     // other Invocation.
     if spec.payload.lanes.invariant_check {
         let checked = satisfied_invariant_check(tx, &execution.id, &invocations[producing + 1..])?;
-        if !checked {
+        // A satisfied-but-inconclusive check is not terminal evidence
+        // either: when a conclusive verification result exists that
+        // the newest check's request never bound, the lane owes that
+        // evidence a re-judged assessment — re-mint the check rather
+        // than park the lane on the stale verdict (#469). The mint is
+        // the same `waiting → ready` re-request `!checked` already
+        // uses, budget-bounded through `accepts_invocation` like every
+        // other Invocation.
+        if !checked || unjudged_conclusive_evidence(tx, &work.id, &invocations[producing + 1..])? {
             admit_queued_role(
                 tx,
                 config,
@@ -4969,6 +4978,98 @@ fn satisfied_invariant_check(
         return Ok(false);
     };
     Ok(latest.state == InvocationState::Done && check_exited_zero(tx, execution_id, latest)?)
+}
+
+/// New conclusive evidence the lane's satisfied check never judged
+/// (#469): the lane's latest `Assessment` on the current target is not
+/// all-positive AND a conclusive `VerificationResult` (`Pass`|`Fail`)
+/// exists on the assessed artifact that the newest check's bound
+/// request did not carry — recorded after every result that request
+/// did bind, so it is genuinely newer evidence and never an older run
+/// the request's evidence bound skipped.
+///
+/// The ordering anchor is `recorded_seq` on the verification-results
+/// table itself — the same domain on both sides — because observation
+/// rows carry no recorded sequence to compare against: the check's
+/// bound evidence set is the authoritative account of what it judged.
+/// A satisfied check with no bound body row (a legacy v1 dispatch) or
+/// an unparseable one cannot prove evidence is unjudged and never
+/// re-mints here.
+fn unjudged_conclusive_evidence(
+    tx: &dyn ReadView,
+    work_id: &WorkId,
+    trailing: &[Invocation],
+) -> Result<bool, StoreError> {
+    let Some(target) = current_target(tx, work_id)? else {
+        return Ok(false);
+    };
+    let lane_all_positive = tx
+        .observations_for_work(work_id)?
+        .iter()
+        .rev()
+        .find_map(|o| match &o.fact {
+            ObservationFact::Assessment {
+                target: t,
+                complete,
+                items,
+                ..
+            } if t == &target => Some(
+                *complete
+                    && !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|i| i.verdict == crate::observation::AssessmentVerdict::Positive),
+            ),
+            _ => None,
+        })
+        .unwrap_or(false);
+    if lane_all_positive {
+        return Ok(false);
+    }
+    // The newest check — the one the gate just proved — is the request
+    // whose bound evidence set is "what the lane last judged".
+    let Some(check) = trailing
+        .iter()
+        .rev()
+        .find(|i| i.role == InvocationRole::InvariantCheck)
+    else {
+        return Ok(false);
+    };
+    let Some(body) = tx.worker_request_body(&check.request_id)? else {
+        return Ok(false);
+    };
+    if !body.verifies() {
+        return Ok(false);
+    }
+    let Ok(request) = WorkerRequestV2::parse(&body.canonical_body) else {
+        return Ok(false);
+    };
+    let TaskBody::InvariantCheck {
+        artifact,
+        verification_evidence,
+        ..
+    } = &request.task
+    else {
+        return Ok(false);
+    };
+    let bound: BTreeSet<&str> = verification_evidence
+        .iter()
+        .map(|e| e.evidence_id.as_str())
+        .collect();
+    let results = tx.verification_results(&artifact.artifact_id)?;
+    let bound_newest = results
+        .iter()
+        .filter(|r| bound.contains(r.id.as_str()))
+        .map(|r| r.recorded_seq)
+        .max()
+        .unwrap_or(0);
+    Ok(results.iter().any(|r| {
+        matches!(
+            r.result,
+            VerificationOutcome::Pass | VerificationOutcome::Fail
+        ) && !bound.contains(r.id.as_str())
+            && r.recorded_seq > bound_newest
+    }))
 }
 
 /// `succeeded` requires the required stage effects applied, the declared
@@ -5393,7 +5494,7 @@ pub fn sweep_scoped(
         }
         report.examined += 1;
         let execution_id = listed.id.clone();
-        match store.transact(|tx| sweep_one(tx, &execution_id, now_unix_seconds)) {
+        match store.transact(|tx| sweep_one(tx, config, &execution_id, now_unix_seconds)) {
             Ok(SweepOutcome::Absent | SweepOutcome::Unchanged) => {}
             Ok(SweepOutcome::StopRecorded) => report.stops_recorded += 1,
             Ok(SweepOutcome::TerminalFailure) => report.terminal_failures += 1,
@@ -5411,7 +5512,6 @@ pub fn sweep_scoped(
             Err(e) => return Err(e),
         }
     }
-    let _ = config;
     Ok(report)
 }
 
@@ -5479,6 +5579,7 @@ fn defer_terminal_while_outstanding(
 /// taken is observed fresh, never acted on from a stale snapshot.
 fn sweep_one(
     tx: &mut dyn TxView,
+    config: &WorkloopConfig,
     execution_id: &ExecutionId,
     now_unix_seconds: i64,
 ) -> Result<SweepOutcome, StoreError> {
@@ -5593,12 +5694,30 @@ fn sweep_one(
     // precedence: an Execution this sweep stops or fails never
     // reaches re-assessment in the same pass.
     if execution.state == ExecutionState::Waiting {
-        assess_completion(tx, &execution)?;
-        if tx
-            .execution(&execution.id)?
-            .is_some_and(|e| e.state == ExecutionState::Succeeded)
-        {
-            return Ok(SweepOutcome::Completed);
+        // The publish seam is level-triggered for the same reason:
+        // handoff verification records its result rows directly, so a
+        // conclusive rerun lands with no observation and nothing
+        // re-drives the invariant lane — the re-mint for evidence the
+        // satisfied check never judged (#469) — unless the sweep runs
+        // the same `maybe_publish` pass the observation paths do.
+        maybe_publish(tx, config, &execution, now_unix_seconds)?;
+        let Some(execution) = tx.execution(&execution.id)? else {
+            return Ok(SweepOutcome::Absent);
+        };
+        if execution.state == ExecutionState::Failed {
+            return Ok(SweepOutcome::TerminalFailure);
+        }
+        // A re-minted check moved the Execution back to `ready` — its
+        // lane now belongs to the new check's evidence, not to this
+        // pass's re-assessment.
+        if execution.state == ExecutionState::Waiting {
+            assess_completion(tx, &execution)?;
+            if tx
+                .execution(&execution.id)?
+                .is_some_and(|e| e.state == ExecutionState::Succeeded)
+            {
+                return Ok(SweepOutcome::Completed);
+            }
         }
     }
     clear_sweep_conflict(tx, execution_id)?;

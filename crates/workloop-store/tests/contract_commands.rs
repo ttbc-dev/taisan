@@ -4303,6 +4303,350 @@ fn sweep_conflict_during_reassessment_is_deferred_not_fatal() {
     );
 }
 
+/// An inconclusive lane assessment fact on the current target — the
+/// verdict that parked the lane forever before the #469 re-drive.
+fn inconclusive_assessment(head: &str) -> ObservationFact {
+    ObservationFact::Assessment {
+        target: target(head),
+        set_digest: "invariants".into(),
+        complete: true,
+        items: vec![AssessmentItem {
+            id: "inv-1".into(),
+            verdict: AssessmentVerdict::Inconclusive,
+            refs: vec![],
+        }],
+    }
+}
+
+/// Record one verification result row exactly as `handoff::verify`
+/// writes them — on an acknowledged artifact handoff, lazily seeded
+/// the first time a result lands for `artifact_id` (the results table
+/// foreign-keys to `artifact_handoffs`). Returns the durable evidence
+/// id the run was given.
+fn record_verification_result(
+    store: &SqliteStore,
+    eid: &ExecutionId,
+    artifact_id: &str,
+    requirement: &str,
+    outcome: VerificationOutcome,
+) -> String {
+    store
+        .transact(|tx| {
+            if tx.artifact_handoff(artifact_id)?.is_none() {
+                let invocations = tx.invocations_for_execution(eid)?;
+                let producing = invocations
+                    .iter()
+                    .find(|i| {
+                        i.required_artifacts
+                            .iter()
+                            .any(|a| format!("{}/{}", i.id.0, a.kind) == artifact_id)
+                    })
+                    .expect("a producing invocation declares the artifact");
+                let work_id = tx.execution(eid)?.expect("the execution exists").work_id;
+                let handoff_seq = tx.alloc_seq()?;
+                tx.apply(&Effect::UpsertHandoff {
+                    handoff: ArtifactHandoff {
+                        artifact_id: artifact_id.into(),
+                        invocation_id: producing.id.clone(),
+                        request_id: producing.request_id.clone(),
+                        work_id,
+                        execution_id: eid.clone(),
+                        base: "base-sha".into(),
+                        produced: Some("produced-commit".into()),
+                        manifest_digest: Some("manifest-digest".into()),
+                        state: HandoffState::Acknowledged,
+                        invalid_reason: None,
+                        attempt: 1,
+                        recorded_seq: handoff_seq,
+                    },
+                    expected_seq: 0,
+                })?;
+            }
+            let id = tx.alloc_id("verify")?;
+            let recorded_seq = tx.alloc_seq()?;
+            tx.apply(&Effect::InsertVerificationResult {
+                result: VerificationResult {
+                    id: id.clone(),
+                    artifact_id: artifact_id.into(),
+                    requirement: requirement.into(),
+                    argv: vec!["verify".into()],
+                    produced: "produced-commit".into(),
+                    environment_digest: "0".repeat(64),
+                    result: outcome,
+                    output: String::new(),
+                    recorded_seq,
+                },
+            })?;
+            Ok(id)
+        })
+        .expect("verification result records")
+}
+
+/// The durable v2 request body for the seeded check Invocation's
+/// request (`<eid>:inv:1`), binding `evidence` as the verification
+/// results that check judged — the fixture equivalent of the bound
+/// request a real v2 dispatch wrote before launch.
+fn bind_check_request_body(
+    store: &SqliteStore,
+    w: &WorkId,
+    eid: &ExecutionId,
+    check_invocation_id: &str,
+    artifact_id: &str,
+    evidence: &[String],
+) {
+    use workloop_core::worker_v2::*;
+    let repository = WireRepository {
+        host: "test-host".into(),
+        repository: "local-repo".into(),
+    };
+    let mut request = WorkerRequestV2 {
+        format_version: WORKER_REQUEST_V2_FORMAT.into(),
+        request_id: format!("{}:inv:1", eid.0),
+        invocation_id: check_invocation_id.into(),
+        request_digest: String::new(),
+        store_id: "store".into(),
+        work_id: w.0.clone(),
+        execution_id: eid.0.clone(),
+        role: InvocationRole::InvariantCheck,
+        repository: repository.clone(),
+        base: RequestBase {
+            repository,
+            object: "0".repeat(40),
+        },
+        spec: SpecRef {
+            revision: 1,
+            digest: "0".repeat(64),
+        },
+        workspace: WorkspaceGrant {
+            workspace_id: format!("ws-{}", w.0),
+            mount: "/workspace".into(),
+            read_only: true,
+        },
+        budget: RequestBudget {
+            deadline_unix_seconds: NOW + 3600,
+            max_runtime_seconds: 1800,
+            max_turns: 200,
+            max_report_bytes: 1_048_576,
+            max_log_bytes: 33_554_432,
+            max_verification_commands: 8,
+            max_continuation_refs: 4,
+        },
+        required_capabilities: RequiredCapabilities {
+            role: InvocationRole::InvariantCheck,
+            protocol_versions: vec![
+                "taisan.worker.request/2".into(),
+                "taisan.worker.report/2".into(),
+            ],
+            capabilities: vec![],
+            resume: "unsupported".into(),
+            verification_egress_hosts: vec![],
+        },
+        continuation: vec![],
+        task: TaskBody::InvariantCheck {
+            artifact: ArtifactRef {
+                artifact_id: artifact_id.into(),
+                manifest_digest: "1".repeat(64),
+                produced: "2".repeat(40),
+            },
+            invariant_set: InvariantSetRef {
+                id: "invariants".into(),
+                revision: 1,
+                digest: "3".repeat(64),
+            },
+            verification_evidence: evidence
+                .iter()
+                .map(|id| VerificationEvidence {
+                    evidence_id: id.clone(),
+                    kind: "verification".into(),
+                    digest: "4".repeat(64),
+                })
+                .collect(),
+        },
+    };
+    request.request_digest = request.digest();
+    apply_effects(
+        store,
+        &[
+            // The request row the body exports for — a real dispatch
+            // wrote it at mint and consumed it at spawn.
+            Effect::InsertRequest {
+                request: InvocationRequest {
+                    request_id: request.request_id.clone(),
+                    work_id: w.clone(),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::InvariantCheck,
+                    spec_revision: 1,
+                    payload: serde_json::json!({}),
+                    adapter_binding: None,
+                },
+            },
+            Effect::MarkRequestConsumed {
+                request_id: request.request_id.clone(),
+            },
+            Effect::InsertWorkerRequestBody {
+                body: workloop_core::worker_v2::WorkerRequestBody {
+                    request_id: request.request_id.clone(),
+                    format_version: WORKER_REQUEST_V2_FORMAT.into(),
+                    canonical_body: request.to_canonical_bytes(),
+                    body_digest: request.digest(),
+                },
+            },
+        ],
+    );
+}
+
+/// #469: an inconclusive lane assessment is not terminal evidence —
+/// when a conclusive `VerificationResult` exists that the satisfied
+/// check's bound request never carried, the timed sweep re-mints the
+/// invariant check so the unjudged evidence gets a re-judged
+/// assessment instead of parking the lane on the stale verdict.
+#[test]
+fn sweep_remints_the_invariant_check_on_unjudged_conclusive_evidence() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("uc1"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "uc1");
+    let artifact = "uc1-coding/artifact.json";
+    // The satisfied check's bound request judged the inconclusive run.
+    let judged = record_verification_result(
+        &store,
+        &e1,
+        artifact,
+        "verification_argv[0]",
+        VerificationOutcome::Inconclusive,
+    );
+    bind_check_request_body(&store, &w, &e1, "uc1-check", artifact, &[judged]);
+    record_unassessed_observation(&store, &w, inconclusive_assessment("sha-1"));
+    // A later verification run converged on a different requirement —
+    // conclusive evidence the bound request never carried.
+    record_verification_result(
+        &store,
+        &e1,
+        artifact,
+        "verification_argv[1]",
+        VerificationOutcome::Pass,
+    );
+
+    let report = sweep(&store, &config(), NOW).unwrap();
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Ready,
+        "the lane re-minted its check for the unjudged evidence: {report:?}"
+    );
+    let pending = store.transact(|tx| tx.pending_requests()).unwrap();
+    assert!(
+        pending
+            .iter()
+            .any(|r| r.execution_id == e1 && r.role == InvocationRole::InvariantCheck),
+        "a new InvariantCheck request is durable: {pending:?}"
+    );
+}
+
+/// The re-drive needs *newer* conclusive evidence: an inconclusive
+/// lane with only its judged results stays waiting — no churn, and a
+/// rerun that is itself still inconclusive never mints either.
+#[test]
+fn the_invariant_lane_does_not_remint_without_newer_conclusive_evidence() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let (w1, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("uc2"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w1, &e1, "uc2");
+    let artifact1 = "uc2-coding/artifact.json";
+    let judged = record_verification_result(
+        &store,
+        &e1,
+        artifact1,
+        "verification_argv[0]",
+        VerificationOutcome::Inconclusive,
+    );
+    bind_check_request_body(&store, &w1, &e1, "uc2-check", artifact1, &[judged]);
+    record_unassessed_observation(&store, &w1, inconclusive_assessment("sha-1"));
+
+    // A newer run that is itself still inconclusive is not conclusive
+    // evidence either.
+    let (w2, e2) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("uc3"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w2, &e2, "uc3");
+    let artifact2 = "uc3-coding/artifact.json";
+    let judged = record_verification_result(
+        &store,
+        &e2,
+        artifact2,
+        "verification_argv[0]",
+        VerificationOutcome::Inconclusive,
+    );
+    bind_check_request_body(&store, &w2, &e2, "uc3-check", artifact2, &[judged]);
+    record_unassessed_observation(&store, &w2, inconclusive_assessment("sha-1"));
+    record_verification_result(
+        &store,
+        &e2,
+        artifact2,
+        "verification_argv[1]",
+        VerificationOutcome::Inconclusive,
+    );
+
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Waiting);
+    assert_eq!(read_execution(&store, &e2).state, ExecutionState::Waiting);
+    assert!(
+        report.completed == 0,
+        "nothing settles on stale or still-inconclusive evidence: {report:?}"
+    );
+    let pending = store.transact(|tx| tx.pending_requests()).unwrap();
+    assert!(
+        pending
+            .iter()
+            .all(|r| r.role != InvocationRole::InvariantCheck),
+        "no check re-minted: {pending:?}"
+    );
+}
+
+/// "Newer" is ordered against the bound set, not just against
+/// membership: an unbound conclusive result recorded BEFORE the newest
+/// bound result is older evidence the request's evidence window
+/// skipped — it must not mint.
+#[test]
+fn an_older_unbound_conclusive_result_does_not_remint() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("uc4"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "uc4");
+    let artifact = "uc4-coding/artifact.json";
+    // Recorded first but never bound — an older run the request's
+    // evidence window skipped.
+    record_verification_result(
+        &store,
+        &e1,
+        artifact,
+        "verification_argv[0]",
+        VerificationOutcome::Pass,
+    );
+    let judged = record_verification_result(
+        &store,
+        &e1,
+        artifact,
+        "verification_argv[1]",
+        VerificationOutcome::Inconclusive,
+    );
+    bind_check_request_body(&store, &w, &e1, "uc4-check", artifact, &[judged]);
+    record_unassessed_observation(&store, &w, inconclusive_assessment("sha-1"));
+
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(
+        read_execution(&store, &e1).state,
+        ExecutionState::Waiting,
+        "an older unbound result is not newer evidence: {report:?}"
+    );
+    let pending = store.transact(|tx| tx.pending_requests()).unwrap();
+    assert!(
+        pending
+            .iter()
+            .all(|r| r.role != InvocationRole::InvariantCheck),
+        "no check re-minted: {pending:?}"
+    );
+}
+
 /// Settlement clears recorded deferrals on EVERY completion path: a
 /// `sweep_conflict` left against a `waiting` Execution must not
 /// survive when ingest assessment settles it. Terminal Executions are

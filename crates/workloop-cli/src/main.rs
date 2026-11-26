@@ -19,7 +19,7 @@ use workloop_config::preflight::{
     ProbeMode, check as preflight_check, init as preflight_init,
 };
 use workloop_config::profile::resolve_paths_from_env;
-use workloop_config::{Installation, load_or_create};
+use workloop_config::{Installation, load_existing, load_or_create};
 use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::identity::{
@@ -2018,6 +2018,46 @@ fn run_check(cli: &Cli, probe: bool) -> i32 {
         // request. The stage runs after (1)–(7), performs no reads and
         // no writes, and the report carries an empty operation log.
         options.probe = ProbeMode::Unavailable;
+    }
+    // The verification boundary paths live on the JSON installation
+    // record beside the store file the `store` stage inspects —
+    // `<state_root>/store.config.json` under the documented layout —
+    // not the profile and not the `--db` flag, which belongs to the
+    // store-backed surface `check` never opens. Read it strictly
+    // read-only — never `load_or_create`, which would publish a fresh
+    // record on first use — so the Paths stage can inspect declared
+    // toolchain/cache paths for the symlink shape the sandbox cannot
+    // mount (#469). An absent record leaves the paths uninspected; a
+    // present-but-foreign record (empty, malformed, or unreadable) is
+    // a config-class failure — the fail-closed preflight never passes
+    // with the declared boundary uninspected.
+    let store_path = options
+        .store_path
+        .clone()
+        .unwrap_or_else(|| paths.state_root.join("store.db"));
+    match load_existing(&store_path.with_extension("config.json")) {
+        Ok(Some(installation)) => {
+            let boundary = match installation.verification_boundary() {
+                Ok(boundary) => boundary,
+                Err(e) => {
+                    return emit(envelope::error_envelope(
+                        None,
+                        envelope::ErrorClass::Config,
+                        &e,
+                    ));
+                }
+            };
+            options.verification_toolchain = boundary.toolchain;
+            options.verification_cache_paths = boundary.cache_paths;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return emit(envelope::error_envelope(
+                None,
+                envelope::ErrorClass::Config,
+                &e,
+            ));
+        }
     }
     let report = preflight_check(&paths.config_path, &mut options);
     if report.success {
