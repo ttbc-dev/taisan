@@ -5079,13 +5079,14 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     // the root needs no copy (copying a file onto
                     // itself truncates it), and a symlinked slot is
                     // never written through — the fact evaluation
-                    // below reports it on its own.
+                    // below reports it on its own. The walk covers
+                    // every component of the workspace-relative path,
+                    // not only the leaf: under a nested declared name
+                    // a symlinked ancestor resolves `dest` outside the
+                    // workspace just as a leaf link does.
                     let dest = workspace.join(name);
-                    let dest_is_symlink = std::fs::symlink_metadata(&dest)
-                        .map(|m| m.file_type().is_symlink())
-                        .unwrap_or(false);
                     if dir != &workspace
-                        && !dest_is_symlink
+                        && !path_has_symlink_component(&workspace, Path::new(name))
                         && std::fs::copy(dir.join(name), &dest).is_err()
                     {
                         continue;
@@ -5391,10 +5392,20 @@ fn find_artifact(workspace: &Path, name: &str) -> Option<PathBuf> {
         workspace.join(".artifact-store"),
     ] {
         let candidate = dir.join(name);
+        let Ok(rel) = candidate.strip_prefix(workspace) else {
+            continue;
+        };
         // symlink_metadata, never metadata: a link's target may live
         // outside the workspace, and a found artifact is promoted —
         // following it would read content the declaration never
-        // named. Only a non-empty regular file counts.
+        // named. The rule covers every component, not only the leaf:
+        // a nested declared path like `out/report.json` resolves
+        // through `out/`, and the store directory itself is a
+        // component — a link planted at either re-roots the candidate
+        // onto host files. Only a non-empty regular file counts.
+        if path_has_symlink_component(workspace, rel) {
+            continue;
+        }
         if std::fs::symlink_metadata(&candidate)
             .map(|m| m.is_file() && m.len() > 0)
             .unwrap_or(false)
@@ -5403,6 +5414,34 @@ fn find_artifact(workspace: &Path, name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Whether any component of the workspace-relative `rel_path` is a
+/// symlink — the leaf itself or any ancestor directory it resolves
+/// through. A leaf-only `symlink_metadata` still follows every
+/// ancestor: under a nested declared path a workspace directory
+/// planted as a link re-roots the path outside the workspace, where a
+/// read picks up host files as evidence and a promotion copy would
+/// write through the link. A component that is missing or not a
+/// directory is a thinner state, not a link — the caller's own leaf
+/// probe reports it.
+fn path_has_symlink_component(root: &Path, rel_path: &Path) -> bool {
+    let mut current = root.to_path_buf();
+    let mut components = rel_path.components().peekable();
+    while let Some(component) = components.next() {
+        current.push(component);
+        let Ok(meta) = std::fs::symlink_metadata(&current) else {
+            return false;
+        };
+        if meta.file_type().is_symlink() {
+            return true;
+        }
+        // Only a real directory can carry the remaining components.
+        if components.peek().is_some() && !meta.is_dir() {
+            return false;
+        }
+    }
+    false
 }
 
 /// Whether the bytes at a required-artifact path are the v2 handoff
@@ -5490,22 +5529,25 @@ fn artifact_fact(
             required.path
         ),
     };
-    // A symlink is never artifact bytes: its target may live outside
-    // the workspace — following it reads content the declaration
-    // never named, and a promotion copy would write through it. A
-    // tracked symlink at the slot is still repository content the
-    // shim never rewrites, so it is the same structural `Unfulfillable`;
-    // an untracked one is a thinner state recovery may replace.
-    let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
-        return ArtifactFact::Missing;
-    };
-    if meta.file_type().is_symlink() {
+    // A symlink anywhere on the workspace-relative path is never
+    // artifact bytes — the leaf itself or an ancestor directory a
+    // nested declared path resolves through: the link's target may
+    // live outside the workspace, so following it reads content the
+    // declaration never named, and a promotion copy would write
+    // through it. A tracked symlink at the slot is still repository
+    // content the shim never rewrites, so it is the same structural
+    // `Unfulfillable`; an untracked one is a thinner state recovery
+    // may replace.
+    if path_has_symlink_component(workspace, Path::new(&declared)) {
         return if tracked {
             unfulfillable()
         } else {
             ArtifactFact::Missing
         };
     }
+    let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
+        return ArtifactFact::Missing;
+    };
     if !meta.is_file() {
         return ArtifactFact::Missing;
     }
@@ -6200,6 +6242,98 @@ mod tests {
             .unwrap();
         std::fs::remove_file(ws.join("artifact.json")).unwrap();
         assert!(find_artifact(&ws, "artifact.json").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A symlinked ancestor resolves outside the workspace exactly
+    /// like a symlinked leaf: under a nested declared path such as
+    /// `out/report.json`, a workspace `out/` planted as a link
+    /// re-roots the slot onto host files — a leaf-only check would
+    /// lstat through the link and read them as evidence. The
+    /// component-wise walk refuses the read on either dispatch rule,
+    /// and the recovery scan never finds or promotes through a link
+    /// at any component — not the declared ancestor, not the leaf,
+    /// not the store directory's own nested ancestor.
+    #[test]
+    fn a_symlinked_ancestor_is_never_read_or_written_through() {
+        let dir = std::env::temp_dir().join(format!(
+            "artifact-ancestor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("report.json"), "host bytes, never evidence").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("out")).unwrap();
+        let invocation = Invocation {
+            id: InvocationId("inv-ancestor".into()),
+            request_id: "req-ancestor".into(),
+            execution_id: ExecutionId("e-ancestor".into()),
+            role: InvocationRole::Coding,
+            state: InvocationState::Done,
+            process_identity: None,
+            required_artifacts: vec![],
+            evidence_refs: vec![],
+            descendants: vec![],
+        };
+        let nested = RequiredArtifact {
+            kind: "report".into(),
+            path: "out/report.json".into(),
+            expected_digest: None,
+        };
+        // `out/` is the link: the whole path refuses under either
+        // dispatch rule even though `outside/report.json` is a
+        // readable regular file.
+        assert!(path_has_symlink_component(
+            &ws,
+            Path::new("out/report.json")
+        ));
+        assert!(matches!(
+            artifact_fact(&ws, &nested, &invocation, true),
+            ArtifactFact::Missing
+        ));
+        assert!(matches!(
+            artifact_fact(&ws, &nested, &invocation, false),
+            ArtifactFact::Missing
+        ));
+        // A leaf link under a real directory refuses identically.
+        std::fs::create_dir_all(ws.join("real")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("report.json"),
+            ws.join("real").join("report.json"),
+        )
+        .unwrap();
+        let leaf_link = RequiredArtifact {
+            path: "real/report.json".into(),
+            ..nested.clone()
+        };
+        assert!(matches!(
+            artifact_fact(&ws, &leaf_link, &invocation, false),
+            ArtifactFact::Missing
+        ));
+        // The recovery scan walks the same components: the workspace
+        // hit through `out/` is never returned, while a real store
+        // copy under a clean nested path is still a promotion
+        // candidate — and a symlinked store-side ancestor is not.
+        let store_out = ws.join(".artifact-store").join("out");
+        std::fs::create_dir_all(&store_out).unwrap();
+        std::fs::write(store_out.join("report.json"), "store copy").unwrap();
+        assert!(!path_has_symlink_component(
+            &ws,
+            Path::new(".artifact-store/out/report.json")
+        ));
+        assert_eq!(
+            find_artifact(&ws, "out/report.json"),
+            Some(ws.join(".artifact-store"))
+        );
+        let linked_store = ws.join(".artifact-store").join("linked");
+        std::os::unix::fs::symlink(&outside, &linked_store).unwrap();
+        assert!(find_artifact(&ws, "linked/report.json").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

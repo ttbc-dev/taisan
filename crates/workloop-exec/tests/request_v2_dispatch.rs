@@ -6548,6 +6548,219 @@ fn a_symlinked_slot_is_never_written_through_by_recovery() {
     );
 }
 
+/// A caller-declared artifact path may nest: `out/report.json` is a
+/// valid declaration the workspace gate normalizes verbatim. A writer
+/// can then plant `out/` as a link to a directory outside the
+/// workspace — every ancestor is still followed by a leaf-only check.
+/// The promotion copy's destination resolves through that link, so
+/// copying the store's bound manifest would create a file on the
+/// host. The component-wise walk refuses the promotion, the outside
+/// directory gains nothing, and no evidence is fabricated: the
+/// Execution stays on the bounded recovery path.
+#[test]
+fn a_symlinked_ancestor_dir_is_never_written_through_by_recovery() {
+    let root = tmp_root("symlink-ancestor-write");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, e, rid) = admit(&store, "v2-symlink-ancestor-write", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "exit-no-artifact", true);
+    sup.consume_requests(&store, NOW).unwrap();
+
+    // Rebind the durable Invocation to the nested declaration — the
+    // same record `required_artifacts` parsing would write for a
+    // caller-supplied `path` object.
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    let expected_state = invocation.state.clone();
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateInvocation {
+                invocation: Invocation {
+                    required_artifacts: vec![RequiredArtifact {
+                        kind: "report".into(),
+                        path: "out/report.json".into(),
+                        expected_digest: None,
+                    }],
+                    ..invocation.clone()
+                },
+                expected_state,
+            })
+        })
+        .unwrap();
+
+    // `out/` is a symlink to an empty directory outside the workspace,
+    // while the runtime store holds this invocation's bound manifest
+    // under the same nested name — the promotion copy's destination
+    // must never follow the ancestor link.
+    let ws = sup.workspace_of(&w);
+    let outside = root.join("outside-workspace");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, ws.join("out")).unwrap();
+    let store_dir = ws.join(".artifact-store").join("out");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    std::fs::write(
+        store_dir.join("report.json"),
+        serde_json::json!({
+            "format_version": "taisan.worker.artifact/1",
+            "worker": "taisan-worker-claude",
+            "request_id": rid,
+            "invocation_id": invocation.id.0,
+            "status": "success",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    drive_to_done(&sup, &store, &rid);
+    for _ in 0..20 {
+        if execution(&store, &e).recovery_attempts_used > 0 {
+            break;
+        }
+        sup.run_once(&store, NOW).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        !outside.join("report.json").exists(),
+        "the promotion copy never creates a file through the link"
+    );
+    assert!(
+        ws.join("out").is_symlink(),
+        "the ancestor link is never replaced by a real directory"
+    );
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "a refused promotion reports no fabricated evidence: {exec:?}"
+    );
+    assert!(
+        !store
+            .transact(|tx| tx.observations_for_execution(&e))
+            .unwrap()
+            .iter()
+            .any(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::Artifact {
+                        state: ArtifactFact::Present { .. },
+                        ..
+                    }
+                )
+            }),
+        "no Present fact was ever recorded through the link"
+    );
+}
+
+/// The mirror image on the read path: `out/` is a link to a host
+/// directory that holds a readable `report.json` — even one carrying
+/// this invocation's bound manifest. A leaf-only check would lstat
+/// through the link and report the outside file as `Present`
+/// evidence; the component-wise walk refuses the path instead, the
+/// slot records `missing`, and the Execution stays on bounded
+/// recovery. The outside file is never read and never touched.
+#[test]
+fn a_symlinked_ancestor_dir_is_never_read_through_as_evidence() {
+    let root = tmp_root("symlink-ancestor-read");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, e, rid) = admit(&store, "v2-symlink-ancestor-read", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "exit-no-artifact", true);
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    let expected_state = invocation.state.clone();
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateInvocation {
+                invocation: Invocation {
+                    required_artifacts: vec![RequiredArtifact {
+                        kind: "report".into(),
+                        path: "out/report.json".into(),
+                        expected_digest: None,
+                    }],
+                    ..invocation.clone()
+                },
+                expected_state,
+            })
+        })
+        .unwrap();
+
+    // The strongest case: the outside file is this invocation's own
+    // bound manifest — following the link would read it as `Present`.
+    let ws = sup.workspace_of(&w);
+    let outside = root.join("outside-workspace");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(
+        outside.join("report.json"),
+        serde_json::json!({
+            "format_version": "taisan.worker.artifact/1",
+            "worker": "taisan-worker-claude",
+            "request_id": rid,
+            "invocation_id": invocation.id.0,
+            "status": "success",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let outside_bytes = std::fs::read(outside.join("report.json")).unwrap();
+    std::os::unix::fs::symlink(&outside, ws.join("out")).unwrap();
+    drive_to_done(&sup, &store, &rid);
+    for _ in 0..20 {
+        if execution(&store, &e).recovery_attempts_used > 0 {
+            break;
+        }
+        sup.run_once(&store, NOW).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert_eq!(
+        std::fs::read(outside.join("report.json")).unwrap(),
+        outside_bytes,
+        "the outside file is never touched"
+    );
+    assert!(
+        ws.join("out").is_symlink(),
+        "the ancestor link is never replaced"
+    );
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "a refused read reports no fabricated evidence: {exec:?}"
+    );
+    let observations = store
+        .transact(|tx| tx.observations_for_execution(&e))
+        .unwrap();
+    assert!(
+        !observations.iter().any(|o| {
+            matches!(
+                &o.fact,
+                ObservationFact::Artifact {
+                    state: ArtifactFact::Present { .. },
+                    ..
+                }
+            )
+        }),
+        "the outside file was never reported as evidence"
+    );
+    assert!(
+        observations.iter().any(|o| {
+            matches!(
+                &o.fact,
+                ObservationFact::Artifact {
+                    required_artifact,
+                    state: ArtifactFact::Missing,
+                    ..
+                } if required_artifact.as_str() == "report"
+            )
+        }),
+        "the linked slot records missing, like a failed write"
+    );
+}
+
 /// Insert a resolved writer bound to `request_id` requiring the
 /// workspace-root `artifact.json` — the durable shape the artifact
 /// gates read when they pick the producing Invocation.
