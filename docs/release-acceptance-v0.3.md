@@ -50,7 +50,11 @@ history additionally carries the post-pin repairs `#466` (PR #467),
 themselves (PRs #472–#476); the §4 baseline re-run on the pinned
 SHA is recorded in
 [release-notes-v0.3.md](release-notes-v0.3.md)'s Verification
-record. Its history contains
+record. `5f134b96` is the **verified-code** SHA: the release tag
+lands on the docs-finalized descendant — the merge commit that
+lands this record — whose tree must diff against `5f134b96` in
+release documentation only (freeze checklist §5.2 checks this
+before tagging). Its history contains
 every change the acceptance evidence depends on:
 
 | Content | Merge | What it carries |

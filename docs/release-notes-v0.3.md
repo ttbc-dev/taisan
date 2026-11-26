@@ -14,11 +14,18 @@ never silently extends the candidate, so the record and the §4
 gates were re-established on the new SHA.
 No tag exists yet — the tag, the cargo-dist artifacts, and the
 repository visibility flip are the remaining release acts (freeze
-checklist §5–§6). One structural note on reading the tag: the
-pinned tree necessarily carries this file's *pre-freeze draft*
-(a commit cannot contain the record of its own pin), so tagging
-`5f134b96` ships the draft copy — this finalized text lives on
-`main` after the freeze-record merge and is the version of record.
+checklist §5–§6). The tag does **not** point at `5f134b96`
+directly: `5f134b96` is the *verified-code* SHA (gates and
+sentinel evidence below), and the tag lands on the commit that
+folds this finalized record into `main` — the merge commit of the
+freeze-record PR (#478). That commit's tree differs from
+`5f134b96` only in release documentation; the freeze checklist
+§5.2 verifies the diff is docs-only before tagging (and offers a
+gate re-run on the tag SHA for an exact-match policy). Tagging
+the bare `5f134b96` would instead ship this file's pre-freeze
+draft — "candidate unconfirmed, #398/#399 unmerged" — inside the
+release source snapshot, which is the inconsistency this split
+avoids.
 The upstream evidence these notes
 depended on is now in hand: the #270 manual real-Worker acceptance
 (runs 1–6, owner-approved at comment `7171973494`), the #271
@@ -210,6 +217,12 @@ git log -1 --format='%H%n%ad%n%s' --date=iso-strict origin/main
 2026-11-26T22:16:25+09:00
 Merge pull request #479 from ttbc-dev/issue-398-399-fix
 ```
+
+`5f134b96` is the verified-code SHA these gates ran against. The
+release tag targets the docs-finalized merge commit that lands
+the freeze record (PR #478) — the freeze checklist §5.2 verifies
+the tag tree diffs against `5f134b96` in release documentation
+only before tagging.
 
 | Gate | Result |
 | --- | --- |

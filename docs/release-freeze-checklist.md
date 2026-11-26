@@ -132,11 +132,33 @@ Per [release-versioning.md](release-versioning.md) §4:
 
 ### 5.2 Tag
 
+The recorded SHA (`5f134b96`) is the **verified-code** SHA — the
+commit the §4 gates and sentinel evidence ran against. The tag
+points at the **docs-finalized** descendant: the merge commit that
+lands the freeze record (PR #478) on `main`. Tagging the bare
+code SHA would ship the pre-freeze drafts inside the release
+snapshot; the two must not be conflated (a commit cannot record
+its own pin, but it can carry the finalized documents).
+
 ```text
-git tag -a v<version> <recorded-sha>   # annotated; message cites
-                                       # the candidate, the acceptance
-                                       # record §1, and the milestone
-git rev-list -n 1 v<version>           # must equal <recorded-sha>
+# 1. After the freeze-record PR merges, name the tag target —
+#    the merge commit that lands the record (PR #478), not
+#    "latest main" (another PR may merge in between):
+TAG_SHA=$(gh pr view 478 --repo ttbc-dev/taisan \
+          --json mergeCommit --jq .mergeCommit.oid)
+# 2. Verify the tag tree differs from the verified code SHA in
+#    release docs only — this check MUST print nothing:
+git diff 5f134b96 "$TAG_SHA" -- \
+  crates/ Cargo.toml Cargo.lock .github/ scripts/
+#    (if it prints anything, stop: the tag is not the release
+#     candidate — a code change slipped in; re-run §3/§4 instead)
+# 3. Optional exact-match policy: re-run §4 on $TAG_SHA itself.
+#    With step 2 empty, code identity makes this redundant.
+git tag -a v<version> "$TAG_SHA"     # annotated; message cites
+                                     # the verified-code SHA
+                                     # 5f134b96, the acceptance
+                                     # record §1, and the milestone
+git rev-list -n 1 v<version>         # must equal $TAG_SHA
 ```
 
 ### 5.3 Distribution artifacts (workflow owned by #441)

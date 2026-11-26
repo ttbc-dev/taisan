@@ -164,8 +164,8 @@ version that has no candidate behind it.
 ## 5. Changelog generation policy
 
 The release notes ([release-notes-v0.3.md](release-notes-v0.3.md)) are
-the public-facing changelog for the release (0.3.0 as proposed,
-pending the §7 decision). Proposed policy:
+the public-facing changelog for the release (0.3.0, decided in §7 —
+the "proposed" phrasing here predates the decision). Proposed policy:
 
 - **Source of truth is the tracker plus merged history**: the notes
   are compiled from milestone-#8 issue titles/states and the merge
@@ -229,4 +229,4 @@ binaries**, not as a registry package.
 | Publication route | in-place, history kept | **decided** — #438 ruling ([release audit](release-audit.md) §7) |
 | Distribution route | cargo-dist → GitHub Releases + Homebrew tap + cargo-binstall; no crates.io | **decided** — #370 comment, 2026-11-25 (§6); workflow is #441's lane |
 | Crate version alignment | workspace `0.3.0` inheritance (proposed) / leave `0.0.0` | **applied** — PR #477 applies the workspace `0.3.0` inheritance, following the owner's version choice |
-| Tag creation | annotated `v<version>` on the recorded candidate | procedure only; no tag exists |
+| Tag creation | annotated `v<version>` on the recorded candidate | procedure only; no tag exists. Tag target = the merge commit landing the freeze record (PR #478) — `5f134b96` stays the verified-code SHA; the tag SHA's code diff against it must be empty (freeze checklist §5.2) |
