@@ -1524,6 +1524,107 @@ fn a_replay_does_not_consume_the_only_free_pending_slot() {
     );
 }
 
+/// A replay trailing a capacity refusal is still resolved from the
+/// ledger, never recorded `capacity_deferred`: that status promises no
+/// saved decision exists under the replay key, so a saved replay must
+/// not be mislabeled (and left unlinked) just because it sorted behind
+/// a fresh proposal the full queue refused.
+#[test]
+fn a_replay_after_a_capacity_refusal_is_still_resolved() {
+    let dir = tmp_root("replay-after-capacity");
+    let store = SqliteStore::in_memory(4).unwrap();
+    set_intake_settings(&store, settings("rev-1", 1), None).unwrap();
+
+    // Seed the replay's saved decision with one accepted Work, then
+    // settle it so the queue has its single position free again.
+    let replayed = proposal("issue-1", "first work");
+    let first_capture = dir.join("first-request.json");
+    let first_script = adapter_script(
+        &dir,
+        "first.sh",
+        &success_template(std::slice::from_ref(&replayed)),
+        &first_capture,
+    );
+    let mut f = fixture(dir.clone(), first_script);
+    f.store = store;
+    let first = run(&f, Duration::from_secs(10));
+    assert_eq!(first.candidates[0].status, IntakeCandidateStatus::Accepted);
+    let replay_work = first.candidates[0].work_id.clone().unwrap();
+    let executions = f
+        .store
+        .transact_deferred(|tx| tx.executions_for_work(&replay_work))
+        .unwrap();
+    force_execution(&f.store, &executions[0].id, ExecutionState::Succeeded);
+    release_claims(&f.store, &replay_work);
+
+    // A second saved identity under the same binding inflates the ask
+    // to three without being returned, so the response may carry two
+    // fresh proposals and the replay with only one free position.
+    let saved = handle_command(
+        &f.store,
+        &config(false),
+        &CommandRequest {
+            actor: f.actor.clone(),
+            origin: Origin("selector".into()),
+            idempotency_key: "proposal/test-sel:saved-extra".into(),
+            body: CommandBody::Submit {
+                intent: "saved decision".into(),
+                sources: vec![SourceSnapshot {
+                    issue: issue("cap-seed"),
+                    source_revision: "rev-0".into(),
+                    content_digest: "digest-0".into(),
+                }],
+                constraints: vec![],
+                verification_argv: vec![],
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    assert!(matches!(saved, CommandDecision::Rejected { .. }));
+
+    let fresh_a = proposal("issue-2", "second work");
+    let fresh_b = proposal("issue-3", "third work");
+    let capture = dir.join("request.json");
+    let script = adapter_script(
+        &dir,
+        "sel.sh",
+        &success_template(&[fresh_a, fresh_b, replayed]),
+        &capture,
+    );
+    f.binding.argv = vec!["/bin/sh".into(), script];
+
+    let report = run(&f, Duration::from_secs(10));
+    assert_eq!(report.state, IntakeRunState::Completed);
+    // One free position plus two known replay identities, under the
+    // protocol bound.
+    assert_eq!(captured_request(&capture)["max_candidates"], 3);
+    assert_eq!(
+        report.candidates[0].status,
+        IntakeCandidateStatus::Accepted,
+        "{:?}",
+        report.candidates[0]
+    );
+    assert_eq!(
+        report.candidates[1].status,
+        IntakeCandidateStatus::CapacityDeferred,
+        "the second fresh proposal exhausts the queue: {:?}",
+        report.candidates[1]
+    );
+    let replay = &report.candidates[2];
+    assert_eq!(
+        replay.status,
+        IntakeCandidateStatus::Replayed,
+        "a saved replay is not deferred: {replay:?}"
+    );
+    assert_eq!(replay.work_id.as_ref(), Some(&replay_work));
+    assert!(
+        replay.command_id.is_some(),
+        "the resolved replay links its saved decision"
+    );
+    assert_eq!(works_count(&f.store), 2);
+}
+
 /// Only saved decision identities for *this* selector and actor may
 /// inflate the ask: another selector's key, or the same selector's
 /// key under another actor, is not a replay this run can present.

@@ -431,17 +431,15 @@ fn complete_intake(
     let mut defer_rest = false;
     for (index, proposal) in outcome.iter().enumerate() {
         if defer_rest {
-            if !mark_candidate(
-                store,
-                run_id,
-                index as u32,
-                IntakeCandidateStatus::CapacityDeferred,
-                Some("capacity_exhausted".into()),
-                None,
-                None,
-                None,
-            )? {
-                break;
+            // Capacity is exhausted for fresh work, but a candidate
+            // whose decision is already saved is still a replay: the
+            // ledger is authoritative and it holds no new pending
+            // position. Resolve it rather than mislabeling it
+            // `capacity_deferred`, which the contract reserves for a
+            // candidate with no saved decision under its replay key.
+            match resolve_or_defer(store, params, run_id, index as u32, proposal)? {
+                AdmitStep::Continue | AdmitStep::Deferred => {}
+                AdmitStep::Halted => break,
             }
             continue;
         }
@@ -754,6 +752,55 @@ fn admit_one(
             );
             Ok(AdmitStep::Halted)
         }
+    }
+}
+
+/// Resolve the unattempted remainder behind a capacity refusal
+/// without submitting. A candidate with a saved decision under its
+/// replay identity is still `replayed` — the ledger is authoritative
+/// and it holds no new pending position — while every other candidate
+/// is `capacity_deferred`, documenting that no decision exists under
+/// its key so a later run decides it fresh. Marking a saved replay
+/// `capacity_deferred` would promise the ledger holds nothing for it,
+/// so replays must never be deferred blindly just because they trail
+/// a fresh proposal that exhausted capacity.
+fn resolve_or_defer(
+    store: &SqliteStore,
+    params: &IntakeParams<'_>,
+    run_id: &str,
+    ordinal: u32,
+    proposal: &Proposal,
+) -> Result<AdmitStep, IntakeError> {
+    let command = admission::submit_command(proposal, params.actor.clone());
+    let digest = payload_digest(
+        &command.origin,
+        &command.actor,
+        &command.idempotency_key,
+        &command.body,
+    );
+    let prior = store.transact_deferred(|tx| {
+        tx.stored_decision(&command.origin, &command.actor, &command.idempotency_key)
+    })?;
+    if let Some((stored_digest, decision)) = prior
+        && stored_digest == digest
+    {
+        return match resolve_decided(store, run_id, ordinal, &decision, true)? {
+            true => Ok(AdmitStep::Continue),
+            false => Ok(AdmitStep::Halted),
+        };
+    }
+    match mark_candidate(
+        store,
+        run_id,
+        ordinal,
+        IntakeCandidateStatus::CapacityDeferred,
+        Some("capacity_exhausted".into()),
+        None,
+        None,
+        None,
+    )? {
+        true => Ok(AdmitStep::Deferred),
+        false => Ok(AdmitStep::Halted),
     }
 }
 
