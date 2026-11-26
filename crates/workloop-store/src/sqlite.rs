@@ -10,8 +10,8 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `15` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1` through `14`
+//! `PRAGMA user_version` is the format gate: `16` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1` through `15`
 //! must carry the complete recognized schema of its version and
 //! upgrades additively at open; a stamped file whose schema is foreign
 //! or incomplete, an unversioned database with user tables (a slice-0
@@ -53,9 +53,11 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// `14` adds the `executor_bindings` / `executor_operations` durable
 /// remote-binding tables (`docs/executor-transport-contract.md`, #375);
 /// `15` adds the `executor_collections` durable remote-collection
-/// record (`docs/executor-transport-contract.md` §6, #376).
+/// record (`docs/executor-transport-contract.md` §6, #376);
+/// `16` adds the usage row's per-pair `merge_check_services` cursor,
+/// which replaces the merge-check service record's observation rows.
 /// Older files upgrade additively at open.
-pub(crate) const FORMAT_VERSION: i64 = 15;
+pub(crate) const FORMAT_VERSION: i64 = 16;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -360,8 +362,9 @@ impl SqliteStore {
             // v9 additions (v6 and v7 each add a column, not a table),
             // and a v8 file everything except the v9 addition, a
             // v9–v13 file everything except the v13 and v14
-            // additions, and a v14 file everything except v15's
-            // collection table. A
+            // additions, a v14 file everything except v15's
+            // collection table, and a v15 file everything (v16 adds
+            // a column, not a table). A
             // foreign or
             // truncated stamped file fails this check untouched, and
             // the accepted difference is a previous release's store: it
@@ -444,7 +447,7 @@ impl SqliteStore {
                     .iter()
                     .filter(|t| !V13_ADDED_TABLES.contains(t) && !V14_ADDED_TABLES.contains(t))
                     .all(|t| present.contains(*t))
-            } else {
+            } else if version < 15 {
                 // A v14 file holds every table the v13 → v14
                 // migration installed; only the v15 addition may be
                 // absent.
@@ -452,6 +455,10 @@ impl SqliteStore {
                     .iter()
                     .filter(|t| !V14_ADDED_TABLES.contains(t))
                     .all(|t| present.contains(*t))
+            } else {
+                // A v15 file holds every table; v16 adds a column,
+                // not a table.
+                EXPECTED_TABLES.iter().all(|t| present.contains(*t))
             };
             if !required_complete {
                 return Err(StoreError::UnsupportedFormat {
@@ -465,7 +472,8 @@ impl SqliteStore {
             // invocation_requests.adapter_binding,
             // work_usage.last_progress_basis,
             // recovery_intents.retirement_generation,
-            // finding_occurrences.summary, and the pin-ledger
+            // finding_occurrences.summary,
+            // work_usage.merge_check_services, and the pin-ledger
             // reconstruction. A crash leaves the old stamp and the
             // migration reruns idempotently (CREATE IF NOT EXISTS; each
             // column check guards a partial ALTER; the ledger insert is
@@ -558,6 +566,18 @@ impl SqliteStore {
                 .map_err(internal)?;
             if !has_occurrence_summary {
                 tx.execute_batch("ALTER TABLE finding_occurrences ADD COLUMN summary TEXT")
+                    .map_err(internal)?;
+            }
+            let has_merge_check_services: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('work_usage') \
+                     WHERE name='merge_check_services')",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(internal)?;
+            if !has_merge_check_services {
+                tx.execute_batch("ALTER TABLE work_usage ADD COLUMN merge_check_services TEXT")
                     .map_err(internal)?;
             }
             // A pre-ledger store recorded protection as the bare
@@ -1455,13 +1475,20 @@ fn usage_from_row(row: &rusqlite::Row<'_>) -> Result<WorkUsage, rusqlite::Error>
         last_progress_basis: row
             .get::<_, Option<String>>(9)?
             .and_then(|s| MaterialProgressBasis::parse(&s)),
+        // NULL on rows migrated from a pre-cursor store — the pair then
+        // sorts least-recently-serviced until its first service lands.
+        merge_check_services: row
+            .get::<_, Option<String>>(10)?
+            .map(|s| de_row(&s))
+            .transpose()?
+            .unwrap_or_default(),
     })
 }
 
 const USAGE_COLS: &str = "work_id, fix_invocations_used, transport_retries_used, \
     equivalent_failure_streak, equivalent_signature, automatic_seconds_used, \
     first_dispatch_unix_seconds, last_progress_unix_seconds, \
-    human_wait_seconds_total, last_progress_basis";
+    human_wait_seconds_total, last_progress_basis, merge_check_services";
 
 fn write_execution(tx: &Tx<'_>, e: &Execution) -> Result<(), StoreError> {
     tx.exec(
@@ -2687,6 +2714,33 @@ impl TxView for Tx<'_> {
         Ok(self.tx.last_insert_rowid())
     }
 
+    fn next_counter(&mut self, name: &str) -> Result<i64, StoreError> {
+        self.exec(
+            "INSERT INTO id_counters (prefix, next) VALUES (?1, 1) \
+             ON CONFLICT(prefix) DO UPDATE SET next = next + 1",
+            params![name],
+        )?;
+        self.tx
+            .query_row(
+                "SELECT next FROM id_counters WHERE prefix=?1",
+                params![name],
+                |r| r.get(0),
+            )
+            .map_err(map_err)
+    }
+
+    fn write_merge_check_services(
+        &mut self,
+        work_id: &WorkId,
+        services: &[MergeCheckService],
+    ) -> Result<(), StoreError> {
+        self.exec(
+            "UPDATE work_usage SET merge_check_services=?2 WHERE work_id=?1",
+            params![work_id.0, json(&services.to_vec())?],
+        )?;
+        Ok(())
+    }
+
     fn alloc_id(&mut self, prefix: &str) -> Result<String, StoreError> {
         self.exec(
             "INSERT INTO id_counters (prefix, next) VALUES (?1, 1) \
@@ -2763,8 +2817,9 @@ impl TxView for Tx<'_> {
                      transport_retries_used, equivalent_failure_streak, \
                      equivalent_signature, automatic_seconds_used, \
                      first_dispatch_unix_seconds, last_progress_unix_seconds, \
-                     human_wait_seconds_total, last_progress_basis) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                     human_wait_seconds_total, last_progress_basis, \
+                     merge_check_services) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                     params![
                         usage.work_id.0,
                         usage.fix_invocations_used,
@@ -2776,6 +2831,7 @@ impl TxView for Tx<'_> {
                         usage.last_progress_unix_seconds,
                         usage.human_wait_seconds_total,
                         usage.last_progress_basis.map(|b| b.as_str()),
+                        json(&usage.merge_check_services)?,
                     ],
                 )?;
             }
@@ -3567,7 +3623,8 @@ impl TxView for Tx<'_> {
                      equivalent_signature=?5, automatic_seconds_used=?6, \
                      first_dispatch_unix_seconds=?7, \
                      last_progress_unix_seconds=?8, \
-                     human_wait_seconds_total=?9, last_progress_basis=?10 \
+                     human_wait_seconds_total=?9, last_progress_basis=?10, \
+                     merge_check_services=?11 \
                      WHERE work_id=?1",
                     params![
                         usage.work_id.0,
@@ -3580,6 +3637,7 @@ impl TxView for Tx<'_> {
                         usage.last_progress_unix_seconds,
                         usage.human_wait_seconds_total,
                         usage.last_progress_basis.map(|b| b.as_str()),
+                        json(&usage.merge_check_services)?,
                     ],
                 )?;
             }

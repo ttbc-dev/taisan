@@ -10,10 +10,14 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use workloop_core::domain::{ExecutionId, WorkId};
+use workloop_core::domain::{ExecutionId, WorkId, new_id};
 use workloop_core::identity::{
     ChangeRequestId, ChangeRequestRef, CommitRevision, CredentialRef, DiffTarget, HostActorRef,
     IssueRef, RepositoryRef, SourceSnapshot,
+};
+use workloop_core::mergeability::{
+    MAX_CONFLICT_RECHECKS_PER_PASS, MAX_MERGE_CHECKS_PER_PASS, MAX_MERGE_RECHECKS_PER_PASS,
+    MergeabilityState, bound_conflict_paths,
 };
 use workloop_core::observation::{
     BranchState, Completeness, DeliveryId, DeliveryScope, HostActionStatus, IssueState,
@@ -204,6 +208,11 @@ pub struct FixtureGithub {
     /// `change_request_id` → the remote's stored title/body: what a
     /// metadata update wrote and a fresh read returns.
     change_meta: BTreeMap<String, (Option<String>, Option<String>)>,
+    /// Change ids the remote reports merged.
+    merged_changes: std::collections::BTreeSet<String>,
+    /// `change_request_id` → the mergeability verdict the remote reports
+    /// for that change's current head against its base.
+    change_mergeability: BTreeMap<String, (MergeabilityState, Vec<String>)>,
     /// `action name` → failure reason: test-injected execution faults.
     /// A matching attempt consumes the entry — one-shot per arming.
     forced_failures: BTreeMap<String, String>,
@@ -385,6 +394,19 @@ pub struct SourceRefreshReport {
     pub unchanged: usize,
     pub ingested: usize,
     pub deferred: Vec<String>,
+    /// Sibling changes re-checked because a managed merge was recorded
+    /// in this pass.
+    pub merge_rechecks: usize,
+    /// Sibling changes observed conflicted against the new base.
+    pub sibling_conflicts: usize,
+    /// Merge-detection checks issued this pass for recorded changes
+    /// that have no recorded merge — bounded by
+    /// `MAX_MERGE_CHECKS_PER_PASS` over the whole pass. On the
+    /// production adapter a check is also how an unrecorded merge is
+    /// discovered, so a detection whose read returns merged counts
+    /// here too; the fixture learns merges from its declared state,
+    /// so only checks of unmerged changes appear in this count.
+    pub merge_detections: usize,
     /// Every issue source whose authoritative read completed this
     /// pass, whether or not the recorded observation changed — the
     /// retained body must exist even when the gate already matched.
@@ -812,6 +834,43 @@ impl FixtureGithub {
     /// metadata receipt reports.
     fn change_fields(&self, change_id: &str) -> (Option<String>, Option<String>) {
         self.change_meta.get(change_id).cloned().unwrap_or_default()
+    }
+
+    /// Test control: mark a change merged on the remote.
+    pub fn set_merged(&mut self, change: &ChangeRequestRef) {
+        self.merged_changes
+            .insert(change.change_request.as_str().to_string());
+        self.bump_change(change.change_request.as_str());
+    }
+
+    /// Alias for [`Self::set_merged`].
+    pub fn mark_merged(&mut self, change: &ChangeRequestRef) {
+        self.set_merged(change);
+    }
+
+    /// Alias for [`Self::set_change_mergeability`].
+    pub fn set_mergeability(
+        &mut self,
+        change: &ChangeRequestRef,
+        state: MergeabilityState,
+        paths: &[&str],
+    ) {
+        self.set_change_mergeability(change, state, paths);
+    }
+
+    /// Test control: the mergeability verdict the remote reports for a
+    /// change's current head against its base.
+    pub fn set_change_mergeability(
+        &mut self,
+        change: &ChangeRequestRef,
+        state: MergeabilityState,
+        paths: &[&str],
+    ) {
+        self.change_mergeability.insert(
+            change.change_request.as_str().to_string(),
+            (state, paths.iter().map(|p| (*p).to_string()).collect()),
+        );
+        self.bump_change(change.change_request.as_str());
     }
 
     /// Test control: the remote's record of a repository's
@@ -2178,6 +2237,15 @@ impl FixtureGithub {
                 }
             }
         }
+        // A Work whose change head was already observed is managed even
+        // if its opening intent has aged out of the retained outbox:
+        // record the pair so merge detection and sibling re-checks still
+        // see it.
+        for (work_id, change) in recorded_change_pairs(store, scope)? {
+            owners
+                .entry(change.change_request.as_str().to_string())
+                .or_insert((work_id, change));
+        }
         for (change_id, head) in &self.changes {
             let Some((work_id, change)) = owners.get(change_id) else {
                 continue;
@@ -2218,6 +2286,346 @@ impl FixtureGithub {
                 now,
             )?;
             report.ingested += 1;
+        }
+        // A recorded managed merge re-checks the remaining open managed
+        // changes on the same target. Every historical merge on one
+        // branch re-reads the same fresh base and the same open
+        // siblings, so the scan is collapsed to one per target per pass
+        // and bounded over the whole pass. The stable observation
+        // identity makes a steady conflicted pair one trigger, not one
+        // per pass.
+        let mut scanned_targets: BTreeMap<String, CommitRevision> = BTreeMap::new();
+        let mut merge_scans = 0usize;
+        // The sibling budget is pass-wide, not per merge: accumulated
+        // merge history cannot multiply the remote verdict reads.
+        let mut rechecked = 0usize;
+        let check_epoch = new_id("merge-check");
+        // The same bound the production adapter applies to merge
+        // detection and merge scans: merged and unmerged recorded
+        // changes share one least-recently-serviced ordering — a
+        // consumed detection read and a consumed scan slot both stamp
+        // the same durable service cursor, so the deferred tail
+        // is reached on a later pass instead of the same leading set
+        // re-scanning or re-reading every pass. Scans and detection
+        // reads interleave in key order the way the production
+        // candidate list does, so a mid-pass deadline defers the same
+        // tail; the service sequence breaks the same-second tie so
+        // the rotation keeps moving once every pair is serviced.
+        let mut merge_services: Vec<((i64, i64), WorkId, ChangeRequestRef, bool)> = Vec::new();
+        for (owner_work, change) in owners.values() {
+            let change_id = change.change_request.as_str();
+            let checked =
+                latest_recorded_merge_check(store, owner_work, change)?.unwrap_or((i64::MIN, 0));
+            merge_services.push((
+                checked,
+                owner_work.clone(),
+                change.clone(),
+                self.merged_changes.contains(change_id),
+            ));
+        }
+        merge_services.sort_by_key(|(checked, ..)| *checked);
+        let mut detections = 0usize;
+        for (_, owner_work, change, merged) in merge_services {
+            let change_id = change.change_request.as_str();
+            if !merged {
+                // The bounded merge-detection mirror: the check runs in
+                // the shared key order, and the durable record it leaves
+                // is the ordering key the next pass reads.
+                if let Some(d) = deadline
+                    && clock() >= d
+                {
+                    report.deferred.push(format!("merge-check:{change_id}"));
+                    continue;
+                }
+                if detections >= MAX_MERGE_CHECKS_PER_PASS {
+                    report.deferred.push(format!("merge-check:{change_id}"));
+                    continue;
+                }
+                detections += 1;
+                report.merge_detections += 1;
+                // The same fallback the production adapter applies: a head
+                // that cannot build a revision still consumed the check,
+                // so the ordering record binds the last recorded head —
+                // only a pair with no usable head at all records nothing.
+                let reported = self.changes.get(change_id).and_then(|object| {
+                    CommitRevision::new(change.repository.clone(), object.clone()).ok()
+                });
+                let head = match reported {
+                    Some(head) => Some(head),
+                    None => latest_recorded_head(store, &owner_work, &change)?.and_then(|object| {
+                        CommitRevision::new(change.repository.clone(), object).ok()
+                    }),
+                };
+                let Some(head) = head else { continue };
+                self.emit(
+                    store,
+                    config,
+                    Observation {
+                        delivery: Some(DeliveryId {
+                            scope: DeliveryScope::Host {
+                                host: change.repository.host.clone(),
+                            },
+                            source: "fixture.merge".into(),
+                            event_id: format!(
+                                "merge-check:{}:{}@{}#{check_epoch}",
+                                owner_work.0, change_id, head.object
+                            ),
+                        }),
+                        subject_work_id: Some(owner_work.clone()),
+                        subject_execution_id: None,
+                        fact: ObservationFact::MergeCheck {
+                            change: change.clone(),
+                            head: head.clone(),
+                        },
+                        observed_unix_seconds: now,
+                    },
+                    now,
+                )?;
+                continue;
+            }
+            // A recorded managed merge re-reads the fresh target base and
+            // the open siblings on it; the recorded merge itself is the
+            // fallback for a head or base the fixture no longer serves,
+            // mirroring the production base-hint fallback.
+            let recorded = latest_recorded_merge(store, &owner_work, &change)?;
+            let target_branch = recorded
+                .as_ref()
+                .map(|(.., target)| target.clone())
+                .or_else(|| {
+                    self.change_sources
+                        .get(change_id)
+                        .map(|(_, target)| target.clone())
+                })
+                .unwrap_or_else(|| "main".to_string());
+            if scanned_targets.contains_key(&target_branch) {
+                // This pass already scanned the target; another merge on
+                // the same branch adds no new base or sibling set.
+                continue;
+            }
+            if let Some(d) = deadline
+                && clock() >= d
+            {
+                report.deferred.push(format!("merge:{change_id}"));
+                continue;
+            }
+            if merge_scans >= MAX_MERGE_RECHECKS_PER_PASS {
+                report.deferred.push(format!("merge:{change_id}"));
+                continue;
+            }
+            let Some(head_object) = recorded
+                .as_ref()
+                .map(|(head, ..)| head.object.clone())
+                .or_else(|| self.changes.get(change_id).cloned())
+            else {
+                continue;
+            };
+            let Some(base_object) = self
+                .branches
+                .get(&(change.repository.to_string(), target_branch.clone()))
+                .cloned()
+                .or_else(|| recorded.as_ref().map(|(_, base, _)| base.object.clone()))
+            else {
+                continue;
+            };
+            let Ok(head) = CommitRevision::new(change.repository.clone(), head_object) else {
+                continue;
+            };
+            let Ok(base) = CommitRevision::new(change.repository.clone(), base_object) else {
+                continue;
+            };
+            // The same rule the production adapter now applies: only a
+            // merge not yet recorded mints evidence. A recorded merge's
+            // base is the durable proof — re-emitting it with this
+            // pass's fresh base would re-stamp the history — but the
+            // fresh base still drives the sibling scan below.
+            if recorded.is_none() {
+                let execution_id = store.transact(|tx| {
+                    Ok(tx
+                        .executions_for_work(&owner_work)?
+                        .into_iter()
+                        .max_by_key(|e| e.ordinal)
+                        .map(|e| e.id))
+                })?;
+                self.emit(
+                    store,
+                    config,
+                    Observation {
+                        delivery: Some(DeliveryId {
+                            scope: DeliveryScope::Host {
+                                host: change.repository.host.clone(),
+                            },
+                            source: "fixture.merge".into(),
+                            event_id: format!(
+                                "merge:{}:{}@{}:{}",
+                                owner_work.0, change_id, head.object, base.object
+                            ),
+                        }),
+                        subject_work_id: Some(owner_work.clone()),
+                        subject_execution_id: execution_id,
+                        fact: ObservationFact::ChangeMerged {
+                            change: change.clone(),
+                            head: head.clone(),
+                            base: base.clone(),
+                            target_branch: target_branch.clone(),
+                        },
+                        observed_unix_seconds: now,
+                    },
+                    now,
+                )?;
+            }
+            report.merge_rechecks += 1;
+            merge_scans += 1;
+            scanned_targets.insert(target_branch.clone(), base.clone());
+            // A consumed scan slot stamps the same durable service
+            // cursor a detection read does: the pair sorts behind the
+            // never-serviced remainder next pass instead of leading
+            // the queue again and starving the deferred tail.
+            self.emit(
+                store,
+                config,
+                Observation {
+                    delivery: Some(DeliveryId {
+                        scope: DeliveryScope::Host {
+                            host: change.repository.host.clone(),
+                        },
+                        source: "fixture.merge".into(),
+                        event_id: format!(
+                            "merge-check:{}:{}@{}#{check_epoch}",
+                            owner_work.0, change_id, head.object
+                        ),
+                    }),
+                    subject_work_id: Some(owner_work.clone()),
+                    subject_execution_id: None,
+                    fact: ObservationFact::MergeCheck {
+                        change: change.clone(),
+                        head: head.clone(),
+                    },
+                    observed_unix_seconds: now,
+                },
+                now,
+            )?;
+            // The same candidate ordering the production adapter
+            // applies: a settled recorded verdict for the current
+            // `(head, base)` pair is final for the episode and never
+            // re-read; unrecorded pairs and provisional `Unknown`
+            // verdicts are checked first, least recently recorded
+            // first, so the deferred tail is reached on a later pass.
+            let mut candidates: Vec<(i64, &String, &WorkId, &ChangeRequestRef)> = Vec::new();
+            for (sibling_id, (sibling_work, sibling)) in &owners {
+                if sibling_id == change_id {
+                    continue;
+                }
+                // A merged sibling is no longer open: like the remote's
+                // open-change list, it drops out before any verdict read.
+                if self.merged_changes.contains(sibling_id) {
+                    continue;
+                }
+                let sibling_target = self
+                    .change_sources
+                    .get(sibling_id)
+                    .map(|(_, target)| target.clone())
+                    .unwrap_or_else(|| "main".to_string());
+                if sibling_target != target_branch {
+                    continue;
+                }
+                if !self.change_mergeability.contains_key(sibling_id) {
+                    continue;
+                }
+                let Some(sibling_head_object) = self.changes.get(sibling_id) else {
+                    continue;
+                };
+                let recorded = latest_recorded_mergeability(
+                    store,
+                    sibling_work,
+                    sibling,
+                    sibling_head_object,
+                    &base,
+                )?;
+                let key = match recorded {
+                    Some((MergeabilityState::Unknown, observed)) => observed,
+                    Some(_) => continue,
+                    None => i64::MIN,
+                };
+                candidates.push((key, sibling_id, sibling_work, sibling));
+            }
+            candidates.sort_by_key(|candidate| candidate.0);
+            for (_, sibling_id, sibling_work, sibling) in candidates {
+                if rechecked >= MAX_CONFLICT_RECHECKS_PER_PASS {
+                    report.deferred.push(format!("merge-siblings:{change_id}"));
+                    break;
+                }
+                if let Some(d) = deadline
+                    && clock() >= d
+                {
+                    report.deferred.push(format!("merge-siblings:{change_id}"));
+                    break;
+                }
+                let Some((state, paths)) = self.change_mergeability.get(sibling_id) else {
+                    continue;
+                };
+                // Every verdict read consumes the pass-wide sibling
+                // bound — re-reading a provisional `Unknown` pair is
+                // still a re-check.
+                rechecked += 1;
+                let Some(sibling_head_object) = self.changes.get(sibling_id).cloned() else {
+                    continue;
+                };
+                let Ok(sibling_head) =
+                    CommitRevision::new(sibling.repository.clone(), sibling_head_object)
+                else {
+                    continue;
+                };
+                let execution_id = store.transact(|tx| {
+                    Ok(tx
+                        .executions_for_work(sibling_work)?
+                        .into_iter()
+                        .max_by_key(|e| e.ordinal)
+                        .map(|e| e.id))
+                })?;
+                // The same bound the production adapter applies: the
+                // durable verdict keeps only the bounded leading set.
+                let paths = bound_conflict_paths(paths);
+                let token = workloop_core::domain::sha256_hex(
+                    "fixture-mergeability-v1",
+                    format!("{state:?}:{paths:?}").as_bytes(),
+                );
+                self.emit(
+                    store,
+                    config,
+                    Observation {
+                        delivery: Some(DeliveryId {
+                            scope: DeliveryScope::Host {
+                                host: sibling.repository.host.clone(),
+                            },
+                            source: "fixture.mergeability".into(),
+                            event_id: format!(
+                                "mergeability:{}:{}@{}:{}#{token}",
+                                sibling_work.0, sibling_id, sibling_head.object, base.object
+                            ),
+                        }),
+                        subject_work_id: Some(sibling_work.clone()),
+                        subject_execution_id: execution_id,
+                        fact: ObservationFact::Mergeability {
+                            target: DiffTarget {
+                                change: sibling.clone(),
+                                head: sibling_head,
+                                base: Some(base.clone()),
+                                target_revision: Some(base.clone()),
+                            },
+                            state: *state,
+                            conflicting_paths: paths.clone(),
+                            reason: (*state == MergeabilityState::Unknown)
+                                .then(|| "fixture mergeability is unknown".to_string()),
+                        },
+                        observed_unix_seconds: now,
+                    },
+                    now,
+                )?;
+                report.merge_rechecks += 1;
+                if *state == MergeabilityState::Conflicting {
+                    report.sibling_conflicts += 1;
+                }
+            }
         }
         Ok(report)
     }
@@ -3149,6 +3557,118 @@ pub(crate) fn declared_sources(
         }
         Ok(out)
     })
+}
+
+/// Every `(Work, change)` pair this store has observed, including Work
+/// whose Execution has already reached a terminal state. Merge
+/// detection and bounded sibling re-checks must still see a completed
+/// Work's open change; only its ordinary head polling is suppressed.
+pub(crate) fn recorded_change_pairs(
+    store: &impl Store,
+    scope: Option<&WorkId>,
+) -> Result<Vec<(WorkId, ChangeRequestRef)>, StoreError> {
+    store.transact(|tx| {
+        let mut out = Vec::new();
+        for work in tx.works()? {
+            if let Some(w) = scope
+                && work.id != *w
+            {
+                continue;
+            }
+            let latest = tx
+                .observations_for_work(&work.id)?
+                .into_iter()
+                .filter_map(|o| match o.fact {
+                    ObservationFact::ChangeHead { change, .. } => Some(change),
+                    _ => None,
+                })
+                .next_back();
+            if let Some(change) = latest {
+                out.push((work.id.clone(), change));
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// The latest recorded `ChangeMerged` observation for one change: the
+/// durable proof the pull already merged, plus the target branch and
+/// base observed at that time. A later scan re-reads only the fresh
+/// target base, never the pull again — re-reading every recorded merge
+/// each pass would make remote reads grow with the merge history.
+pub(crate) fn latest_recorded_merge(
+    store: &impl Store,
+    work_id: &WorkId,
+    change: &ChangeRequestRef,
+) -> Result<Option<(CommitRevision, CommitRevision, String)>, StoreError> {
+    let observations = store.transact(|tx| tx.observations_for_work(work_id))?;
+    Ok(observations
+        .into_iter()
+        .filter_map(|o| match o.fact {
+            ObservationFact::ChangeMerged {
+                change: merged,
+                head,
+                base,
+                target_branch,
+            } if merged == *change => Some((head, base, target_branch)),
+            _ => None,
+        })
+        .next_back())
+}
+
+/// The pair's "last serviced" record — the "least recently serviced"
+/// key the bounded merge-detection and merge-scan sets order by, so
+/// the deferred tail is reached. The key is `(observed time, service
+/// sequence)`: the time is second-granular, so the durable sequence
+/// position ties it out and the servicing rotation keeps moving
+/// instead of freezing on a same-second leading set. The record lives
+/// on the Work's usage row and is overwritten in place on every
+/// service — one bounded record per pair, never a log of services.
+pub(crate) fn latest_recorded_merge_check(
+    store: &impl Store,
+    work_id: &WorkId,
+    change: &ChangeRequestRef,
+) -> Result<Option<(i64, i64)>, StoreError> {
+    Ok(store
+        .transact(|tx| tx.work_usage(work_id))?
+        .and_then(|usage| usage.merge_check_position(change)))
+}
+
+/// The latest recorded `Mergeability` verdict for one exact
+/// `(change, head, base)` pair — its state and the time it was
+/// observed. A settled verdict (mergeable or conflicting) is final for
+/// the pair: the episode model binds both revisions, so any real change
+/// mints a new pair. `Unknown` is a provisional answer a later pass
+/// must resolve. Ordered by observed time then row order — the same
+/// "latest wins" rule the other recorded-fact lookups use.
+pub(crate) fn latest_recorded_mergeability(
+    store: &impl Store,
+    work_id: &WorkId,
+    change: &ChangeRequestRef,
+    head_object: &str,
+    base: &CommitRevision,
+) -> Result<Option<(MergeabilityState, i64)>, StoreError> {
+    let observations = store.transact(|tx| tx.observations_for_work(work_id))?;
+    Ok(observations
+        .iter()
+        .enumerate()
+        .filter_map(|(index, o)| {
+            if let ObservationFact::Mergeability { target, state, .. } = &o.fact {
+                let recorded_base = target
+                    .base
+                    .clone()
+                    .or_else(|| target.target_revision.clone());
+                if target.change == *change
+                    && target.head.object == head_object
+                    && recorded_base.as_ref() == Some(base)
+                {
+                    return Some((o.observed_unix_seconds, index, *state));
+                }
+            }
+            None
+        })
+        .max_by_key(|(observed, index, _)| (*observed, *index))
+        .map(|(observed, _, state)| (state, observed)))
 }
 
 /// The latest recorded `issue` read for one declared source, ordered by

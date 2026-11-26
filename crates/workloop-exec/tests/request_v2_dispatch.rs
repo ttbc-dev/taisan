@@ -1223,6 +1223,148 @@ fn fix_dispatch_binds_the_acknowledged_predecessor_and_failed_evidence() {
 }
 
 #[test]
+fn conflict_repair_dispatch_binds_the_reported_pair() {
+    let root = tmp_root("conflict-origin");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-conflict-origin", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let lo = layout(&root);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&lo, &src, &artifact_id, &produced);
+    let target_revision = "1".repeat(40);
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::Fix,
+        serde_json::json!({
+            "kind": "conflict_repair",
+            "schema_version": 1,
+            "episode_id": "ep-conflict",
+            "repository": repo(),
+            "change_request": "change-1",
+            "source_revision": CommitRevision::new(repo(), produced.clone()).unwrap(),
+            "target_revision": CommitRevision::new(repo(), target_revision.clone()).unwrap(),
+            "head": CommitRevision::new(repo(), produced.clone()).unwrap(),
+            "base": CommitRevision::new(repo(), target_revision.clone()).unwrap(),
+            "conflicting_paths": ["src/a.rs"],
+        }),
+    );
+
+    // A conflict origin needs neither a review judgment nor failed
+    // evidence: the exact pair is the durable repair basis.
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let wire = WorkerRequestV2::parse(&request_body(&store, &rid1).canonical_body).unwrap();
+    let TaskBody::Fix { origin, .. } = &wire.task else {
+        panic!("expected fix task: {:?}", wire.task)
+    };
+    let FixOrigin::Conflict {
+        change,
+        source_revision,
+        target_revision: target,
+        paths,
+    } = origin.as_ref()
+    else {
+        panic!("expected conflict origin: {origin:?}")
+    };
+    assert_eq!(change, "change-1");
+    assert_eq!(source_revision, &produced);
+    assert_eq!(target, &"1".repeat(40));
+    assert_eq!(paths, &["src/a.rs"]);
+    assert!(
+        invocation_for(&store, &rid1).is_some(),
+        "the conflict repair dispatches instead of refusing evidence_missing"
+    );
+}
+
+fn insert_conflict_request(
+    store: &SqliteStore,
+    work_id: &WorkId,
+    execution_id: &ExecutionId,
+    request_id: &str,
+    head: &str,
+    base: &str,
+) {
+    insert_request(
+        store,
+        work_id,
+        execution_id,
+        request_id,
+        InvocationRole::Fix,
+        serde_json::json!({
+            "kind": "conflict_repair",
+            "schema_version": 1,
+            "episode_id": "ep-conflict",
+            "repository": repo(),
+            "change_request": "change-1",
+            "source_revision": CommitRevision::new(repo(), head.to_string()).unwrap(),
+            "target_revision": CommitRevision::new(repo(), base.to_string()).unwrap(),
+            "head": CommitRevision::new(repo(), head.to_string()).unwrap(),
+            "base": CommitRevision::new(repo(), base.to_string()).unwrap(),
+            "conflicting_paths": ["src/a.rs"],
+        }),
+    );
+}
+
+#[test]
+fn a_conflict_source_head_the_workspace_does_not_contain_is_head_stale() {
+    let root = tmp_root("conflict-moved-head");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-conflict-moved-head", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+    // A source head that is not the produced commit the workspace pins
+    // names code the mounted workspace does not contain.
+    let moved = "a".repeat(40);
+    let target_revision = "1".repeat(40);
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_conflict_request(&store, &w, &e, &rid1, &moved, &target_revision);
+
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let refusals = dispatch_refusals(&store, &w);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].0, "request.head_stale", "{refusals:?}");
+    assert!(invocation_for(&store, &rid1).is_none());
+    assert!(!pending_ids(&store).contains(&rid1));
+}
+
+#[test]
+fn a_conflict_pair_without_exact_commit_ids_is_head_stale() {
+    let root = tmp_root("conflict-nonhex");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-conflict-nonhex", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+    // The source head matches the workspace, but the target revision is
+    // not an exact commit id: the pair cannot bind a repair.
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_conflict_request(&store, &w, &e, &rid1, &produced, "not-a-commit");
+
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let refusals = dispatch_refusals(&store, &w);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].0, "request.head_stale", "{refusals:?}");
+    assert!(invocation_for(&store, &rid1).is_none());
+    assert!(!pending_ids(&store).contains(&rid1));
+}
+
+#[test]
 fn a_fix_without_durable_evidence_refuses_dispatch() {
     let root = tmp_root("fix-noev");
     let state_root = root.join("state");

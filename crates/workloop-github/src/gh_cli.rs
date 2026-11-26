@@ -833,6 +833,19 @@ impl GhCliApi {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
                 || value.get("merged_at").is_some_and(|v| v.is_string()),
+            mergeable: value.get("mergeable").and_then(|v| v.as_bool()),
+            mergeable_state: str_field("mergeable_state"),
+            base_sha: base_str("sha"),
+            conflicting_paths: value
+                .get("conflicting_paths")
+                .and_then(|v| v.as_array())
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(|p| p.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 }
@@ -1367,6 +1380,35 @@ impl GitHubApi for GhCliApi {
                 pull.pointer("/head/sha")
                     .and_then(|v| v.as_str())
                     .is_some_and(|sha| sha == head_sha)
+            })
+            .map(Self::remote_pull)
+            .collect()
+    }
+
+    fn list_open_pulls_on_base(
+        &mut self,
+        repository: &RepositoryRef,
+        target_branch: &str,
+    ) -> Result<Vec<RemotePull>, ApiError> {
+        let slug = Self::slug(repository)?;
+        if !valid_branch(target_branch) {
+            return Err(ApiError::Refused {
+                reason: format!("invalid target branch: {target_branch:?}"),
+            });
+        }
+        let pulls = self.api_pages(
+            &format!("repos/{slug}/pulls"),
+            &[
+                ("state", "open"),
+                ("base", target_branch),
+                ("per_page", "100"),
+            ],
+        )?;
+        pulls
+            .iter()
+            .filter(|pull| {
+                let base = pull.pointer("/base/ref").and_then(|v| v.as_str());
+                base.is_none_or(|b| b == target_branch)
             })
             .map(Self::remote_pull)
             .collect()

@@ -1786,7 +1786,7 @@ fn store_header_classification_covers_fresh_unversioned_and_newer_formats() {
         ),
         (
             "newer format",
-            header(1, 16),
+            header(1, 17),
             false,
             Some("store.unsupported"),
         ),
