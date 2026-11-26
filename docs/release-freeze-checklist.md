@@ -29,12 +29,21 @@ Already met at writing:
 Still open at writing:
 
 - [ ] *owner* — defect dispositions are recorded in #365's closing
-      comment (2026-11-25): #313/#398/#399/#400 'fixed per §6',
+      comment (2026-11-25): #313/#398/#399/#400 'fixed per §6'
+      (owner's disposition wording — the four defects are confirmed
+      present on the candidate per
+      [release-acceptance-v0.3.md](release-acceptance-v0.3.md) §6;
+      the label is not a code-state claim),
       #468/#470/#471 deferred to v0.6 (milestone 11) and the earlier
       deferred set #453–#456 unchanged → v0.6,
       #469 fixed post-pin by #474. Remaining owner acts: close the
       dispositioned defect issues (#313/#358/#359/#361/#398/#399/
-      #400 — 'Fixed on the release candidate' group, all open), and
+      #400 — 'Fixed on the release candidate' group, all open; the
+      group label is the owner's disposition wording for issue
+      closure, not a code-state claim — #313/#398/#399/#400 remain
+      confirmed present and open with no milestone (#398/#400 also
+      needs-human), so closing them
+      is a disposition act, not evidence a fix landed), and
       give #437 a recorded disposition (flagged for owner review,
       absent from the comment) — ledger:
       [release-acceptance-v0.3.md](release-acceptance-v0.3.md) §6–§7;

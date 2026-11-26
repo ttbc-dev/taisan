@@ -87,10 +87,14 @@ With `[intake] enabled` on the clean install, the scheduler — not
   which the selector's GitHub backend cannot read — filed as #468.
   The operator set the id to the `owner/name` slug
   (`02b-check-after-id-fix.txt`) and intake proceeded.
-- **7 Works admitted across scheduled ticks** — intake-2, -3, -4,
-  -13, -14, -16 (`38-intake-runs-final.json`), each a distinct real
-  Issue on the isolated repository. `issue_claims` held single
-  ownership of every selected Issue; no Work was dispatched twice.
+- **7 Works admitted across six admitting scheduled ticks** —
+  intake-2 accepted two Works in one run (w-1, w-2), intake-3, -4,
+  -13, -14, -16 one each (`38-intake-runs-final.json`), each a
+  distinct real Issue on the isolated repository (intake-1's
+  `scheduled_startup` tick failed closed
+  `adapter_source_unavailable`, #468 — above). `issue_claims`
+  held single ownership of every selected Issue; no Work was
+  dispatched twice.
 - **Scheduler scenarios exercised with durable rows:** `queue_full`
   skips while capacity was occupied (intake-5..9), replayed
   candidates re-presented each tick, a selector outage surfacing as
@@ -175,10 +179,13 @@ would overstate the release:
   deterministic `work/w-N` branch names collided with branches left
   by earlier installations on the shared repository. Guarded
   refusal behaved correctly (never overwrote a foreign head);
-  bounded transport retries elapsed and each Work was
-  operator-cancelled — at `paused_judgment` for w-3/w-4/w-5 and at
-  transport-budget exhaustion for w-1 (`15-ack-w1.json`,
-  `wd-w-1..5-final.json`) — filed as #470.
+  bounded transport retries elapsed (4 each) and every one of the
+  four paused `paused_judgment` on the `transport_exhausted`
+  decision ("transport retry bound reached"), then was
+  operator-cancelled while paused — w-1/w-3/w-4 after an
+  `acknowledge`, w-5 directly (`15-acknowledge-w1.json`,
+  `ack-w-3.json`/`ack-w-4.json`, `cancel-w-*.json`,
+  `wd-w-{1,3,4,5}-final.json`) — filed as #470.
 - **w-2:** every verification reported `cache_unreadable` — the
   `caches/cargo-registry` symlink dangled inside the sandbox —
   leaving the lane `waiting/ci` on a sticky `inconclusive` item

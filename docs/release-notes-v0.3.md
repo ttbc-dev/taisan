@@ -90,8 +90,11 @@ plus the owner-run live records summarized in
    pilot on the clean #367 install (driver built from `81c62cf`;
    owner-side records `acceptance-v03-pilot/RUN-RECORD-2026-11-26-PILOT.md`
    and `acceptance-v03-clean/RUN-RECORD-2026-11-25-CLEAN.md`):
-   **7 Works admitted across
-   scheduled ticks** (intake-2, -3, -4, -13, -14, -16) — every
+   **7 Works admitted across six
+   admitting scheduled ticks** — intake-2 accepted two candidates in
+   one run (w-1, w-2); intake-3, -4, -13, -14, -16 one each; the
+   first tick, intake-1, had failed closed
+   `adapter_source_unavailable` (#468) — every
    dispatch decision made by the scheduler, none by manual `submit`.
    Two Works ran the full verified path to `succeeded`: **w-6**
    (issue #74 → PR #77 on the isolated repository) and **w-7**
@@ -258,9 +261,13 @@ supported independently.
     raise `pending_queue_limit`.
 - **Earlier flagged defects, dispositioned in #365's closing
   comment** — recorded 'fixed per §6' there, issues still open
-  (release-acceptance §6): #313 (two unrecorded
-  same-signature processes can hold an unidentified launch
-  unresolved — honest-uncertain wedge, not a false absence), #398
+  (release-acceptance §6); 'fixed per §6' is the owner's
+  disposition wording for closing the issues, not a code-state
+  claim — all four are confirmed present on the candidate and
+  open with no milestone (#398/#400 also needs-human): #313 (two
+  unrecorded same-signature processes can hold an unidentified
+  launch unresolved — honest-uncertain wedge, not a false
+  absence), #398
   and #399 (`file:` credential sources can stay readable inside
   contained verification — same credential-hygiene class #364 gated
   on), #400 (v2 `report.json` full-body retention dropped by a merge
