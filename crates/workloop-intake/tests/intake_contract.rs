@@ -1582,6 +1582,76 @@ fn the_replay_ask_is_scoped_to_the_binding_and_actor() {
     assert_eq!(report.candidates[0].status, IntakeCandidateStatus::Accepted);
 }
 
+/// The replay read is bounded by the protocol candidate bound rather
+/// than the (never pruned) command ledger: the store returns only the
+/// requested number of prefix-matching keys, and the ask stays at
+/// `MAX_CANDIDATES` even when far more decisions are saved.
+#[test]
+fn the_replay_ask_is_capped_at_the_protocol_bound() {
+    let dir = tmp_root("replay-cap");
+    let store = SqliteStore::in_memory(4).unwrap();
+    set_intake_settings(&store, settings("rev-1", 1), None).unwrap();
+
+    let rejecting = config(false);
+    for i in 0..40 {
+        let decision = handle_command(
+            &store,
+            &rejecting,
+            &CommandRequest {
+                actor: actor(),
+                origin: Origin("selector".into()),
+                idempotency_key: format!("proposal/test-sel:saved-{i:02}"),
+                body: CommandBody::Submit {
+                    intent: format!("saved decision {i}"),
+                    sources: vec![SourceSnapshot {
+                        issue: issue(&format!("cap-seed-{i}")),
+                        source_revision: "rev-0".into(),
+                        content_digest: "digest-0".into(),
+                    }],
+                    constraints: vec![],
+                    verification_argv: vec![],
+                },
+            },
+            NOW,
+        )
+        .unwrap();
+        assert!(matches!(decision, CommandDecision::Rejected { .. }));
+    }
+
+    let bounded = store
+        .transact_deferred(|tx| {
+            tx.decided_idempotency_keys(
+                &Origin("selector".into()),
+                &actor(),
+                "proposal/test-sel:",
+                5,
+            )
+        })
+        .unwrap();
+    assert_eq!(bounded.len(), 5, "the read stops at the requested limit");
+    assert!(
+        bounded
+            .iter()
+            .all(|key| key.starts_with("proposal/test-sel:")),
+        "{bounded:?}"
+    );
+
+    let proposals = vec![proposal("issue-cap", "fresh work")];
+    let capture = dir.join("request.json");
+    let script = adapter_script(&dir, "cap.sh", &success_template(&proposals), &capture);
+    let mut f = fixture(dir.clone(), script);
+    f.store = store;
+    let report = run(&f, Duration::from_secs(10));
+
+    assert_eq!(report.state, IntakeRunState::Completed);
+    let request = captured_request(&capture);
+    assert_eq!(
+        request["max_candidates"], 32,
+        "the replay-widened ask is capped at the protocol bound"
+    );
+    assert_eq!(report.candidates[0].status, IntakeCandidateStatus::Accepted);
+}
+
 /// `queued` is not the only owning state: Works forced into `running`
 /// and `paused` still hold their issues, so the request's
 /// `excluded_sources` carries both — the wire-level half of the

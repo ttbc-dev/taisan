@@ -169,12 +169,21 @@ pub fn run_intake_with_owner(
 ) -> Result<IntakeReport, IntakeError> {
     let lease = IntakeLease::acquire(store, owner, now_unix_seconds)?;
 
+    // The replay prefix identifies this selector binding's saved
+    // decisions. Preflight asks the ledger only for keys under it, and
+    // only as many as the protocol's candidate bound could use.
+    let replay_prefix = format!(
+        "{}{}:",
+        admission::REPLAY_KEY_PREFIX,
+        params.binding.adapter
+    );
+
     // Preflight in one deferred read: an already-active run refuses
     // the invocation outright (the lease makes this rare — it covers
     // a run left by a dead owner awaiting recovery), the pending
     // queue's free positions size `max_candidates`, the live source
     // owners become the request's exclusions, and the ledger names
-    // every replay identity whose decision is already saved.
+    // the replay identities whose decision is already saved.
     let preflight = store.transact_deferred(|tx| {
         if let Some(run) = tx.active_intake_run()? {
             return Ok(Preflight::Active(run.run_id));
@@ -185,8 +194,12 @@ pub fn run_intake_with_owner(
             .unwrap_or(DEFAULT_PENDING_QUEUE_LIMIT);
         let occupied = tx.pending_queue_count()?;
         let owned = tx.intake_owned_issues()?;
-        let decided =
-            tx.decided_idempotency_keys(&Origin(admission::SELECTOR_ORIGIN.into()), params.actor)?;
+        let decided = tx.decided_idempotency_keys(
+            &Origin(admission::SELECTOR_ORIGIN.into()),
+            params.actor,
+            &replay_prefix,
+            protocol::MAX_CANDIDATES,
+        )?;
         Ok(Preflight::Ready {
             limit,
             occupied,
@@ -216,20 +229,21 @@ pub fn run_intake_with_owner(
     // A candidate whose saved decision is re-presented is `replayed`
     // and creates no new pending position, but it still counts
     // against the adapter's returned-candidate bound. Size the ask
-    // beyond the free positions by every known replay identity this
-    // selector owns, so a permanently-replayed Issue can never soak
-    // the budget new proposals need. The count is an upper bound —
-    // unknown/stale keys only ask for extra candidates, which the
-    // capacity check defers — and the wire bound still caps the ask.
-    let replay_prefix = format!(
-        "{}{}:",
-        admission::REPLAY_KEY_PREFIX,
-        params.binding.adapter
-    );
-    let known_replays = decided
-        .iter()
-        .filter(|key| key.starts_with(&replay_prefix))
-        .count() as u64;
+    // beyond the free positions by the known replay identities this
+    // selector owns, so replays do not consume the budget new
+    // proposals need. The ledger read is already scoped to the
+    // binding's replay prefix and capped at `MAX_CANDIDATES`, so the
+    // count is bounded and an upper bound on the replays a response
+    // can carry.
+    //
+    // Residual limit: `max_candidates` is capped at the protocol's
+    // 32, so once at least `MAX_CANDIDATES - free` replay identities
+    // exist the ask is already saturated. A selector that ranks every
+    // replay ahead of every fresh Issue can then still fill the
+    // response with replays. Removing that would require the selector
+    // protocol to accept replay identities; until then the documented
+    // operator lever is raising `pending_queue_limit`.
+    let known_replays = decided.len() as u64;
     // The run record copies the *held* lease's owner identity — the
     // storage contract's provenance for "who held this invocation" —
     // not a second, unrelated acquisition identity.
