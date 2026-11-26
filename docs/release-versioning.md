@@ -169,9 +169,8 @@ decision 2026-11-26):
   freeze records both so the notes' tested-identity values stay
   honest.
 
-This draft intentionally changes no `Cargo.toml`: the version bump is
-part of the freeze, and landing it early would make builds claim a
-version that has no candidate behind it.
+The bump was applied at freeze per the above (PR #477): the tagged
+tree carries `0.3.0`, and this record changes no further `Cargo.toml`.
 
 ## 5. Changelog generation policy
 
