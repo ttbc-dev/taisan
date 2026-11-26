@@ -113,17 +113,17 @@ the merges the evidence depends on. The freeze extends it:
 
 ## 4. Version metadata alignment
 
-Today the workspace carries almost no version metadata: every crate
-except `workloop-evidence-protocol` (0.1.0) declares no `version`
-field and resolves to Cargo's `0.0.0` default; there is no
-`workspace.package.version`. This matters beyond cosmetics —
-`taisan-worker-claude`'s `describe` reports
+Before the freeze alignment the workspace carried almost no version
+metadata: every crate except `workloop-evidence-protocol` (0.1.0)
+declared no `version` field and resolved to Cargo's `0.0.0` default;
+there was no `workspace.package.version`. This mattered beyond
+cosmetics — `taisan-worker-claude`'s `describe` reports
 `adapter_version: env!("CARGO_PKG_VERSION")` into the durable
-declaration the supervisor digests, so released binaries currently
-self-report `0.0.0`.
+declaration the supervisor digests, so released binaries would have
+self-reported `0.0.0`.
 
-Proposed alignment **at freeze time** (not in this draft change, and
-not before the owner signs off):
+The alignment **was applied at freeze** (PR #477, owner version
+decision 2026-11-26):
 
 - Set `workspace.package.version = "0.3.0"` and have member crates
   inherit it (`version.workspace = true`), so `taisan`,
@@ -216,9 +216,9 @@ binaries**, not as a registry package.
 
 | Decision | Options | This draft |
 | --- | --- | --- |
-| Release version | `0.3.0` (proposed) / `1.0.0` | **owner-pending** — the only undecided *decision* row in this table; owner acts outside it (closing the dispositioned defect issues, #437's call, candidate sign-off) remain — status paragraph, freeze checklist |
+| Release version | `0.3.0` (proposed) / `1.0.0` | **decided: `0.3.0`** — owner decision, 2026-11-26; owner acts outside it (candidate sign-off, #437's disposition recorded on the issue) remain — status paragraph, freeze checklist |
 | Candidate commit | recorded `origin/main` SHA at sign-off (§3) | procedure only; **not named** — the freeze records it |
 | Publication route | in-place, history kept | **decided** — #438 ruling ([release audit](release-audit.md) §7) |
 | Distribution route | cargo-dist → GitHub Releases + Homebrew tap + cargo-binstall; no crates.io | **decided** — #370 comment, 2026-11-25 (§6); workflow is #441's lane |
-| Crate version alignment | workspace `0.3.0` inheritance (proposed) / leave `0.0.0` | proposed, not applied — a metadata step that follows the version choice, not an independent decision |
+| Crate version alignment | workspace `0.3.0` inheritance (proposed) / leave `0.0.0` | **applied** — PR #477 applies the workspace `0.3.0` inheritance, following the owner's version choice |
 | Tag creation | annotated `v<version>` on the recorded candidate | procedure only; no tag exists |

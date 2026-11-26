@@ -9,8 +9,8 @@ homepage.workspace = true
 
 # The Homebrew formula is named after the shipped binary.
 [package.metadata.dist]
-# Required while workspace crates carry no `version` field (0.0.0 →
-# publish = false, which dist otherwise skips); see workloop-cli.
+# Declares this package a shipped app (cargo-dist builds declared
+# apps only); see workloop-cli.
 dist = true
 formula = "public-issue-selector"
 

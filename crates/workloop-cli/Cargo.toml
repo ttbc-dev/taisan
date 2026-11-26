@@ -10,9 +10,9 @@ description = "taisan command-line interface"
 
 # dist settings for this package's release app.
 [package.metadata.dist]
-# Required while workspace crates carry no `version` field: cargo
-# reports them as publish = false (0.0.0) and dist skips them. The
-# real version lands with the #370 freeze.
+# Declares this package a shipped app — cargo-dist only builds
+# declared apps. All workspace crates inherit `0.3.0` since the #370
+# freeze alignment.
 dist = true
 # The Homebrew formula is named after the shipped CLI, not the
 # crate-internal package name.
