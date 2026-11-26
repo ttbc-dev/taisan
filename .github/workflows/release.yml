@@ -6,7 +6,10 @@
 # runs `dist host --steps=create` on tag pushes, which creates the
 # GitHub Release). Tag names reach run: blocks only through env vars,
 # never via ${{ }} interpolation (a crafted tag could otherwise inject
-# shell commands). cargo-dist 0.34.0 cannot express permissions for its
+# shell commands). The `publish-homebrew-formula` job's git identity is
+# overridden from dist's "axo bot" default to github-actions[bot] so
+# commits to the owner's tap are attributed to CI, not a third-party
+# name. cargo-dist 0.34.0 cannot express permissions for its
 # built-in jobs, so `[workspace.metadata.dist].allow-dirty = ["ci"]`
 # keeps `dist generate` from clobbering this patch.
 # See docs/distribution.md "Release flow".
@@ -329,8 +332,10 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PLAN: ${{ needs.plan.outputs.val }}
-      GITHUB_USER: "axo bot"
-      GITHUB_EMAIL: "admin+bot@axo.dev"
+      # Hand-patched (see header note): dist's "axo bot" default is
+      # replaced with the standard CI identity for owner-tap commits.
+      GITHUB_USER: "github-actions[bot]"
+      GITHUB_EMAIL: "41898282+github-actions[bot]@users.noreply.github.com"
     if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
     steps:
       - uses: actions/checkout@v6

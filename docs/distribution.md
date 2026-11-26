@@ -25,6 +25,14 @@ distributes exactly the documented install surface
 | `taisan-worker-claude` | `taisan-worker-claude` | `taisan-worker-claude` |
 | `workloop-fixture-worker` | `workloop-fixture-worker` | `workloop-fixture-worker` |
 
+Every release archive also carries the license and notice set the
+licensing audit requires for binary bundles — `LICENSE-MIT`,
+`LICENSE-APACHE`, `THIRD-PARTY.md`, and `LICENSES/`, plus `README.md` —
+declared via `[workspace.metadata.dist].include` with
+`auto-includes = false` (auto-detection picks a single arbitrary
+`LICENSE*` match per kind, and entries it detects are listed twice
+alongside the explicit list).
+
 Every package builds for `x86_64-apple-darwin`,
 `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and
 `aarch64-unknown-linux-gnu`. There is no Windows or musl target: the
@@ -63,7 +71,8 @@ which creates the GitHub Release on tag pushes) → per-target
 artifacts and publishes the release) → `publish-homebrew-formula`
 (commits each `Formula/<name>.rb` to `shimpeiws/homebrew-tap`) →
 `announce`. Pull requests run `dist plan` only (`pr-run-mode =
-"plan"`), which exercises the matrix without building.
+"plan"`): the `plan` job computes the release plan and build matrix,
+and `build-local-artifacts` stays gated off — nothing is built.
 
 `release.yml` is no longer fully generated. It carries a hand-applied
 permissions patch, marked by a `LOCAL MODIFICATION` header: the
@@ -82,8 +91,11 @@ pushed refs and can contain `$(...)`/backticks, so `github.ref_name`,
 `needs.plan.outputs.tag`, and `needs.plan.outputs.tag-flag` never
 appear inside `run:` blocks as `${{ }}` interpolation — each step
 reads them as shell variables (with `${TAG_FLAG:+$TAG_FLAG}` where the
-flag is absent on pull_request runs). cargo-dist 0.34.0 cannot express
-permissions for its built-in jobs
+flag is absent on pull_request runs). The patch also replaces the
+`publish-homebrew-formula` job's git identity — dist's default
+`axo bot`/`admin+bot@axo.dev` — with `github-actions[bot]`, so commits
+to the owner's tap are attributed to CI. cargo-dist 0.34.0 cannot
+express permissions for its built-in jobs
 (`github-custom-job-permissions` covers only user-defined custom
 jobs), so `[workspace.metadata.dist].allow-dirty = ["ci"]` keeps `dist
 generate` from silently reverting the patch.
@@ -92,9 +104,10 @@ The cost of `allow-dirty`: `dist generate --mode=ci` (and `--check`)
 skips `release.yml` entirely, so CI-affecting config changes no longer
 regenerate it. To resync after editing `[workspace.metadata.dist]`,
 temporarily remove `allow-dirty`, run `dist generate --mode=ci`,
-re-apply the permissions patch (read at workflow level, write on
-`plan` and `host`) and the env-var tag hardening, then restore
-`allow-dirty`.
+restore the `LOCAL MODIFICATION` header, re-apply the permissions
+patch (read at workflow level, write on `plan` and `host`), the
+env-var tag hardening, and the `github-actions[bot]` commit identity,
+then restore `allow-dirty`.
 
 ## Install routes
 

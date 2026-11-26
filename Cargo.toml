@@ -48,6 +48,20 @@ checksum = "sha256"
 unix-archive = ".tar.xz"
 # Where to host releases
 hosting = "github"
+# Static files copied into every app's release archive. The licensing
+# audit (docs/licensing-prep.md) requires each binary bundle to carry
+# both license texts, the third-party inventory, and the full license
+# corpus — auto-includes picks a single arbitrary LICENSE* match per
+# kind (and duplicates entries with the explicit list), so the whole
+# set is declared here instead. Paths are relative to this Cargo.toml.
+auto-includes = false
+include = [
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "THIRD-PARTY.md",
+    "LICENSES",
+    "README.md",
+]
 # The workspace packages to distribute — the documented install
 # surface (docs/v0.3-installation.md, docs/reference-adapters.md,
 # README): the taisan CLI, the TUI console, the two public reference
