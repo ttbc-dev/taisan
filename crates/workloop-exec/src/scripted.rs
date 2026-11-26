@@ -116,6 +116,10 @@ struct State {
     spawn_envs: Vec<WorkerEnv>,
     /// The environment each `run_probe` was given, in call order.
     probe_envs: Vec<WorkerEnv>,
+    /// The argv each `run_probe` was given, in call order — the full
+    /// outer argv a contained probe runs, so a suite can read the
+    /// mount boundary a probe carried.
+    probe_commands: Vec<Vec<String>>,
 }
 
 /// An in-memory `ProcessControlPort`. Clone the handle to steer the
@@ -378,6 +382,11 @@ impl ScriptedProcessControl {
     /// The environment every `run_probe` was given, in call order.
     pub fn probe_envs(&self) -> Vec<WorkerEnv> {
         self.state.lock().unwrap().probe_envs.clone()
+    }
+
+    /// The argv every `run_probe` was given, in call order.
+    pub fn probe_commands(&self) -> Vec<Vec<String>> {
+        self.state.lock().unwrap().probe_commands.clone()
     }
 
     /// The shared scan behind both directory queries — the model's
@@ -759,6 +768,7 @@ impl ProcessControlPort for ScriptedProcessControl {
         let outcome = {
             let mut s = self.state.lock().unwrap();
             s.probe_envs.push(env.clone());
+            s.probe_commands.push(argv.to_vec());
             s.probes.pop_front().or_else(|| s.default_probe.clone())
         };
         match outcome {

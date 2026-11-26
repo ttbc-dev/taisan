@@ -261,13 +261,18 @@ fn verify_bundle(repo: &Path, bundle: &Path, produced: &str) -> bool {
 /// artifact. `seed.base` is the workspace-derived fork point `produced`
 /// must descend from; `artifact_id` is the required-artifact identity.
 /// `max_attempts` bounds export/import transport attempts — counting
-/// here is separate from `max_invocations`.
+/// here is separate from `max_invocations`. `credential_source` is the
+/// runtime boundary's mask answer (see [`CredentialMaskSource`]): the
+/// contained verification mount plans shadow a resolved `file:`
+/// source, and a boundary refusal fails the verification closed —
+/// it never touches the transport stages.
 pub fn drive(
     store: &impl Store,
     layout: &HandoffLayout,
     artifact_id: &str,
     seed: &HandoffSeed,
     max_attempts: u32,
+    credential_source: &CredentialMaskSource,
     clock: &mut dyn FnMut() -> i64,
 ) -> Result<ArtifactHandoff, HandoffError> {
     let existing = store.transact(|tx| tx.artifact_handoff(artifact_id))?;
@@ -318,7 +323,7 @@ pub fn drive(
         return Err(e);
     }
     if handoff.state == HandoffState::Acknowledged {
-        run_verifications(store, layout, &handoff, seed, clock)?;
+        run_verifications(store, layout, &handoff, seed, credential_source, clock)?;
     }
     Ok(handoff)
 }
@@ -332,6 +337,7 @@ fn run_verifications(
     layout: &HandoffLayout,
     handoff: &ArtifactHandoff,
     seed: &HandoffSeed,
+    credential_source: &CredentialMaskSource,
     clock: &mut dyn FnMut() -> i64,
 ) -> Result<(), HandoffError> {
     if seed.verification_argv.is_empty() {
@@ -372,6 +378,7 @@ fn run_verifications(
             argv,
             &scratch,
             &seed.verification_egress_hosts,
+            credential_source,
             clock,
         )?;
     }
@@ -894,6 +901,13 @@ struct ContainedVerification {
     egress_hosts: Vec<String>,
     egress_dir: PathBuf,
     relay_exe: PathBuf,
+    /// The host path a `file:` runtime credential was read from,
+    /// masked inside every verification mount plan — a source beneath
+    /// a covered bind would otherwise stay readable at its own
+    /// spelling even though the contract exposes only the staged
+    /// `/taisan/runtime-auth`. `None` for `env:`/`command:` providers
+    /// and for a boundary that grants no credential.
+    credential_source: Option<PathBuf>,
     /// The gate's boundary identity — toolchain/cache digests plus
     /// the effective host set. Any change re-proves the battery.
     boundary_digest: String,
@@ -968,14 +982,24 @@ fn collect_path_manifest(
     Ok(())
 }
 
+/// The runtime boundary's answer for the credential mask a contained
+/// verification needs: `Ok` carries the resolved `file:` credential
+/// source path (`None` for providers with no host path and for no
+/// boundary at all); `Err` is the boundary resolution refusal — a
+/// contained verification records it `Inconclusive` rather than mask
+/// nothing.
+pub type CredentialMaskSource = Result<Option<PathBuf>, String>;
+
 /// Resolve the §14.5 enforcement for one command. `Err` is a typed
 /// refusal reason recorded `Inconclusive` — a missing toolchain or
-/// cache, an egress host that names a model-API destination, or an
-/// unreadable boundary path is repairable configuration evidence,
-/// never an open-network fallback.
+/// cache, an egress host that names a model-API destination, an
+/// unreadable boundary path, or an unresolvable credential mask
+/// source is repairable configuration evidence, never an open-network
+/// fallback.
 fn prepare_enforcement(
     layout: &HandoffLayout,
     declared_egress_hosts: &[String],
+    credential_source: &CredentialMaskSource,
 ) -> Result<Enforcement, String> {
     let Some(sandbox) = &layout.verification else {
         // A request declaring verification egress hosts asks for a
@@ -992,6 +1016,11 @@ fn prepare_enforcement(
         }
         return Ok(Enforcement::Hygiene);
     };
+    // The credential mask follows the resolved boundary grant: a
+    // boundary that cannot produce one refuses the verification closed
+    // rather than leave a `file:` source readable inside the sandbox
+    // at its own spelling.
+    let credential_source = credential_source.clone()?;
     // Configured paths must exist before the first dispatch — a
     // missing toolchain or cache is a preflight failure, never a
     // download at verification time.
@@ -1078,6 +1107,7 @@ fn prepare_enforcement(
         egress_hosts: hosts.clone(),
         egress_dir: sandbox.egress_dir.clone(),
         relay_exe: sandbox.relay_exe.clone(),
+        credential_source,
         identity: serde_json::json!({
             "kind": "contained",
             "profile": sandbox.profile.id,
@@ -1132,7 +1162,7 @@ fn prove_verification_mounts(
         extra_rw_binds: vec![],
         worker: None,
         mask_roots: layout.mask_roots(),
-        masked_files: vec![],
+        masked_files: ctx.credential_source.iter().cloned().collect(),
     };
     let argv = vec!["/bin/sh".to_string(), "-c".to_string(), checks.join(" && ")];
     if let Some(reason) = containment::plan_denial(&plan) {
@@ -1290,7 +1320,7 @@ fn run_verification_contained(
         extra_rw_binds: vec![gitdir.to_path_buf()],
         worker: worker.clone(),
         mask_roots: layout.mask_roots(),
-        masked_files: vec![],
+        masked_files: ctx.credential_source.iter().cloned().collect(),
     };
     let _ = std::fs::create_dir_all(scratch_out);
     if let Some(reason) = containment::plan_denial(&plan) {
@@ -1321,6 +1351,7 @@ pub fn verify(
     argv: &[String],
     scratch: &Path,
     declared_egress_hosts: &[String],
+    credential_source: &CredentialMaskSource,
     clock: &mut dyn FnMut() -> i64,
 ) -> Result<VerificationResult, HandoffError> {
     let (timeout, output_cap) = verification_bounds(store, artifact_id, clock())?;
@@ -1334,6 +1365,7 @@ pub fn verify(
         timeout,
         output_cap,
         declared_egress_hosts,
+        credential_source,
     )
 }
 
@@ -1409,6 +1441,7 @@ pub fn verify_with_timeout(
     timeout: Duration,
     output_cap: u64,
     declared_egress_hosts: &[String],
+    credential_source: &CredentialMaskSource,
 ) -> Result<VerificationResult, HandoffError> {
     let handoff = store
         .transact(|tx| tx.artifact_handoff(artifact_id))?
@@ -1463,7 +1496,7 @@ pub fn verify_with_timeout(
     // toolchain/cache or a denied egress host records the same bounded
     // Inconclusive evidence a failed command would — never an
     // open-network fallback.
-    let enforcement = prepare_enforcement(layout, declared_egress_hosts);
+    let enforcement = prepare_enforcement(layout, declared_egress_hosts, credential_source);
     let environment_digest = enforcement.as_ref().ok().map(|e| match e {
         Enforcement::Hygiene => sha256_hex(
             "verification-env-v1",
