@@ -74,9 +74,11 @@ recorded here so the decision is explicit either way.
 - **Tag target is the freeze record's merge commit** — the
   docs-finalized descendant of the recorded candidate SHA — not
   "current main" at tag time. The recorded SHA stays the verified-code
-  SHA; before tagging, `git diff <recorded-sha> <tag-sha>` over
-  `crates/`, `Cargo.toml`, `Cargo.lock`, `.github/`, `scripts/` must be
-  empty (freeze checklist §5.2). The tag is applied with
+  SHA; before tagging, every path in
+  `git diff --name-only <recorded-sha> <tag-sha>` must be release
+  documentation (`docs/`, `README.md`) — an allowlist, so changes
+  outside the checked paths cannot pass silently (freeze checklist
+  §5.2). The tag is applied with
   `git tag -a v0.3.0 <tag-sha>` and verified with
   `git rev-list -n 1 v0.3.0` against the record.
 - **Patch releases** on the line reuse the procedure: `v0.3.1` tags the
@@ -119,8 +121,10 @@ the merges the evidence depends on. The freeze extends it:
    results run **on that exact commit** — not on whatever main happens
    to point at later.
 3. Any merge to `main` after recording invalidates the record: the
-   candidate is re-recorded and the checks re-run. A later merge does
-   not silently extend the candidate.
+   candidate is re-recorded and the checks re-run — unless the merge's
+   diff is confined to release documentation (the §5.2 allowlist), in
+   which case the empty-diff proof stands in for a gate re-run. Any
+   other later merge does not silently extend the candidate.
 4. The tag is applied to the freeze record's merge commit (§2) after
    the empty-diff check proves it carries the recorded SHA's code
    unchanged. Under the decided in-place publication route the tag

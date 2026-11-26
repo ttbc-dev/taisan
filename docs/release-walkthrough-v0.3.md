@@ -254,8 +254,10 @@ cited to the release notes' known-limitations section
       [release-freeze-checklist.md](release-freeze-checklist.md)).
 - [x] Each retained section re-marked: the drift between the
       retained drivers and `5f134b96` — version self-reports
-      (`0.0.0` → `0.3.0`) and the post-pin repairs #466/#469/
-      #419/#323/#398/#399 — is labelled where it surfaces (§6 w-2 carries the
+      (`0.0.0` → `0.3.0`) and the repairs #466/#469/
+      #419/#323 (after the `119dcb7` record, inside the pin) and
+      #398/#399 (added by the `5f134b96` re-pin) — is labelled where it
+      surfaces (§6 w-2 carries the
       #469 re-mark inline).
 - [ ] Owner decision: whether to add a fresh live-demonstration
       segment on the frozen commit (re-authorization required).

@@ -337,9 +337,10 @@ supported independently.
   `taisan --version`), #422 (preflight does not probe `gh`
   version/features — a distribution-default `gh` 2.45.0 broke
   adapter list calls; the recorded environment ran `gh` 2.105.0).
-- **Deferred residuals** — the #359 retained-body edges, #353
+- **Deferred residuals** — the #359 retained-body edges (issue
+  closed; deferred edges recorded in §6), plus #353
   (fixture-worker test orphans), #409 (#405 follow-ups), and
-  #302/#306/#139 are recorded open issues with bounded consequences;
+  #302/#306/#139 — recorded open issues with bounded consequences;
   see release-acceptance §6 for the complete ledger.
 - **Run-1 publish leg used operator workarounds** — the clean
   publish path is proven by run 3 on post-#421 code (and twice more

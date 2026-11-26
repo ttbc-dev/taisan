@@ -31,8 +31,8 @@ Merge pull request #435 from shimpeiws/issue-376-agent
 
 The candidate is `origin/main` HEAD at record time (2026-11-25) —
 **provisional**: it moves as remaining PRs merge (at record time PR
-#427 for #323 and PR #431 for #419 were open — #427 has since merged
-as `52a5493`, post the original `00fed69` pin; #431 merged as `e0e31e9`, post the same pin).
+#427 for #323 and PR #431 for #419 were open — both have since
+merged (`52a5493` and `e0e31e9`) and are inside the `00fed69` pin).
 
 **Frozen 2026-11-26, re-pinned the same day**: the owner signed off
 and the candidate is now pinned at
@@ -45,8 +45,9 @@ recorded and gate-verified earlier the same day, then superseded
 when #479 merged — the freeze checklist's "a merge never silently
 extends the candidate" rule re-established the record on the new
 SHA. The pin's
-history additionally carries the post-pin repairs `#466` (PR #467),
-`#469` (PR #474), `#419` (PR #431) and the release materials
+history additionally carries the repairs `#466` (PR #467),
+`#469` (PR #474), `#419` (PR #431) — merged after the `119dcb7`
+record, inside the pin — and the release materials
 themselves (PRs #472–#476); the §4 baseline re-run on the pinned
 SHA is recorded in
 [release-notes-v0.3.md](release-notes-v0.3.md)'s Verification
@@ -224,7 +225,7 @@ the guest at `/opt/taisan-v03/evidence/`).
 - New defects surfaced (recorded in §6/§7): #468 (`init` emits a
   numeric repository id the selector's gh backend cannot use —
   intake-1 `adapter_source_unavailable`), #469 (sandboxed cache
-  symlink → sticky `inconclusive` lane — **fixed post-pin by PR
+  symlink → sticky `inconclusive` lane — **fixed after the `119dcb7` record by PR
   #474**, §6/§7), #470
   (`work/w-N` publish-branch collisions across installations), #471
   (replayed candidates consuming `max_candidates` and starving new
@@ -303,9 +304,9 @@ names):
 | #409 — #405 follow-ups (watchdog gap, ppid edges, docs, regression test) | **Open — deferred, not release-blocking** | Residual test-harness/observability coverage items; the merged core fix stands. |
 | #353 — `workloop-fixture-worker` orphans leak past test exit | **Open — deferred, not release-blocking** | Test-infrastructure defect; it does not touch production behavior. |
 | #302, #306, #139 | **Open — backlog, not re-verified this pass** | Older defects (v2 negotiation capability identifiers, workspace-prepare direct fetch deviating from the rejected transport design, deferred PR #128 shadow findings); recorded open — no disposition claimed. |
-| #466 — fast-exiting output flood reports `success` instead of `limit_reached` | **Fixed on `main` post-pin — issue closed** (repair PR #467 merged `80cb059` — not an ancestor of the `119dcb7` record but an ancestor of the frozen pin `00fed69`) | Diagnosed to the monitor loop's child-exit drain path skipping the `log_truncated` → `limit = output_limit_reached` promotion (CI run 45690519468 flake exposed the real race). PR #467 promotes truncation once after the loop exits, first-wins preserved, with deterministic regression tests for both fast-exit and still-running floods. |
+| #466 — fast-exiting output flood reports `success` instead of `limit_reached` | **Fixed on `main` after the `119dcb7` record — issue closed** (repair PR #467 merged `80cb059` — not an ancestor of the `119dcb7` record but an ancestor of the frozen pin `00fed69`) | Diagnosed to the monitor loop's child-exit drain path skipping the `log_truncated` → `limit = output_limit_reached` promotion (CI run 45690519468 flake exposed the real race). PR #467 promotes truncation once after the loop exits, first-wins preserved, with deterministic regression tests for both fast-exit and still-running floods. |
 | #468 — `init` emits a numeric repository id the selector cannot use | **Deferred to v0.6 (milestone 11) — dispositioned in #365's final comment; issue open** | Scheduled intake fails closed out of the box (`adapter_source_unavailable` on tick 1); pilot workaround was a manual config edit. Doc-level workaround exists, so a docs-now/code-later split is plausible. |
-| #469 — symlinked `caches/*` dangles in the sandbox + sticky `inconclusive` lane | **Fixed on `main` post-pin** (repair PR #474 merged — not an ancestor of the `119dcb7` record but an ancestor of the frozen pin `00fed69`; issue closed; discovered in the #271 pilot) | Two coupled gaps it closed: (a) symlinked verification-boundary paths are now refused instead of degrading verification to permanent `inconclusive`; (b) the invariant check re-drives on unjudged conclusive evidence, so a stale inconclusive lane is no longer a dead end. (b) is on the released outcome-classification surface. |
+| #469 — symlinked `caches/*` dangles in the sandbox + sticky `inconclusive` lane | **Fixed on `main` after the `119dcb7` record** (repair PR #474 merged — not an ancestor of the `119dcb7` record but an ancestor of the frozen pin `00fed69`; issue closed; discovered in the #271 pilot) | Two coupled gaps it closed: (a) symlinked verification-boundary paths are now refused instead of degrading verification to permanent `inconclusive`; (b) the invariant check re-drives on unjudged conclusive evidence, so a stale inconclusive lane is no longer a dead end. (b) is on the released outcome-classification surface. |
 | #470 — `work/w-N` publish-branch collisions across installations | **Deferred to v0.6 (milestone 11) — dispositioned in #365's final comment; issue open** | Guarded refusal behaved correctly (never overwrote a foreign head); the deterministic name just makes collisions certain on shared/repeated installs. 4/7 pilot works hit it (w-1/w-3/w-4/w-5 — §7). |
 | #471 — replayed candidates consume `max_candidates` | **Deferred to v0.6 (milestone 11) — dispositioned in #365's final comment; issue open** | A permanently-replayed issue can starve new proposals; pilot unblocked by raising `pending_queue_limit` — tuning workaround exists. |
 
@@ -342,7 +343,7 @@ the pinned SHA):
 | #456 — `unavailable`/`provider_unavailable` check at exit 0 is lane-terminal | None (open) | Run 5 ×3 reproduction: `inv-16`/`inv-18`/`inv-20` (invariant_check) reported `provider_unavailable` at exit 0 — `checked`=true so no bounded re-request, assessment stays `complete:false`, completion permanently closed; worker log shows `api_error: connection_failed` after ~473 s while coding/fix Invocations went 4/4 |
 
 Repairs in flight at record time: PR #427 (sibling-PR conflict
-detection, #323) resolved post-pin — merged `52a5493` on `main`,
+detection, #323) resolved after the `119dcb7` record — merged `52a5493` on `main`,
 not an ancestor of the pinned `119dcb7`, landing on the provisional
 candidate line — and PR #431 (`artifact.json` collision, #419)
 merged `e0e31e9`, inside the frozen pin `00fed69`; the candidate is
@@ -361,7 +362,7 @@ converged path, and the verified-outcome settle stayed unexercised —
 each blocked by a filed defect (#447/#448/#449/#450).
 
 Run 5 (#270, owner-authorized, guest `taisan-v03`, driver built from
-`179f6fe` — post-pin) reached **M-1…M-6 PASS** on independent
+`179f6fe` — after the `119dcb7` record) reached **M-1…M-6 PASS** on independent
 Execution chains (e-3 → PR #66, e-4 → PR #67) — proven twice for
 M-1, M-3, M-4, M-5 and M-6; M-2 (independent invariant coverage) is
 proven on the e-3 chain only, e-4's `inv-18` having completed
@@ -424,14 +425,14 @@ v0.6 by the owner 2026-11-26, §6). States verified
 | #263 — connect produced commits to handoff/verification | Implemented — **closed by owner (2026-11-26)** | PR #348 (`d7f5a9f`) | none found |
 | #264 — real invariant/code-review assessments | Implemented — **closed by owner (2026-11-26)** | PR #349 (`b93b72d`) | none found |
 | #266 — production host effects/reconciliation | Implemented — **closed by owner (2026-11-26)** | PR #351 (`9642c2a`) | none found |
-| #269 — clean-install + real-Worker acceptance docs | Implemented — **closed by owner (2026-11-25)** | PR #356 (`9a79664`); runbook corrections merged via #465 (`827b9c0`, post-pin) | reproduction done — #367 closed the loop (row below) |
+| #269 — clean-install + real-Worker acceptance docs | Implemented — **closed by owner (2026-11-25)** | PR #356 (`9a79664`); runbook corrections merged via #465 (`827b9c0`, after the `119dcb7` record) | reproduction done — #367 closed the loop (row below) |
 | #410 / #411 / #412 — live-run finding fixes | Implemented | PR #413 (`bfa0412`) | verified live in runs 2–3 (§7); recommend close |
 | #366 — pluggable public Selector/Worker references | Closed | PR #404 (`f883d6e`) | done |
 | #368 — public-content/history/metadata audit | Audit delivered — **closed by owner (2026-11-25)** | PR #432 (`b0b81f6`) | `release-audit.md` §5 items resolved under the #438 ruling (recorded in its §7): in-place publication, history kept, private names acceptable — no disclosure review gates publication |
 | #369 — license selection prep | License selected and applied — **closed by owner (2026-11-25)** | PR #433 (`aff8721`) prep; PR #464 (merged `2f1a825`) applies | Owner chose MIT OR Apache-2.0: `LICENSE-MIT`/`LICENSE-APACHE` placed, workspace + 15-crate `license` metadata, README/`assets/LICENSE.md` exception for `taisan-hero.jpg` only, CONTRIBUTING dual-contribution note, `THIRD-PARTY.md` (87-crate inventory) + `LICENSES/` texts staged for source distribution |
-| #270 — manual real-Worker acceptance | M-1…M-7 exercised live — **closed by owner (2026-11-25)** | runs 1–6 retained owner-side | Run 6 done (run-6 authorization issue #270 comment `7161879297`; driver `c445feee` incl. the #458 fix, post-pin): M-7 verified outcome exercised — post-republish `invariant_check` → assessment `complete:true` → `succeeded` on e-5 (`RUN-RECORD-2026-11-25-RUN6.md`, sanitized copy `acceptance-v03-run6/`); M-7 row filled in `docs/evidence/v0.3-manual-acceptance.md`. Attribution recorded honestly: run 6's H1 review round sealed with zero occurrences, so the finding→judged-fix→republish legs (M-4/M-5/M-6) are evidenced by run 5's e-3/e-4 chains — the M-1…M-6 rows are recorded via the run-5 record (#457, merged post-pin). Owner approval of the record posted 2026-11-25 (comment `7171973494`, recorded in record §8); the restart-clean store-recovery variant left unexercised by runs 1–6 was evidenced by the #271 pilot (§5 — planned SIGINT plus an unplanned guest VM restart, orphaned invocations re-minted). Residual: none against #270 itself |
-| #271 — scheduled pilot acceptance | **Exercised — all acceptance criteria met — closed by owner (2026-11-25)** | `RUN-RECORD-2026-11-26-PILOT.md` + 66 sanitized evidence files owner-side (`acceptance-v03-pilot/`; guest originals `/opt/taisan-v03/evidence/`) | Authorized pilot (comment `7171885803`) on the clean #367 install: 7 Works admitted across scheduled ticks, w-6/w-7 `succeeded` via the verified real path; queue_full/replay/selector-outage/restart×2 (planned + unplanned VM)/disable-reenable all durable; `issue_claims` single ownership; per-Work interventions, wall time and usage recorded honestly. Surfaced defects #468–#471 (§6/§7 — #469 fixed post-pin by PR #474; the rest deferred to v0.6 milestone 11 per #365) |
-| #367 — clean-Linux-install reproduction | **Done — closed by owner (2026-11-25)** | `RUN-RECORD-2026-11-25-CLEAN.md` + 26 sanitized evidence files owner-side (`acceptance-v03-clean/`) | Fresh OrbStack guest `taisan-clean` (Ubuntu noble arm64): runbook steps verified verbatim or as typed documented failures; 4 binaries installed; full ops cycle on the fixture binding; all 10 sandbox probes passed; real Worker `describe` + offline `select` proven. Doc gaps fixed and merged via #465 (`827b9c0`, post-pin). One verification gap stands: `git clone` unverifiable while the repo is private — no longer release-blocking under the #438 publication ruling; it closes when the owner flips visibility |
+| #270 — manual real-Worker acceptance | M-1…M-7 exercised live — **closed by owner (2026-11-25)** | runs 1–6 retained owner-side | Run 6 done (run-6 authorization issue #270 comment `7161879297`; driver `c445feee` incl. the #458 fix, after the `119dcb7` record): M-7 verified outcome exercised — post-republish `invariant_check` → assessment `complete:true` → `succeeded` on e-5 (`RUN-RECORD-2026-11-25-RUN6.md`, sanitized copy `acceptance-v03-run6/`); M-7 row filled in `docs/evidence/v0.3-manual-acceptance.md`. Attribution recorded honestly: run 6's H1 review round sealed with zero occurrences, so the finding→judged-fix→republish legs (M-4/M-5/M-6) are evidenced by run 5's e-3/e-4 chains — the M-1…M-6 rows are recorded via the run-5 record (#457, merged after the `119dcb7` record). Owner approval of the record posted 2026-11-25 (comment `7171973494`, recorded in record §8); the restart-clean store-recovery variant left unexercised by runs 1–6 was evidenced by the #271 pilot (§5 — planned SIGINT plus an unplanned guest VM restart, orphaned invocations re-minted). Residual: none against #270 itself |
+| #271 — scheduled pilot acceptance | **Exercised — all acceptance criteria met — closed by owner (2026-11-25)** | `RUN-RECORD-2026-11-26-PILOT.md` + 66 sanitized evidence files owner-side (`acceptance-v03-pilot/`; guest originals `/opt/taisan-v03/evidence/`) | Authorized pilot (comment `7171885803`) on the clean #367 install: 7 Works admitted across scheduled ticks, w-6/w-7 `succeeded` via the verified real path; queue_full/replay/selector-outage/restart×2 (planned + unplanned VM)/disable-reenable all durable; `issue_claims` single ownership; per-Work interventions, wall time and usage recorded honestly. Surfaced defects #468–#471 (§6/§7 — #469 fixed after the `119dcb7` record by PR #474; the rest deferred to v0.6 milestone 11 per #365) |
+| #367 — clean-Linux-install reproduction | **Done — closed by owner (2026-11-25)** | `RUN-RECORD-2026-11-25-CLEAN.md` + 26 sanitized evidence files owner-side (`acceptance-v03-clean/`) | Fresh OrbStack guest `taisan-clean` (Ubuntu noble arm64): runbook steps verified verbatim or as typed documented failures; 4 binaries installed; full ops cycle on the fixture binding; all 10 sandbox probes passed; real Worker `describe` + offline `select` proven. Doc gaps fixed and merged via #465 (`827b9c0`, after the `119dcb7` record). One verification gap stands: `git clone` unverifiable while the repo is private — no longer release-blocking under the #438 publication ruling; it closes when the owner flips visibility |
 | #370 / #371 — candidate freeze; go/no-go | #370 freeze executed — candidate pinned `00fed69` then re-pinned `5f134b96` (2026-11-26, this PR) after the #479 repair merged; #371 not started | — | #371's go/no-go reads this ledger, the pinned SHA and the notes' Verification record; defect dispositions all recorded (#437 → v0.6 per owner 2026-11-26); the route (#438) and license (#464) are decided |
 | #267 — stop/restart/recovery integration | Implemented — **closed by owner (2026-11-26)** | PR #352 | evidenced the §4 restart/recovery row |
 
@@ -516,7 +517,7 @@ record.
   the pilot-discovered #468, #470, #471 are deferred to v0.6
   (milestone 11) and the earlier deferred set #453–#456 stays
   deferred to v0.6; #469, the one touching the released
-  outcome-classification surface, was repaired post-pin by PR #474.
+  outcome-classification surface, was repaired after the `119dcb7` record by PR #474.
   #437 (`remote_collect` zero-byte artifact) was flagged for owner
   review in the comment; the owner dispositioned it 2026-11-26 —
   deferred to v0.6 (milestone 11), confirmed present on the

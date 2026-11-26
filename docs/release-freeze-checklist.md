@@ -48,7 +48,7 @@ Resolved at freeze (2026-11-26):
       code-state claim),
       #468/#470/#471 deferred to v0.6 (milestone 11) and the earlier
       deferred set #453–#456 unchanged → v0.6,
-      #469 fixed post-pin by #474. Owner acts completed
+      #469 fixed after the `119dcb7` record by #474. Owner acts completed
       2026-11-26: the dispositioned defect issues #313/#358/#359/
       #361/#398/#399/#400 were closed under the owner's 'Fixed on
       the release candidate' wording (a disposition act, not
@@ -60,9 +60,10 @@ Resolved at freeze (2026-11-26):
       [release-acceptance-v0.3.md](release-acceptance-v0.3.md) §6–§7;
       user-facing ones sit in the notes' known-limitations.
 - [x] Merge the open repair PRs or defer them explicitly:
-      #431 (#419) — **merged `e0e31e9` 2026-11-26** — and
-      #479 (#398/#399) — **merged `5f134b96` 2026-11-26**,
-      post-pin; the re-pinned candidate carries the fix. (#472's
+      #431 (#419) — **merged `e0e31e9` 2026-11-26, inside the
+      `00fed69` pin** — and #479 (#398/#399) — **merged `5f134b96`
+      2026-11-26 after the pin; the merge became the re-pinned
+      candidate** and carries the fix. (#472's
       ledger fold-in merged as `d87d5dc` — the
       notes cite the retained owner-side run records, not that PR —
       and #427 merged as `52a5493`.)
@@ -93,7 +94,11 @@ git log -1 --format='%H%n%ad%n%s' --date=iso-strict origin/main
 Record the SHA, the `git log -1` output, and the retrieval date in
 the release notes' verification section
 ([release-notes-v0.3.md](release-notes-v0.3.md)). Any later merge
-invalidates the record — re-record and re-run §4; a merge never
+invalidates the record — re-record and re-run §4 — unless the merge's
+diff against the candidate is confined to release documentation (the
+§5.2 allowlist): a docs-only merge does not invalidate the verified
+code, so the §5.2 proof stands in for a §4 re-run and §4 on the tag
+SHA stays optional. A merge never
 silently extends the candidate.
 
 ## 4. Re-run the baseline gates on the pinned commit
@@ -148,12 +153,16 @@ its own pin, but it can carry the finalized documents).
 #    "latest main" (another PR may merge in between):
 TAG_SHA=$(gh pr view 478 --repo ttbc-dev/taisan \
           --json mergeCommit --jq .mergeCommit.oid)
+git fetch origin main          # the pin checkout does not carry
+                               # $TAG_SHA until fetched
 # 2. Verify the tag tree differs from the verified code SHA in
-#    release docs only — this check MUST print nothing:
-git diff 5f134b96 "$TAG_SHA" -- \
-  crates/ Cargo.toml Cargo.lock .github/ scripts/
-#    (if it prints anything, stop: the tag is not the release
-#     candidate — a code change slipped in; re-run §3/§4 instead)
+#    release docs only — every changed path must be documentation;
+#    this check MUST print nothing:
+git diff --name-only 5f134b96 "$TAG_SHA" | \
+  grep -vE '^(docs/|README\.md$)'
+#    (any output is a non-documentation change — a five-path check
+#     would miss LICENSES/, fixtures/, skills/, which cargo-dist
+#     archives bundle; stop and re-run §3/§4 instead)
 # 3. Optional exact-match policy: re-run §4 on $TAG_SHA itself.
 #    With step 2 empty, code identity makes this redundant.
 git tag -a v<version> "$TAG_SHA"     # annotated; message cites
@@ -180,8 +189,9 @@ git rev-list -n 1 v<version>         # must equal $TAG_SHA
 - [x] Re-mark every walkthrough section: "retained — predates
       candidate" where the frozen commit differs from the exercised
       code — done in the freeze record: the drift is the version
-      self-report (`0.0.0` → `0.3.0`) plus the post-pin behavioral
-      repairs #466/#469/#419/#323/#398/#399, labelled in
+      self-report (`0.0.0` → `0.3.0`) plus the behavioral
+      repairs #466/#469/#419/#323 (after the `119dcb7` record, inside
+      the pin) and #398/#399 (added by the `5f134b96` re-pin), labelled in
       [release-walkthrough-v0.3.md](release-walkthrough-v0.3.md)
       (§6 w-2 carries the #469 re-mark inline);
       re-recording a live-demo segment stays an owner decision.
