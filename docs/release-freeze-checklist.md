@@ -1,6 +1,8 @@
 # Release freeze checklist — mechanical steps
 
-Status: **executed through §4 — candidate re-pinned** (issue #370).
+Status: **executed through §4 — candidate re-pinned** (issue #370);
+§6's documentation sweeps are recorded by this freeze record itself;
+§5 tag/dist and publication remain pending.
 The owner signed off
 2026-11-26 (version `0.3.0`; defect issues closed; #437 deferred to
 v0.6); the candidate was first pinned at

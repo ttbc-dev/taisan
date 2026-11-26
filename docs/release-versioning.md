@@ -222,7 +222,7 @@ binaries**, not as a registry package.
 
 ## 7. What remains for the owner
 
-| Decision | Options | This draft |
+| Decision | Options | This record |
 | --- | --- | --- |
 | Release version | `0.3.0` (proposed) / `1.0.0` | **decided: `0.3.0`** — owner decision, 2026-11-26; accompanying owner acts also exercised (candidate sign-off → `00fed69`, re-pinned `5f134b96` on merge of the #398/#399 repair; #437 disposition recorded on the issue) — status paragraph, freeze checklist |
 | Candidate commit | recorded `origin/main` SHA at sign-off (§3) | **named** — `5f134b964aca05637d4fa1fc8198779dd408913f`, re-pinned 2026-11-26 (original pin `00fed690cf2993e220116901f1c2d14584305e18` recorded earlier the same day, superseded when PR #479 merged) |
