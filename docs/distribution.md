@@ -13,7 +13,7 @@ the candidate.
 ## What ships
 
 The workspace allowlist in `[workspace.metadata.dist].packages`
-distributions exactly the documented install surface
+distributes exactly the documented install surface
 ([v0.3 installation](v0.3-installation.md),
 [reference adapters](reference-adapters.md)):
 
@@ -44,8 +44,12 @@ Excluded and why:
   compiling the package from source, which builds and installs all
   of its bins.
 - `workloop-fixture-selector`, `workloop-contract-worker`, and
-  `taisan-executor` are test fixtures or unshipped surface and are not
-  in `packages`.
+  `taisan-executor` are test fixtures or unshipped surface. They are not
+  in `packages` — which alone does not suffice: in cargo-dist 0.34.0 a
+  versioned binary crate outside `packages` is still auto-detected and
+  shipped (verified with `dist plan`), so each also carries
+  `[package.metadata.dist] dist = false` in its own manifest to pin the
+  exclusion through the #370 version freeze.
 
 ## Release flow
 
@@ -60,12 +64,26 @@ GitHub Release and uploads everything) → `publish-homebrew-formula`
 `announce`. Pull requests run `dist plan` only (`pr-run-mode =
 "plan"`), which exercises the matrix without building.
 
-After editing `[workspace.metadata.dist]` or any
-`[package.metadata.dist]`, regenerate CI with `dist generate
---mode=ci`; `dist generate --mode=ci --check` fails if the workflow
-drifted from the config. `release.yml` is fully generated — do not
-hand-edit it; use `allow-dirty = ["ci"]` if that ever becomes
-necessary.
+`release.yml` is no longer fully generated. It carries a hand-applied
+permissions patch, marked by a `LOCAL MODIFICATION` header: the
+workflow-level `GITHUB_TOKEN` is scoped to `contents: read`, and only
+the tag-gated `host` job — the one that runs `dist host
+--steps=upload --steps=release` and `gh release create` — escalates to
+`contents: write`. The `pull_request`-triggered `plan` job (which runs
+the `curl | sh` dist installer and `dist plan`) is therefore
+read-only; `dist host --steps=create` performs no GitHub writes for
+`hosting = "github"`, so `plan` needs nothing more. cargo-dist 0.34.0
+cannot express permissions for its built-in jobs
+(`github-custom-job-permissions` covers only user-defined custom
+jobs), so `[workspace.metadata.dist].allow-dirty = ["ci"]` keeps `dist
+generate` from silently reverting the patch.
+
+The cost of `allow-dirty`: `dist generate --mode=ci` (and `--check`)
+skips `release.yml` entirely, so CI-affecting config changes no longer
+regenerate it. To resync after editing `[workspace.metadata.dist]`,
+temporarily remove `allow-dirty`, run `dist generate --mode=ci`,
+re-apply the permissions patch (read at workflow level, write on
+`host`), then restore `allow-dirty`.
 
 ## Install routes
 

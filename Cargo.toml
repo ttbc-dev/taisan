@@ -17,6 +17,11 @@ cargo-dist-version = "0.34.0"
 ci = "github"
 # Which actions to run on pull requests
 pr-run-mode = "plan"
+# release.yml carries a hand-applied permissions patch (GITHUB_TOKEN is
+# scoped per job; cargo-dist 0.34.0 cannot express built-in job
+# permissions). Mark the CI output dirty-tolerant so `dist generate`
+# does not silently clobber the patch — see docs/distribution.md.
+allow-dirty = ["ci"]
 # Target platforms to build apps for (Rust target-triple syntax).
 # Linux + macOS on x86_64 and aarch64 only: the codebase is unix-only
 # and containment is a Linux feature, so no Windows or musl matrix.
@@ -50,6 +55,11 @@ hosting = "github"
 # Everything else in the workspace is an internal library crate or a
 # test-only fixture (workloop-fixture-selector,
 # workloop-contract-worker) and must not produce release artifacts.
+# Note: this list does not by itself suppress auto-detection — in dist
+# 0.34.0 a versioned binary crate outside `packages` still ships, so the
+# non-shipped binary crates (workloop-executor,
+# workloop-fixture-selector, workloop-contract-worker) also carry
+# `[package.metadata.dist] dist = false`.
 packages = [
     "workloop-cli",
     "workloop-tui",
