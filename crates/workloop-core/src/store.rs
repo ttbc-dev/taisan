@@ -722,6 +722,22 @@ pub trait ReadView {
         idempotency_key: &str,
     ) -> Result<Option<(String, CommandDecision)>, StoreError>;
 
+    /// Distinct idempotency keys carrying a saved decision for
+    /// `(origin, actor)`. Intake uses this to size a selector request
+    /// beyond the known replay identities: re-presenting a saved
+    /// decision creates no new pending position, so a replay must not
+    /// consume the budget that new proposals need.
+    ///
+    /// The default has no durable history to report; the SQLite store
+    /// overrides it with the command ledger.
+    fn decided_idempotency_keys(
+        &self,
+        _origin: &Origin,
+        _actor: &Actor,
+    ) -> Result<Vec<String>, StoreError> {
+        Ok(Vec::new())
+    }
+
     fn command_decision(
         &self,
         command_id: &CommandId,

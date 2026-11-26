@@ -1684,6 +1684,21 @@ impl ReadView for Tx<'_> {
         )
     }
 
+    fn decided_idempotency_keys(
+        &self,
+        origin: &Origin,
+        actor: &Actor,
+    ) -> Result<Vec<String>, StoreError> {
+        let actor_kind = tag(&actor.kind);
+        self.query_all(
+            "SELECT DISTINCT idempotency_key FROM commands \
+             WHERE origin=?1 AND actor_kind=?2 AND actor_id=?3 \
+             ORDER BY idempotency_key",
+            params![origin.0, actor_kind, actor.external_id],
+            |row| row.get(0),
+        )
+    }
+
     fn command_decision(
         &self,
         command_id: &CommandId,

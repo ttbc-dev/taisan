@@ -172,8 +172,9 @@ pub fn run_intake_with_owner(
     // Preflight in one deferred read: an already-active run refuses
     // the invocation outright (the lease makes this rare — it covers
     // a run left by a dead owner awaiting recovery), the pending
-    // queue's free positions size `max_candidates`, and the live
-    // source owners become the request's exclusions.
+    // queue's free positions size `max_candidates`, the live source
+    // owners become the request's exclusions, and the ledger names
+    // every replay identity whose decision is already saved.
     let preflight = store.transact_deferred(|tx| {
         if let Some(run) = tx.active_intake_run()? {
             return Ok(Preflight::Active(run.run_id));
@@ -184,19 +185,23 @@ pub fn run_intake_with_owner(
             .unwrap_or(DEFAULT_PENDING_QUEUE_LIMIT);
         let occupied = tx.pending_queue_count()?;
         let owned = tx.intake_owned_issues()?;
+        let decided =
+            tx.decided_idempotency_keys(&Origin(admission::SELECTOR_ORIGIN.into()), params.actor)?;
         Ok(Preflight::Ready {
             limit,
             occupied,
             owned,
+            decided,
         })
     })?;
 
-    let (limit, occupied, mut owned) = match preflight {
+    let (limit, occupied, mut owned, decided) = match preflight {
         Preflight::Ready {
             limit,
             occupied,
             owned,
-        } => (limit, occupied, owned),
+            decided,
+        } => (limit, occupied, owned, decided),
         Preflight::Active(run_id) => return Err(IntakeError::ActiveRun { run_id }),
     };
 
@@ -208,6 +213,23 @@ pub fn run_intake_with_owner(
     owned.dedup();
     let exclusions = owned;
 
+    // A candidate whose saved decision is re-presented is `replayed`
+    // and creates no new pending position, but it still counts
+    // against the adapter's returned-candidate bound. Size the ask
+    // beyond the free positions by every known replay identity this
+    // selector owns, so a permanently-replayed Issue can never soak
+    // the budget new proposals need. The count is an upper bound —
+    // unknown/stale keys only ask for extra candidates, which the
+    // capacity check defers — and the wire bound still caps the ask.
+    let replay_prefix = format!(
+        "{}{}:",
+        admission::REPLAY_KEY_PREFIX,
+        params.binding.adapter
+    );
+    let known_replays = decided
+        .iter()
+        .filter(|key| key.starts_with(&replay_prefix))
+        .count() as u64;
     // The run record copies the *held* lease's owner identity — the
     // storage contract's provenance for "who held this invocation" —
     // not a second, unrelated acquisition identity.
@@ -245,7 +267,9 @@ pub fn run_intake_with_owner(
         );
     }
 
-    let max_candidates = free.min(u64::from(protocol::MAX_CANDIDATES)) as u32;
+    let max_candidates = free
+        .saturating_add(known_replays)
+        .min(u64::from(protocol::MAX_CANDIDATES)) as u32;
     let spec = protocol::RequestSpec {
         request_id: &request_id,
         selector: &params.binding.adapter,
@@ -457,6 +481,9 @@ enum Preflight {
         limit: u32,
         occupied: u64,
         owned: Vec<IssueRef>,
+        /// Idempotency keys with a saved selector decision; the
+        /// coordinator filters them to this binding's replay prefix.
+        decided: Vec<String>,
     },
     Active(String),
 }
