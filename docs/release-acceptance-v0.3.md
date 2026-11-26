@@ -48,7 +48,8 @@ SHA. The pin's
 history additionally carries the repairs `#466` (PR #467),
 `#469` (PR #474), `#419` (PR #431) — merged after the `119dcb7`
 record, inside the pin — and the release materials
-themselves (PRs #472–#476); the §4 baseline re-run on the pinned
+themselves (PRs #472/#473/#475/#476; #474 is the #469 repair, not
+materials); the §4 baseline re-run on the pinned
 SHA is recorded in
 [release-notes-v0.3.md](release-notes-v0.3.md)'s Verification
 record. `5f134b96` is the **verified-code** SHA: the release tag

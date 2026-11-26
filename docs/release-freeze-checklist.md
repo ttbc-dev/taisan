@@ -17,7 +17,8 @@ the owner acts (live-demo segment, visibility flip) remain.
 Steps marked *owner* require an explicit owner decision; everything
 else is mechanical. Items are in execution order: each step gates
 the next, and any merge to `main` after step 3 invalidates the
-recorded candidate.
+recorded candidate unless its diff is confined to release
+documentation (§3, §5.2).
 
 ## 1. Preconditions — all true before step 2
 
