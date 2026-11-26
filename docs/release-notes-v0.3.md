@@ -114,8 +114,10 @@ values from the retained owner-run `describe` captures at freeze time.
 - **Rust toolchain** supporting edition 2024 for source builds
   (`cargo build --workspace`; `cargo install --path
   crates/workloop-cli --bin taisan`). The packaged binaries are
-  `taisan`, `taisan-tui`, `public-issue-selector`, and
-  `taisan-worker-claude` ([licensing inventory](licensing-prep.md) §2).
+  `taisan`, `taisan-tui`, `public-issue-selector`,
+  `taisan-worker-claude`, and the fixture Worker
+  `workloop-fixture-worker` ([licensing inventory](licensing-prep.md)
+  §2, [distribution](distribution.md)).
 - **`gh` CLI** for the GitHub host driver and the Selector's live
   source reads — a current release is required: a distribution-default
   `gh` 2.45.0 lacked `gh api --slurp` and broke adapter list calls;
@@ -155,9 +157,11 @@ Build precedes test because contract tests spawn
 `target/debug/workloop-fixture-worker`. **TODO at freeze:** re-run all
 four gates on the recorded candidate commit and replace this table —
 a freeze never inherits a check record from a different commit. The
-supported build/install route is the source-build path above; **TODO:**
-record packaged-artifact checksums here only if binaries are
-distributed (none are planned by this draft; owner decides).
+supported build/install route is the source-build path above; a
+cargo-dist binary route is wired per #441
+([distribution](distribution.md)) but produces artifacts only once a
+tag is cut. **TODO:** record packaged-artifact checksums here once a
+release produces them.
 
 ## Known limitations
 

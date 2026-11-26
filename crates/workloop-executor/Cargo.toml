@@ -7,6 +7,14 @@ license.workspace = true
 name = "taisan-executor"
 path = "src/bin/taisan-executor.rs"
 
+# taisan-executor is an internal binary, not release surface:
+# `[workspace.metadata.dist].packages` does not suppress cargo-dist's
+# auto-detection of other binary crates — a versioned crate outside the
+# list still ships (verified with dist 0.34.0). The #370 version freeze
+# gives every crate a version, so pin the exclusion here.
+[package.metadata.dist]
+dist = false
+
 [dependencies]
 workloop-core = { path = "../workloop-core" }
 workloop-exec = { path = "../workloop-exec" }
