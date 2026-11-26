@@ -20,8 +20,11 @@ the pin — #466 (post-exit output flood now promotes to
 `output_limit_reached`), #469 (symlinked verification-boundary paths
 are refused and the invariant check re-drives unjudged conclusive
 evidence — this changes the §6 w-2 path), #419 (`artifact.json`
-collision plus a component-wise symlink guard), and #323
-(sibling-PR conflict detection). A fresh live-demonstration segment on the frozen commit
+collision plus a component-wise symlink guard), #323
+(sibling-PR conflict detection), and #398/#399
+(contained-verification credential masking: `masked_files` was
+left empty and mask coverage only matched system-bind prefixes —
+both repaired on the candidate, sentinel-verified). A fresh live-demonstration segment on the frozen commit
 remains a separate owner decision (closing checklist); this document
 deliberately ships the retained-run form only.
 

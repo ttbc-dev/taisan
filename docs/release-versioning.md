@@ -48,8 +48,9 @@ that ordinal visible in the public identity:
   release can ship as `0.3.1`, `0.3.2`, … without reusing the milestone
   ordinal. Pre-1.0 semantics apply: minor bumps may change behavior;
   patch bumps are for fixes on a frozen release line only.
-- **Tag:** `v0.3.0` — annotated tag (`git tag -a`) on the frozen
-  candidate commit once the freeze criteria below are met.
+- **Tag:** `v0.3.0` — annotated tag (`git tag -a`) on the freeze
+  record's merge commit (docs-finalized descendant of the frozen
+  candidate) once the freeze criteria below are met.
 - **Release title:** "taisan 0.3.0 — initial public release (validated
   v0.3)" or owner-adjusted equivalent; the title names the validated
   unit so release names stay consistent with the milestone and the
@@ -70,19 +71,25 @@ recorded here so the decision is explicit either way.
   acceptance record ([release-acceptance-v0.3.md](release-acceptance-v0.3.md)
   §1), and the milestone — so `git show v0.3.0` is itself a small
   provenance record.
-- **Tag target is the recorded candidate commit**, not "current main"
-  at tag time. The candidate is recorded before tagging (§3); the tag
-  is applied with `git tag -a v0.3.0 <recorded-sha>` and verified with
+- **Tag target is the freeze record's merge commit** — the
+  docs-finalized descendant of the recorded candidate SHA — not
+  "current main" at tag time. The recorded SHA stays the verified-code
+  SHA; before tagging, `git diff <recorded-sha> <tag-sha>` over
+  `crates/`, `Cargo.toml`, `Cargo.lock`, `.github/`, `scripts/` must be
+  empty (freeze checklist §5.2). The tag is applied with
+  `git tag -a v0.3.0 <tag-sha>` and verified with
   `git rev-list -n 1 v0.3.0` against the record.
 - **Patch releases** on the line reuse the procedure: `v0.3.1` tags the
   recorded fix commit after the same check record.
 - **Tag placement is direct under the decided publication route.** The
   #438 ruling is in-place publication with the existing history kept —
   the published `main` *is* this repository's `main`, so the tag names
-  the recorded candidate commit itself, with no rewritten-history
-  duality to carry. Publication must still precede the release's
-  public announcement steps, but the tag object, the candidate record,
-  and the published history all name the same SHA.
+  a descendant of the recorded candidate whose code content is
+  byte-identical to it (verified by the §5.2 empty-diff check), with
+  no rewritten-history duality to carry. Publication must still
+  precede the release's public announcement steps, and the tag object,
+  the candidate record, and the published history all trace to the
+  same verified-code SHA.
 
 ## 3. Candidate-commit recording procedure
 
@@ -114,10 +121,11 @@ the merges the evidence depends on. The freeze extends it:
 3. Any merge to `main` after recording invalidates the record: the
    candidate is re-recorded and the checks re-run. A later merge does
    not silently extend the candidate.
-4. The tag is applied only against the recorded SHA (§2). Under the
-   decided in-place publication route the recorded SHA and the
-   published history's commit are the same object — no pre/post-rewrite
-   pair needs to be carried.
+4. The tag is applied to the freeze record's merge commit (§2) after
+   the empty-diff check proves it carries the recorded SHA's code
+   unchanged. Under the decided in-place publication route the tag
+   target and the published history's commit are the same object — no
+   pre/post-rewrite pair needs to be carried.
 
 ## 4. Version metadata alignment
 
