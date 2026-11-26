@@ -155,9 +155,11 @@ These steps are owner operations, not part of this change:
 
 ## Verification
 
-`dist plan` (cargo-dist 0.34.0) produces five apps × four targets of
+`dist plan` (cargo-dist 0.34.0) plans five apps × four targets of
 `*.tar.xz` archives, each with a `*.sha256` checksum plus a per-app
 unified `sha256.sum`, a `*-installer.sh` shell installer, a Homebrew
-`*.rb` formula, and a checksummed `source.tar.gz`. `dist build
---artifacts=global` emits the same installers and formulas under
-`target/distrib/` for inspection without cutting a release.
+`*.rb` formula, and a checksummed `source.tar.gz` — the artifacts
+themselves are produced by `dist build`/`dist host`, not `dist
+plan`. `dist build --artifacts=global` emits the same installers and
+formulas under `target/distrib/` for inspection without cutting a
+release.
