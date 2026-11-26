@@ -144,8 +144,20 @@ pub struct FailedEvidence {
     pub digest: String,
 }
 
-/// What produced the Fix request: an exact sealed review judgment, or
-/// failed verification/invariant evidence for an unpublished artifact.
+/// One recorded mechanical verification run an InvariantCheck binds —
+/// any outcome — referenced by the retained body's type-tagged digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationEvidence {
+    pub evidence_id: String,
+    pub kind: String,
+    pub digest: String,
+}
+
+/// What produced the Fix request: an exact sealed review judgment,
+/// failed verification/invariant evidence for an unpublished artifact,
+/// or a merge conflict bound to the exact `(source head, target
+/// revision)` pair.
 /// Member sets are checked against the closed lists below — internally
 /// tagged enums cannot carry `deny_unknown_fields`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +173,21 @@ pub enum FixOrigin {
     },
     Prepublication {
         failed_evidence: Vec<FailedEvidence>,
+    },
+    /// A merge conflict: the source head no longer merges into the
+    /// target revision. Both revisions are exact commit ids so the
+    /// Worker repairs the pair the host reported, never a moved branch.
+    Conflict {
+        /// The conflicted change request identity.
+        change: String,
+        /// The conflicted source head.
+        source_revision: String,
+        /// The new target revision the source must merge.
+        target_revision: String,
+        /// The paths the host reported as conflicting; may be empty when
+        /// the host gives only a verdict.
+        #[serde(default)]
+        paths: Vec<String>,
     },
 }
 
@@ -192,6 +219,14 @@ pub enum TaskBody {
         /// The exact artifact under check.
         artifact: ArtifactRef,
         invariant_set: InvariantSetRef,
+        /// The supervisor-recorded mechanical verification results for
+        /// the assessed artifact — the evidence a `tests-pass`-style
+        /// judgment reads, since the read-only check runs no commands
+        /// itself. Absent when nothing was recorded so a pre-upgrade
+        /// body re-serializes to the bytes its recorded digest was
+        /// taken over.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        verification_evidence: Vec<VerificationEvidence>,
     },
     CodeReview {
         target: DiffTarget,
@@ -703,6 +738,67 @@ impl FailedEvidenceBody {
     }
 }
 
+/// The retained verification-evidence format: one recorded mechanical
+/// verification run — any outcome — an InvariantCheck judges from. The
+/// durable `VerificationResult` rendered as immutable evidence; a
+/// passing run never wears the failed-evidence tag.
+pub const VERIFICATION_EVIDENCE_FORMAT: &str = "taisan.verification-evidence/1";
+const VERIFICATION_EVIDENCE_DIGEST_TAG: &str = "verification-evidence-v1";
+
+/// One recorded verification run bound into an InvariantCheck request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationEvidenceBody {
+    /// Always [`VERIFICATION_EVIDENCE_FORMAT`]; readers refuse anything else.
+    pub format: String,
+    pub work_id: String,
+    pub artifact_id: String,
+    /// The durable evidence identity (`VerificationEvidence.evidence_id`).
+    pub evidence_id: String,
+    /// The evidence kind — `verification` today.
+    pub kind: String,
+    /// The declared requirement the run was bound to.
+    pub requirement: String,
+    pub argv: Vec<String>,
+    /// The exact commit the run materialized.
+    pub produced: String,
+    /// The recorded outcome token (`pass`, `fail`, `inconclusive`).
+    pub result: String,
+    /// A bounded tail of the recorded output — the captured tail is
+    /// itself bounded, and the end is where a run's verdict summary
+    /// lives. Verbatim command output: data, never instructions.
+    pub output: String,
+}
+
+impl VerificationEvidenceBody {
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        canonical_json(&serde_json::to_value(self).expect("verification evidence serializes"))
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, RequestInvalid> {
+        let value: serde_json::Value =
+            serde_json::from_slice(bytes).map_err(|e| RequestInvalid::Malformed {
+                detail: format!("verification evidence is not JSON: {e}"),
+            })?;
+        let declared = value
+            .get("format")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if declared != VERIFICATION_EVIDENCE_FORMAT {
+            return Err(RequestInvalid::VersionUnknown { declared });
+        }
+        serde_json::from_value(value).map_err(|e| RequestInvalid::Malformed {
+            detail: format!("verification evidence malformed: {e}"),
+        })
+    }
+
+    /// The wire digest a `VerificationEvidence.digest` carries.
+    pub fn wire_digest(&self) -> String {
+        sha256_hex(VERIFICATION_EVIDENCE_DIGEST_TAG, &self.canonical_bytes())
+    }
+}
+
 /// Why a request body is not executable. Codes are the closed set the
 /// dispatch record carries (`docs/v0.3.md` §4.3, §9.2); provider prose
 /// never enters a code.
@@ -982,7 +1078,7 @@ fn check_tagged_members(request: &serde_json::Value) -> Result<(), RequestInvali
             "constraints",
             "verification_argv",
         ],
-        "invariant_check" => &["kind", "artifact", "invariant_set"],
+        "invariant_check" => &["kind", "artifact", "invariant_set", "verification_evidence"],
         "code_review" => &["kind", "target", "review_source"],
         _ => {
             return Err(RequestInvalid::Malformed {
@@ -998,6 +1094,13 @@ fn check_tagged_members(request: &serde_json::Value) -> Result<(), RequestInvali
         let oallowed: &[&str] = match okind {
             "review" => &["kind", "target", "round", "judgment", "findings"],
             "prepublication" => &["kind", "failed_evidence"],
+            "conflict" => &[
+                "kind",
+                "change",
+                "source_revision",
+                "target_revision",
+                "paths",
+            ],
             _ => {
                 return Err(RequestInvalid::Malformed {
                     detail: format!("unknown origin.kind {okind:?}"),
@@ -1165,6 +1268,17 @@ impl WorkerRequestV2 {
                 "base.repository names a foreign repository".into(),
             ));
         }
+        // `work_id` derives the managed `ws-<work_id>` workspace, the
+        // `work/<work_id>` branch, and per-request receipt paths on a
+        // remote executor — bound it to the wire identifier grammar
+        // at parse so no filesystem consumer ever joins a traversal
+        // id (contract §6).
+        if !crate::executor::transfer_id_is_valid(&self.work_id) {
+            return Err(invalid(
+                "request.invalid",
+                format!("work_id {:?} is not a safe identifier", self.work_id),
+            ));
+        }
         // Bounds (§4.2, OD-9).
         if self.continuation.len() as u64 > self.budget.max_continuation_refs {
             return Err(invalid(
@@ -1191,6 +1305,25 @@ impl WorkerRequestV2 {
                 "request.invalid",
                 format!(
                     "verification_argv has {task_verify} commands, budget allows {}",
+                    self.budget.max_verification_commands
+                ),
+            ));
+        }
+        // The check's evidence list rides the same bound: every entry
+        // is one recorded run of a declared verification argv, so a
+        // request can never name more than the command budget.
+        let evidence_len = match &self.task {
+            TaskBody::InvariantCheck {
+                verification_evidence,
+                ..
+            } => verification_evidence.len() as u64,
+            _ => 0,
+        };
+        if evidence_len > self.budget.max_verification_commands {
+            return Err(invalid(
+                "request.invalid",
+                format!(
+                    "verification_evidence has {evidence_len} entries, budget allows {}",
                     self.budget.max_verification_commands
                 ),
             ));
@@ -1509,10 +1642,15 @@ pub struct ClassifiedReport {
 
 /// Read a report body against the binding of the exact request it
 /// answers. `max_bytes` applies before parsing — an oversize body is
-/// `invalid` (`report.oversize`) and never parsed. Identity checks
-/// collect every mismatch (§7.4), so `invalid` names each broken
-/// binding. `absent` is produced by the caller (no file after
-/// confirmed exit), not here.
+/// `invalid` (`report.oversize`) and never parsed. The report's
+/// `findings`/`invariant_items` member sets are also bounded by
+/// [`MAX_REPORT_MEMBERS`] at this ingestion boundary: a body whose
+/// member count exceeds the declared ceiling is `invalid`
+/// (`report.oversize`) before any gate sees it, so an oversized
+/// verdict can never inflate a downstream round or assessment. Identity
+/// checks collect every mismatch (§7.4), so `invalid` names each broken
+/// binding. `absent` is produced by the caller (no file after confirmed
+/// exit), not here.
 pub fn classify_report(
     raw: &[u8],
     binding: &ReportBinding<'_>,
@@ -1551,6 +1689,15 @@ pub fn classify_report(
             return invalid(vec![reason]);
         }
     };
+    // The member-count ceiling belongs to the same ingestion boundary
+    // as the byte ceiling: a small-member flood inside the byte budget
+    // must not reach the gates merely because its bytes fit. Both
+    // claim arrays share the one reported-member bound.
+    if report.findings.len() > MAX_REPORT_MEMBERS
+        || report.invariant_items.len() > MAX_REPORT_MEMBERS
+    {
+        return invalid(vec!["report.oversize".into()]);
+    }
     // The declared digest is verified over the raw body minus its
     // digest member, never a re-serialization.
     let body_digest = report_v2_digest(&report_canonical_body(&value));
@@ -1606,7 +1753,10 @@ pub fn classify_report(
 /// Upper bound on `findings`/`invariant_items` members one report may
 /// carry into gate evidence. The report byte bound already caps the
 /// wire; this caps the parsed fan-out so a tiny-member flood cannot
-/// inflate a sealed round or an assessment without bound.
+/// inflate a sealed round or an assessment without bound. The bound is
+/// enforced at ingestion by [`classify_report`] — a report over it is
+/// `invalid` (`report.oversize`) — and re-checked by the gate binder as
+/// defence in depth for evidence recorded before this boundary existed.
 pub const MAX_REPORT_MEMBERS: usize = 128;
 /// Per-string bounds inside a member claim.
 pub const MAX_MEMBER_KEY: usize = 256;
@@ -1807,6 +1957,11 @@ mod tests {
                         revision: 4,
                         digest: "f".repeat(64),
                     },
+                    verification_evidence: vec![VerificationEvidence {
+                        evidence_id: "vr-1".into(),
+                        kind: "verification".into(),
+                        digest: "e".repeat(64),
+                    }],
                 },
             ),
             (
@@ -2047,6 +2202,89 @@ mod tests {
         );
     }
 
+    /// Bodies minted before `verification_evidence` existed carry no
+    /// member for it; an empty list must serialize as absence or every
+    /// pre-upgrade InvariantCheck body stops verifying and its
+    /// in-flight request reads as corrupt.
+    #[test]
+    fn a_body_minted_before_verification_evidence_still_verifies() {
+        let mut request = WorkerRequestV2::parse(DOC_REQUEST.as_bytes()).expect("valid request");
+        request.role = crate::domain::InvocationRole::InvariantCheck;
+        request.required_capabilities.role = crate::domain::InvocationRole::InvariantCheck;
+        request.workspace.read_only = true;
+        request.task = TaskBody::InvariantCheck {
+            artifact: ArtifactRef {
+                artifact_id: "inv-39/artifact.json".into(),
+                manifest_digest: "c".repeat(64),
+                produced: "0123456789abcdef0123456789abcdef01234567".into(),
+            },
+            invariant_set: InvariantSetRef {
+                id: "invariants-core".into(),
+                revision: 4,
+                digest: "f".repeat(64),
+            },
+            verification_evidence: vec![],
+        };
+        let mut value = serde_json::to_value(&request).expect("request serializes");
+        assert!(
+            value["task"].get("verification_evidence").is_none(),
+            "an empty evidence list stays off the wire"
+        );
+        let digest = request_v2_digest(&canonical_minus(&value, "request_digest"));
+        value["request_digest"] = serde_json::Value::String(digest);
+        let bytes = canonical_json(&value);
+        let parsed = WorkerRequestV2::parse(&bytes).expect("pre-upgrade body parses");
+        let TaskBody::InvariantCheck {
+            verification_evidence,
+            ..
+        } = &parsed.task
+        else {
+            panic!("task kind changed on parse");
+        };
+        assert!(verification_evidence.is_empty());
+        let body = WorkerRequestBody {
+            request_id: parsed.request_id.clone(),
+            format_version: WORKER_REQUEST_V2_FORMAT.into(),
+            canonical_body: bytes,
+            body_digest: parsed.digest(),
+        };
+        assert!(
+            body.verifies(),
+            "a body minted before verification evidence must keep verifying"
+        );
+    }
+
+    /// A passing run never wears the failed-evidence tag: the evidence
+    /// reader refuses any other declared format.
+    #[test]
+    fn verification_evidence_refuses_a_foreign_format() {
+        let body = VerificationEvidenceBody {
+            format: VERIFICATION_EVIDENCE_FORMAT.into(),
+            work_id: "w-7".into(),
+            artifact_id: "inv-39/artifact.json".into(),
+            evidence_id: "vr-1".into(),
+            kind: "verification".into(),
+            requirement: "verification_argv[0]".into(),
+            argv: vec!["cargo".into(), "test".into()],
+            produced: "0".repeat(40),
+            result: "pass".into(),
+            output: "test result: ok".into(),
+        };
+        let parsed =
+            VerificationEvidenceBody::parse(&body.canonical_bytes()).expect("evidence body parses");
+        assert_eq!(parsed.wire_digest(), body.wire_digest());
+
+        let mut foreign: serde_json::Value =
+            serde_json::from_slice(&body.canonical_bytes()).unwrap();
+        foreign["format"] = serde_json::Value::String(FAILED_EVIDENCE_FORMAT.into());
+        match VerificationEvidenceBody::parse(&canonical_json(&foreign)) {
+            Err(RequestInvalid::VersionUnknown { declared }) => {
+                assert_eq!(declared, FAILED_EVIDENCE_FORMAT)
+            }
+            other => panic!("expected version_unknown, got {other:?}"),
+        }
+    }
+
     #[test]
     fn an_unknown_version_is_refused() {
         let body = DOC_REQUEST.replace("taisan.worker.request/2", "taisan.worker.request/9");
@@ -2170,6 +2408,43 @@ mod tests {
         match request.validate() {
             Err(RequestInvalid::Invalid { detail, .. }) => {
                 assert!(detail.contains("verification_argv"), "{detail}")
+            }
+            other => panic!("expected invalid, got {other:?}"),
+        }
+    }
+
+    /// A forged check request naming more evidence than the command
+    /// budget admits fails the same bound the producing argv was
+    /// checked against — the member list stays bounded on the wire.
+    #[test]
+    fn an_over_budget_verification_evidence_list_is_invalid() {
+        let mut request = WorkerRequestV2::parse(DOC_REQUEST.as_bytes()).unwrap();
+        request.role = InvocationRole::InvariantCheck;
+        request.required_capabilities.role = InvocationRole::InvariantCheck;
+        request.workspace.read_only = true;
+        let over = (0..=request.budget.max_verification_commands)
+            .map(|i| VerificationEvidence {
+                evidence_id: format!("vr-{i}"),
+                kind: "verification".into(),
+                digest: "e".repeat(64),
+            })
+            .collect();
+        request.task = TaskBody::InvariantCheck {
+            artifact: ArtifactRef {
+                artifact_id: "inv-39/artifact.json".into(),
+                manifest_digest: "c".repeat(64),
+                produced: "0123456789abcdef0123456789abcdef01234567".into(),
+            },
+            invariant_set: InvariantSetRef {
+                id: "invariants-core".into(),
+                revision: 4,
+                digest: "f".repeat(64),
+            },
+            verification_evidence: over,
+        };
+        match request.validate() {
+            Err(RequestInvalid::Invalid { detail, .. }) => {
+                assert!(detail.contains("verification_evidence"), "{detail}")
             }
             other => panic!("expected invalid, got {other:?}"),
         }
@@ -2364,6 +2639,40 @@ mod tests {
                 )
             }
             other => panic!("expected invalid, got {other:?}"),
+        }
+    }
+
+    /// A valid envelope under the byte bound can still carry an
+    /// oversized verdict: more member claims than the contract's
+    /// declared fan-out ceiling. Ingestion classifies it `invalid`
+    /// with the named `report.oversize` class before any gate binds a
+    /// single member, so the downstream round/assessment reserve is
+    /// never inflated by a tiny-member flood.
+    #[test]
+    fn an_oversize_member_set_is_invalid_at_ingestion() {
+        for field in ["findings", "invariant_items"] {
+            let mut value: serde_json::Value = serde_json::from_str(DOC_REPORT).unwrap();
+            let members: Vec<serde_json::Value> = (0..=MAX_REPORT_MEMBERS)
+                .map(|i| serde_json::json!({"key": format!("f-{i}"), "summary": "claim"}))
+                .collect();
+            value[field] = serde_json::Value::Array(members);
+            value["report_digest"] =
+                serde_json::Value::String(report_v2_digest(&report_canonical_body(&value)));
+            let raw = serde_json::to_vec(&value).unwrap();
+            assert!(
+                raw.len() < 1_048_576,
+                "{field}: fixture stays under the byte bound"
+            );
+            let classified = classify_report(&raw, &doc_binding(), 1_048_576);
+            match classified.classification {
+                ReportClassification::Invalid { reasons } => assert_eq!(
+                    reasons,
+                    vec!["report.oversize".to_string()],
+                    "{field}: the member ceiling fails with the named class"
+                ),
+                other => panic!("{field}: expected invalid, got {other:?}"),
+            }
+            assert!(classified.report.is_none(), "{field}: no claim is parsed");
         }
     }
 

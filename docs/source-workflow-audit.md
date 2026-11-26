@@ -9,9 +9,11 @@ and implementation planning.
 
 The four source repositories are private. Publication-facing documents
 reference them by role, not by name (see `AGENTS.md`). This audit record
-is the owner-controlled exception: it retains issue numbers, revision
-SHAs, and source-internal module names as owner-verifiable evidence
-locators so each mapping can be re-checked against the sources:
+is an owner-controlled provenance record — the first of two;
+`docs/release-audit.md` is the second. This record retains issue
+numbers, revision SHAs, and source-internal module names as
+owner-verifiable evidence locators so each mapping can be re-checked
+against the sources:
 
 | Role name used here | What it is |
 | --- | --- |
@@ -21,16 +23,20 @@ locators so each mapping can be re-checked against the sources:
 | **the infra repo** | the remote-execution infrastructure running bounded worker jobs in isolated containers |
 
 These locators identify nothing without access to the sources.
-`agent-workloop` is itself private today; if it is ever published, this
-document needs a disclosure review first — and so does the git history,
-which retains the identifiers removed from current files; publication
-must either rewrite/export history or explicitly accept that exposure.
 Publication-facing documents
 carry only a minimal origin statement (see `docs/provenance.md`); the
 name- and identifier-level detail removed there — source-system names,
 private issue/PR metadata, the reference-verification table, and the
 document-audit corrections list — is preserved in this repository's git
 history.
+
+**Publication disposition (owner decision, issue #438, 2026-11-25):**
+the owner ruled that the private source-repository names and the owner
+identity retained here are acceptable to disclose, and that the
+repository is published in place with its existing history. This
+document therefore stays in the published tree as the provenance
+record; the earlier requirement that publication wait on a disclosure
+review of this file and the git history is superseded by that ruling.
 
 ## Inspected revisions and scope
 
@@ -56,7 +62,7 @@ Notes on inspection fidelity:
 - Symbol-level locators were collected during inspection. File paths,
   function names, and line numbers are not reproduced; module, command,
   and component names are retained as owner-verifiable locators under
-  the audit-record exception in `AGENTS.md`.
+  the audit-record convention in `AGENTS.md`.
 - The ops repo's converge state-transitions design document is itself a
   design audit pinned to earlier revisions (`839094bb` ops / `e6c16686`
   worker); where this document cites it as evidence, the underlying

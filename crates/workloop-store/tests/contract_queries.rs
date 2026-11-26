@@ -504,6 +504,78 @@ fn attention_versions_and_acknowledgement() {
 }
 
 #[test]
+fn merge_check_records_do_not_resurface_acknowledged_attention() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, eid) = submit(&store, "q-mergecheck");
+    store
+        .transact(|tx| {
+            let mut e = tx.execution(&eid)?.unwrap();
+            e.state = ExecutionState::Paused;
+            e.pause_reason = Some("repair: needs human".into());
+            tx.apply(&Effect::UpdateExecution {
+                execution: e,
+                expected_state: ExecutionState::Queued,
+            })
+        })
+        .unwrap();
+    let items = found(store.transact(|tx| attention(tx, None, NOW)).unwrap());
+    assert_eq!(items.len(), 1);
+    let att_id = items[0].attention_id.clone();
+    let d = handle_command(
+        &store,
+        &config(),
+        &CommandRequest {
+            actor: actor(),
+            origin: Origin("cli".into()),
+            idempotency_key: "q-mergecheck-ack".into(),
+            body: CommandBody::Acknowledge {
+                work_id: work_id.clone(),
+                expected_work_version: 1,
+                attention_id: att_id,
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    assert!(matches!(d, CommandDecision::Accepted { .. }), "{d:?}");
+    assert!(
+        found(store.transact(|tx| attention(tx, None, NOW)).unwrap()).is_empty(),
+        "acknowledged attention is hidden"
+    );
+
+    // A merge-detection pass leaves one fresh ordering record per pass —
+    // bookkeeping for the least-recently-checked order, not new Work
+    // evidence. Counting it would mint a new occurrence id every pass
+    // and resurface the acknowledged hold forever.
+    for pass in 0..3i64 {
+        workloop_core::work::handle_observation(
+            &store,
+            &config(),
+            &Observation {
+                delivery: Some(DeliveryId {
+                    scope: DeliveryScope::Host { host: host() },
+                    source: "github.merge".into(),
+                    event_id: format!("merge-check:{}:cr-1@h#epoch-{pass}", work_id.0),
+                }),
+                subject_work_id: Some(work_id.clone()),
+                subject_execution_id: None,
+                fact: ObservationFact::MergeCheck {
+                    change: change(),
+                    head: rev("detected-head"),
+                },
+                observed_unix_seconds: NOW + pass,
+            },
+            NOW + pass,
+        )
+        .unwrap();
+    }
+    assert!(
+        found(store.transact(|tx| attention(tx, None, NOW)).unwrap()).is_empty(),
+        "merge-detection bookkeeping never resurfaces an acknowledged attention"
+    );
+}
+
+#[test]
 fn acknowledge_requires_a_currently_derivable_attention_version() {
     let store = SqliteStore::in_memory(1).unwrap();
     let (work_id, eid) = submit(&store, "q14");

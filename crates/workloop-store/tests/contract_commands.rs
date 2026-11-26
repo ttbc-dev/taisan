@@ -3263,6 +3263,643 @@ fn late_launch_refusal_never_resurrects_a_terminal_execution() {
     assert_eq!(e.terminal_code.as_deref(), Some("setup"));
     assert!(e.outcome.is_some(), "the recorded outcome survives");
 }
+
+/// Seed `next_role` the way a `fix` disposition's release judgment
+/// leaves it, then run the ordinary admission seam.
+fn admit_judged_role(
+    store: &SqliteStore,
+    config: &WorkloopConfig,
+    eid: &ExecutionId,
+    role: InvocationRole,
+) {
+    let mut seeded = read_execution(store, eid);
+    seeded.next_role = Some(role);
+    apply_effects(
+        store,
+        &[Effect::UpdateExecution {
+            execution: seeded.clone(),
+            expected_state: seeded.state.clone(),
+        }],
+    );
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued(tx, config, eid, NOW)?.is_some(),
+                "the judged role admits"
+            );
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// The supervisor abandons a refused Invocation in its own transaction
+/// before reporting `LaunchRefused` — the refusal observation always
+/// lands on an already-resolved writer.
+fn abandon_invocation(store: &SqliteStore, invocation: &Invocation) {
+    let mut next = invocation.clone();
+    next.state = InvocationState::Abandoned;
+    apply_effects(
+        store,
+        &[Effect::UpdateInvocation {
+            invocation: next,
+            expected_state: invocation.state.clone(),
+        }],
+    );
+}
+
+/// A launch proven never to have spawned hands back the role-scoped
+/// account the attempt's admission charged: the Work-wide fix account
+/// refunds so a re-issued dispatch is charged exactly once, while the
+/// minted request still counts against the invocation-attempt bound.
+/// Issue #447.
+#[test]
+fn launch_refused_refunds_the_fix_account() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config, &submit("lr-fix"), NOW).unwrap());
+    admit_judged_role(&store, &config, &e1, InvocationRole::Fix);
+
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Ready);
+    assert_eq!(e.invocations_used, 1);
+    assert_eq!(e.next_role, None, "admission consumed the judged role");
+    let refused_rid = format!("{}:inv:0", e1.0);
+    let requests = store.transact(|tx| tx.pending_requests()).unwrap();
+    assert_eq!(requests[0].role, InvocationRole::Fix);
+    assert_eq!(requests[0].request_id, refused_rid);
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(
+        usage.fix_invocations_used, 1,
+        "admission charged the fix account"
+    );
+
+    let mut inv = recorded_invocation(&e1, "inv-lr-fix");
+    inv.role = InvocationRole::Fix;
+    inv.request_id = refused_rid.clone();
+    apply_effects(
+        &store,
+        &[Effect::InsertInvocation {
+            invocation: inv.clone(),
+        }],
+    );
+    // The supervisor abandons the refused Invocation in its own
+    // transaction before the refusal observation lands.
+    abandon_invocation(&store, &inv);
+    launch_refused(&store, &e1, &inv.id);
+
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Paused);
+    assert_eq!(
+        e.invocations_used, 1,
+        "the minted request still counts against the attempt bound"
+    );
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(
+        usage.fix_invocations_used, 0,
+        "a launch that never spawned refunds the fix account"
+    );
+
+    // A second, distinct refusal delivery on the paused Execution is a
+    // no-op — the refund cannot decrement twice.
+    let mut dup = recorded_invocation(&e1, "inv-lr-fix-dup");
+    dup.role = InvocationRole::Fix;
+    dup.request_id = format!("{}:inv:dup", e1.0);
+    apply_effects(
+        &store,
+        &[Effect::InsertInvocation {
+            invocation: dup.clone(),
+        }],
+    );
+    launch_refused(&store, &e1, &dup.id);
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(
+        usage.fix_invocations_used, 0,
+        "a refusal landing on a paused Execution refunds nothing more"
+    );
+}
+
+/// The refused attempt's recorded role re-arms as `next_role`, so a
+/// `resume` re-issues the judged role — a Fix pinned to the produced
+/// head — instead of degrading to a Coding request pinned to base.
+/// Issue #448.
+#[test]
+fn launch_refused_rearms_the_judged_role_for_resume() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config, &submit("lr-role"), NOW).unwrap());
+    admit_judged_role(&store, &config, &e1, InvocationRole::Fix);
+    let refused_rid = format!("{}:inv:0", e1.0);
+
+    let mut inv = recorded_invocation(&e1, "inv-lr-role");
+    inv.role = InvocationRole::Fix;
+    inv.request_id = refused_rid.clone();
+    apply_effects(
+        &store,
+        &[Effect::InsertInvocation {
+            invocation: inv.clone(),
+        }],
+    );
+    abandon_invocation(&store, &inv);
+    launch_refused(&store, &e1, &inv.id);
+
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Paused);
+    assert_eq!(
+        e.next_role,
+        Some(InvocationRole::Fix),
+        "the refused attempt's role re-arms for resume"
+    );
+
+    // Resume re-issues the judged role: the fresh request is a Fix and
+    // the account is charged exactly once for it — the cascading
+    // Coding request pinned to base never happens.
+    let version = store.transact(|tx| tx.work(&w)).unwrap().unwrap().version;
+    let d = handle_command(
+        &store,
+        &config,
+        &req(
+            "lr-role-resume",
+            CommandBody::Resume {
+                work_id: w.clone(),
+                expected_work_version: version,
+                execution_id: e1.clone(),
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    accepted(&d);
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued(tx, &config, &e1, NOW + 10)?.is_some(),
+                "the resumed Execution readmits"
+            );
+            Ok(())
+        })
+        .unwrap();
+    let requests = store.transact(|tx| tx.pending_requests()).unwrap();
+    let reissued = requests
+        .iter()
+        .find(|r| r.request_id != refused_rid)
+        .expect("a fresh request was minted");
+    assert_eq!(
+        reissued.role,
+        InvocationRole::Fix,
+        "resume re-issues the judged role, not Coding"
+    );
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.invocations_used, 2,
+        "the re-issue counts as a new attempt"
+    );
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(
+        usage.fix_invocations_used, 1,
+        "the re-issued dispatch charges the refunded account once"
+    );
+}
+
+/// The same refund for a refused dispatch: the request was minted but
+/// never materialized a body, so its role's charge comes back.
+#[test]
+fn dispatch_refused_refunds_the_judged_role() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config, &submit("dr-fix"), NOW).unwrap());
+    admit_judged_role(&store, &config, &e1, InvocationRole::Fix);
+    let refused_rid = format!("{}:inv:0", e1.0);
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(usage.fix_invocations_used, 1);
+
+    workloop_core::work::handle_observation(
+        &store,
+        &config,
+        &Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: Some(e1.clone()),
+            fact: ObservationFact::DispatchRefused {
+                request_id: refused_rid.clone(),
+                code: "request.body_missing".into(),
+                detail: "no durable v2 request body".into(),
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Paused);
+    assert_eq!(
+        e.next_role,
+        Some(InvocationRole::Fix),
+        "the refused request's role re-arms for resume"
+    );
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(
+        usage.fix_invocations_used, 0,
+        "a refused materialization refunds the request's charge"
+    );
+
+    // Resume re-issues the judged role here too — a dispatch refusal
+    // is the same refused attempt, so the fresh request is a Fix.
+    let version = store.transact(|tx| tx.work(&w)).unwrap().unwrap().version;
+    let d = handle_command(
+        &store,
+        &config,
+        &req(
+            "dr-fix-resume",
+            CommandBody::Resume {
+                work_id: w.clone(),
+                expected_work_version: version,
+                execution_id: e1.clone(),
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    accepted(&d);
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued(tx, &config, &e1, NOW + 10)?.is_some(),
+                "the resumed Execution readmits"
+            );
+            Ok(())
+        })
+        .unwrap();
+    let requests = store.transact(|tx| tx.pending_requests()).unwrap();
+    let reissued = requests
+        .iter()
+        .find(|r| r.request_id != refused_rid)
+        .expect("a fresh request was minted");
+    assert_eq!(
+        reissued.role,
+        InvocationRole::Fix,
+        "resume re-issues the judged role, not Coding"
+    );
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(
+        usage.fix_invocations_used, 1,
+        "the re-issued dispatch charges the refunded account once"
+    );
+}
+
+/// The review-round ledger refunds on a refused dispatch the same way:
+/// the refused review request burns no round and its role re-arms.
+#[test]
+fn dispatch_refused_refunds_the_review_round_ledger() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = budget_config(3, 1);
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config, &submit("dr-rv"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued_role(
+                    tx,
+                    &config,
+                    &e1,
+                    InvocationRole::Review,
+                    NOW
+                )?
+                .is_some()
+            );
+            Ok(())
+        })
+        .unwrap();
+    let refused_rid = format!("{}:inv:0", e1.0);
+    assert_eq!(read_execution(&store, &e1).review_rounds_used, 1);
+
+    workloop_core::work::handle_observation(
+        &store,
+        &config,
+        &Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: Some(e1.clone()),
+            fact: ObservationFact::DispatchRefused {
+                request_id: refused_rid,
+                code: "request.body_missing".into(),
+                detail: "no durable v2 request body".into(),
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Paused);
+    assert_eq!(
+        e.review_rounds_used, 0,
+        "a refused dispatch refunds the review round"
+    );
+    assert_eq!(e.next_role, Some(InvocationRole::Review));
+
+    // The refunded bound admits again — without the refund a
+    // max_review_rounds=1 Execution would fail terminally here.
+    let version = store.transact(|tx| tx.work(&w)).unwrap().unwrap().version;
+    let d = handle_command(
+        &store,
+        &config,
+        &req(
+            "dr-rv-resume",
+            CommandBody::Resume {
+                work_id: w,
+                expected_work_version: version,
+                execution_id: e1.clone(),
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    accepted(&d);
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued(tx, &config, &e1, NOW + 10)?.is_some(),
+                "the refunded review round admits again"
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(read_execution(&store, &e1).review_rounds_used, 1);
+}
+
+/// A refusal delivered for a non-Ready Execution refunds nothing and
+/// restores no role — terminal state is never resurrected and the
+/// accounts never double-refund.
+#[test]
+fn late_launch_refusal_refunds_nothing_on_a_terminal_execution() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config, &submit("lr-term"), NOW).unwrap());
+    admit_judged_role(&store, &config, &e1, InvocationRole::Fix);
+    let mut inv = recorded_invocation(&e1, "inv-lr-term");
+    inv.role = InvocationRole::Fix;
+    apply_effects(
+        &store,
+        &[Effect::InsertInvocation {
+            invocation: inv.clone(),
+        }],
+    );
+    force_state(&store, &e1, ExecutionState::Cancelled);
+    abandon_invocation(&store, &inv);
+
+    launch_refused(&store, &e1, &inv.id);
+
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(
+        usage.fix_invocations_used, 1,
+        "a terminal Execution keeps the charge standing"
+    );
+}
+
+/// The review-round ledger refunds the same way a refused review
+/// launch burns no round, and the re-armed role lets the refunded
+/// bound admit again.
+#[test]
+fn launch_refused_refunds_the_review_round_ledger() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = budget_config(3, 1);
+    let (_w, e1) =
+        accepted_with_execution(&handle_command(&store, &config, &submit("lr-rv"), NOW).unwrap());
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued_role(
+                    tx,
+                    &config,
+                    &e1,
+                    InvocationRole::Review,
+                    NOW
+                )?
+                .is_some()
+            );
+            Ok(())
+        })
+        .unwrap();
+    let mut inv = recorded_invocation(&e1, "inv-lr-rv");
+    inv.role = InvocationRole::Review;
+    apply_effects(
+        &store,
+        &[Effect::InsertInvocation {
+            invocation: inv.clone(),
+        }],
+    );
+    abandon_invocation(&store, &inv);
+    launch_refused(&store, &e1, &inv.id);
+
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Paused);
+    assert_eq!(e.review_rounds_used, 0, "the refused round refunds");
+    assert_eq!(e.next_role, Some(InvocationRole::Review));
+
+    // The refunded bound admits again — without the refund a
+    // max_review_rounds=1 Execution would fail terminally here.
+    let version = store
+        .transact(|tx| tx.work(&e.work_id))
+        .unwrap()
+        .unwrap()
+        .version;
+    let d = handle_command(
+        &store,
+        &config,
+        &req(
+            "lr-rv-resume",
+            CommandBody::Resume {
+                work_id: e.work_id.clone(),
+                expected_work_version: version,
+                execution_id: e1.clone(),
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    accepted(&d);
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued(tx, &config, &e1, NOW + 10)?.is_some(),
+                "the refunded review round admits again"
+            );
+            Ok(())
+        })
+        .unwrap();
+    let requests = store.transact(|tx| tx.pending_requests()).unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.role == InvocationRole::Review)
+            .count(),
+        2,
+        "both review requests are recorded, the re-issued one charged"
+    );
+    assert_eq!(read_execution(&store, &e1).review_rounds_used, 1);
+}
+
+/// A refusal re-delivered under a fresh delivery id — the delivery
+/// dedupe is per delivery, not per attempt — for an Invocation that
+/// already resolved refunds nothing during a later `ready` window: the
+/// charge belongs to the live attempt now, not the resolved one.
+#[test]
+fn a_stale_launch_refusal_during_a_new_ready_window_never_refunds_twice() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let (w, e1) = accepted_with_execution(
+        &handle_command(&store, &config, &submit("lr-stale"), NOW).unwrap(),
+    );
+    admit_judged_role(&store, &config, &e1, InvocationRole::Fix);
+
+    let mut inv = recorded_invocation(&e1, "inv-lr-stale");
+    inv.role = InvocationRole::Fix;
+    inv.request_id = format!("{}:inv:0", e1.0);
+    apply_effects(
+        &store,
+        &[Effect::InsertInvocation {
+            invocation: inv.clone(),
+        }],
+    );
+    abandon_invocation(&store, &inv);
+    launch_refused(&store, &e1, &inv.id);
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(usage.fix_invocations_used, 0, "the first refusal refunds");
+
+    // Resume mints and charges a fresh attempt — the Execution is
+    // `ready` again with a live request.
+    let version = store.transact(|tx| tx.work(&w)).unwrap().unwrap().version;
+    let d = handle_command(
+        &store,
+        &config,
+        &req(
+            "lr-stale-resume",
+            CommandBody::Resume {
+                work_id: w.clone(),
+                expected_work_version: version,
+                execution_id: e1.clone(),
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    accepted(&d);
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued(tx, &config, &e1, NOW + 10)?.is_some(),
+                "the resumed Execution readmits"
+            );
+            Ok(())
+        })
+        .unwrap();
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(
+        usage.fix_invocations_used, 1,
+        "the live attempt carries the charge"
+    );
+
+    // The stale re-delivery still resolves nothing new: the Invocation
+    // is already abandoned, so the live attempt's charge stands.
+    launch_refused(&store, &e1, &inv.id);
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(
+        usage.fix_invocations_used, 1,
+        "a stale refusal never refunds the live attempt's charge"
+    );
+}
+
+/// The dispatch-refusal twin: the durable request row outlives its
+/// attempt, so a stale re-delivery naming the old request id must not
+/// refund the live attempt's charge.
+#[test]
+fn a_stale_dispatch_refusal_during_a_new_ready_window_never_refunds_twice() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let (w, e1) = accepted_with_execution(
+        &handle_command(&store, &config, &submit("dr-stale"), NOW).unwrap(),
+    );
+    admit_judged_role(&store, &config, &e1, InvocationRole::Fix);
+    let stale_rid = format!("{}:inv:0", e1.0);
+
+    workloop_core::work::handle_observation(
+        &store,
+        &config,
+        &Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: Some(e1.clone()),
+            fact: ObservationFact::DispatchRefused {
+                request_id: stale_rid.clone(),
+                code: "request.body_missing".into(),
+                detail: "no durable v2 request body".into(),
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(usage.fix_invocations_used, 0, "the first refusal refunds");
+
+    let version = store.transact(|tx| tx.work(&w)).unwrap().unwrap().version;
+    let d = handle_command(
+        &store,
+        &config,
+        &req(
+            "dr-stale-resume",
+            CommandBody::Resume {
+                work_id: w.clone(),
+                expected_work_version: version,
+                execution_id: e1.clone(),
+            },
+        ),
+        NOW,
+    )
+    .unwrap();
+    accepted(&d);
+    store
+        .transact(|tx| {
+            assert!(
+                workloop_core::work::admit_queued(tx, &config, &e1, NOW + 10)?.is_some(),
+                "the resumed Execution readmits"
+            );
+            Ok(())
+        })
+        .unwrap();
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(usage.fix_invocations_used, 1);
+
+    workloop_core::work::handle_observation(
+        &store,
+        &config,
+        &Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: Some(e1.clone()),
+            fact: ObservationFact::DispatchRefused {
+                request_id: stale_rid,
+                code: "request.body_missing".into(),
+                detail: "no durable v2 request body".into(),
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+    let usage = store.transact(|tx| tx.work_usage(&w)).unwrap().unwrap();
+    assert_eq!(
+        usage.fix_invocations_used, 1,
+        "a refusal naming an earlier request never refunds the live attempt"
+    );
+}
+
 /// Work-scoped observation delivery: the fact types that name only the
 /// Work still resolve the current Execution for assessment.
 fn emit_work_fact(store: &SqliteStore, w: &WorkId, fact: ObservationFact) {
@@ -4032,6 +4669,350 @@ fn sweep_conflict_during_reassessment_is_deferred_not_fatal() {
     );
 }
 
+/// An inconclusive lane assessment fact on the current target — the
+/// verdict that parked the lane forever before the #469 re-drive.
+fn inconclusive_assessment(head: &str) -> ObservationFact {
+    ObservationFact::Assessment {
+        target: target(head),
+        set_digest: "invariants".into(),
+        complete: true,
+        items: vec![AssessmentItem {
+            id: "inv-1".into(),
+            verdict: AssessmentVerdict::Inconclusive,
+            refs: vec![],
+        }],
+    }
+}
+
+/// Record one verification result row exactly as `handoff::verify`
+/// writes them — on an acknowledged artifact handoff, lazily seeded
+/// the first time a result lands for `artifact_id` (the results table
+/// foreign-keys to `artifact_handoffs`). Returns the durable evidence
+/// id the run was given.
+fn record_verification_result(
+    store: &SqliteStore,
+    eid: &ExecutionId,
+    artifact_id: &str,
+    requirement: &str,
+    outcome: VerificationOutcome,
+) -> String {
+    store
+        .transact(|tx| {
+            if tx.artifact_handoff(artifact_id)?.is_none() {
+                let invocations = tx.invocations_for_execution(eid)?;
+                let producing = invocations
+                    .iter()
+                    .find(|i| {
+                        i.required_artifacts
+                            .iter()
+                            .any(|a| format!("{}/{}", i.id.0, a.kind) == artifact_id)
+                    })
+                    .expect("a producing invocation declares the artifact");
+                let work_id = tx.execution(eid)?.expect("the execution exists").work_id;
+                let handoff_seq = tx.alloc_seq()?;
+                tx.apply(&Effect::UpsertHandoff {
+                    handoff: ArtifactHandoff {
+                        artifact_id: artifact_id.into(),
+                        invocation_id: producing.id.clone(),
+                        request_id: producing.request_id.clone(),
+                        work_id,
+                        execution_id: eid.clone(),
+                        base: "base-sha".into(),
+                        produced: Some("produced-commit".into()),
+                        manifest_digest: Some("manifest-digest".into()),
+                        state: HandoffState::Acknowledged,
+                        invalid_reason: None,
+                        attempt: 1,
+                        recorded_seq: handoff_seq,
+                    },
+                    expected_seq: 0,
+                })?;
+            }
+            let id = tx.alloc_id("verify")?;
+            let recorded_seq = tx.alloc_seq()?;
+            tx.apply(&Effect::InsertVerificationResult {
+                result: VerificationResult {
+                    id: id.clone(),
+                    artifact_id: artifact_id.into(),
+                    requirement: requirement.into(),
+                    argv: vec!["verify".into()],
+                    produced: "produced-commit".into(),
+                    environment_digest: "0".repeat(64),
+                    result: outcome,
+                    output: String::new(),
+                    recorded_seq,
+                },
+            })?;
+            Ok(id)
+        })
+        .expect("verification result records")
+}
+
+/// The durable v2 request body for the seeded check Invocation's
+/// request (`<eid>:inv:1`), binding `evidence` as the verification
+/// results that check judged — the fixture equivalent of the bound
+/// request a real v2 dispatch wrote before launch.
+fn bind_check_request_body(
+    store: &SqliteStore,
+    w: &WorkId,
+    eid: &ExecutionId,
+    check_invocation_id: &str,
+    artifact_id: &str,
+    evidence: &[String],
+) {
+    use workloop_core::worker_v2::*;
+    let repository = WireRepository {
+        host: "test-host".into(),
+        repository: "local-repo".into(),
+    };
+    let mut request = WorkerRequestV2 {
+        format_version: WORKER_REQUEST_V2_FORMAT.into(),
+        request_id: format!("{}:inv:1", eid.0),
+        invocation_id: check_invocation_id.into(),
+        request_digest: String::new(),
+        store_id: "store".into(),
+        work_id: w.0.clone(),
+        execution_id: eid.0.clone(),
+        role: InvocationRole::InvariantCheck,
+        repository: repository.clone(),
+        base: RequestBase {
+            repository,
+            object: "0".repeat(40),
+        },
+        spec: SpecRef {
+            revision: 1,
+            digest: "0".repeat(64),
+        },
+        workspace: WorkspaceGrant {
+            workspace_id: format!("ws-{}", w.0),
+            mount: "/workspace".into(),
+            read_only: true,
+        },
+        budget: RequestBudget {
+            deadline_unix_seconds: NOW + 3600,
+            max_runtime_seconds: 1800,
+            max_turns: 200,
+            max_report_bytes: 1_048_576,
+            max_log_bytes: 33_554_432,
+            max_verification_commands: 8,
+            max_continuation_refs: 4,
+        },
+        required_capabilities: RequiredCapabilities {
+            role: InvocationRole::InvariantCheck,
+            protocol_versions: vec![
+                "taisan.worker.request/2".into(),
+                "taisan.worker.report/2".into(),
+            ],
+            capabilities: vec![],
+            resume: "unsupported".into(),
+            verification_egress_hosts: vec![],
+        },
+        continuation: vec![],
+        task: TaskBody::InvariantCheck {
+            artifact: ArtifactRef {
+                artifact_id: artifact_id.into(),
+                manifest_digest: "1".repeat(64),
+                produced: "2".repeat(40),
+            },
+            invariant_set: InvariantSetRef {
+                id: "invariants".into(),
+                revision: 1,
+                digest: "3".repeat(64),
+            },
+            verification_evidence: evidence
+                .iter()
+                .map(|id| VerificationEvidence {
+                    evidence_id: id.clone(),
+                    kind: "verification".into(),
+                    digest: "4".repeat(64),
+                })
+                .collect(),
+        },
+    };
+    request.request_digest = request.digest();
+    apply_effects(
+        store,
+        &[
+            // The request row the body exports for — a real dispatch
+            // wrote it at mint and consumed it at spawn.
+            Effect::InsertRequest {
+                request: InvocationRequest {
+                    request_id: request.request_id.clone(),
+                    work_id: w.clone(),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::InvariantCheck,
+                    spec_revision: 1,
+                    payload: serde_json::json!({}),
+                    adapter_binding: None,
+                },
+            },
+            Effect::MarkRequestConsumed {
+                request_id: request.request_id.clone(),
+            },
+            Effect::InsertWorkerRequestBody {
+                body: workloop_core::worker_v2::WorkerRequestBody {
+                    request_id: request.request_id.clone(),
+                    format_version: WORKER_REQUEST_V2_FORMAT.into(),
+                    canonical_body: request.to_canonical_bytes(),
+                    body_digest: request.digest(),
+                },
+            },
+        ],
+    );
+}
+
+/// #469: an inconclusive lane assessment is not terminal evidence —
+/// when a conclusive `VerificationResult` exists that the satisfied
+/// check's bound request never carried, the timed sweep re-mints the
+/// invariant check so the unjudged evidence gets a re-judged
+/// assessment instead of parking the lane on the stale verdict.
+#[test]
+fn sweep_remints_the_invariant_check_on_unjudged_conclusive_evidence() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("uc1"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "uc1");
+    let artifact = "uc1-coding/artifact.json";
+    // The satisfied check's bound request judged the inconclusive run.
+    let judged = record_verification_result(
+        &store,
+        &e1,
+        artifact,
+        "verification_argv[0]",
+        VerificationOutcome::Inconclusive,
+    );
+    bind_check_request_body(&store, &w, &e1, "uc1-check", artifact, &[judged]);
+    record_unassessed_observation(&store, &w, inconclusive_assessment("sha-1"));
+    // A later verification run converged on a different requirement —
+    // conclusive evidence the bound request never carried.
+    record_verification_result(
+        &store,
+        &e1,
+        artifact,
+        "verification_argv[1]",
+        VerificationOutcome::Pass,
+    );
+
+    let report = sweep(&store, &config(), NOW).unwrap();
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Ready,
+        "the lane re-minted its check for the unjudged evidence: {report:?}"
+    );
+    let pending = store.transact(|tx| tx.pending_requests()).unwrap();
+    assert!(
+        pending
+            .iter()
+            .any(|r| r.execution_id == e1 && r.role == InvocationRole::InvariantCheck),
+        "a new InvariantCheck request is durable: {pending:?}"
+    );
+}
+
+/// The re-drive needs *newer* conclusive evidence: an inconclusive
+/// lane with only its judged results stays waiting — no churn, and a
+/// rerun that is itself still inconclusive never mints either.
+#[test]
+fn the_invariant_lane_does_not_remint_without_newer_conclusive_evidence() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let (w1, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("uc2"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w1, &e1, "uc2");
+    let artifact1 = "uc2-coding/artifact.json";
+    let judged = record_verification_result(
+        &store,
+        &e1,
+        artifact1,
+        "verification_argv[0]",
+        VerificationOutcome::Inconclusive,
+    );
+    bind_check_request_body(&store, &w1, &e1, "uc2-check", artifact1, &[judged]);
+    record_unassessed_observation(&store, &w1, inconclusive_assessment("sha-1"));
+
+    // A newer run that is itself still inconclusive is not conclusive
+    // evidence either.
+    let (w2, e2) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("uc3"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w2, &e2, "uc3");
+    let artifact2 = "uc3-coding/artifact.json";
+    let judged = record_verification_result(
+        &store,
+        &e2,
+        artifact2,
+        "verification_argv[0]",
+        VerificationOutcome::Inconclusive,
+    );
+    bind_check_request_body(&store, &w2, &e2, "uc3-check", artifact2, &[judged]);
+    record_unassessed_observation(&store, &w2, inconclusive_assessment("sha-1"));
+    record_verification_result(
+        &store,
+        &e2,
+        artifact2,
+        "verification_argv[1]",
+        VerificationOutcome::Inconclusive,
+    );
+
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Waiting);
+    assert_eq!(read_execution(&store, &e2).state, ExecutionState::Waiting);
+    assert!(
+        report.completed == 0,
+        "nothing settles on stale or still-inconclusive evidence: {report:?}"
+    );
+    let pending = store.transact(|tx| tx.pending_requests()).unwrap();
+    assert!(
+        pending
+            .iter()
+            .all(|r| r.role != InvocationRole::InvariantCheck),
+        "no check re-minted: {pending:?}"
+    );
+}
+
+/// "Newer" is ordered against the bound set, not just against
+/// membership: an unbound conclusive result recorded BEFORE the newest
+/// bound result is older evidence the request's evidence window
+/// skipped — it must not mint.
+#[test]
+fn an_older_unbound_conclusive_result_does_not_remint() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("uc4"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "uc4");
+    let artifact = "uc4-coding/artifact.json";
+    // Recorded first but never bound — an older run the request's
+    // evidence window skipped.
+    record_verification_result(
+        &store,
+        &e1,
+        artifact,
+        "verification_argv[0]",
+        VerificationOutcome::Pass,
+    );
+    let judged = record_verification_result(
+        &store,
+        &e1,
+        artifact,
+        "verification_argv[1]",
+        VerificationOutcome::Inconclusive,
+    );
+    bind_check_request_body(&store, &w, &e1, "uc4-check", artifact, &[judged]);
+    record_unassessed_observation(&store, &w, inconclusive_assessment("sha-1"));
+
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(
+        read_execution(&store, &e1).state,
+        ExecutionState::Waiting,
+        "an older unbound result is not newer evidence: {report:?}"
+    );
+    let pending = store.transact(|tx| tx.pending_requests()).unwrap();
+    assert!(
+        pending
+            .iter()
+            .all(|r| r.role != InvocationRole::InvariantCheck),
+        "no check re-minted: {pending:?}"
+    );
+}
+
 /// Settlement clears recorded deferrals on EVERY completion path: a
 /// `sweep_conflict` left against a `waiting` Execution must not
 /// survive when ingest assessment settles it. Terminal Executions are
@@ -4642,7 +5623,7 @@ fn a_v2_store_upgrades_to_the_current_format_preserving_rows() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 13, "the upgrade lands on the current format");
+        assert_eq!(version, 16, "the upgrade lands on the current format");
     }
     // A second open must not re-migrate — the schema is already current.
     let _ = SqliteStore::open(&db, 1).unwrap();
@@ -4707,7 +5688,7 @@ fn a_v9_store_gains_the_retirement_generation_column() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 13, "the upgrade lands on the current format");
+        assert_eq!(version, 16, "the upgrade lands on the current format");
     }
     drop(store);
     // Re-opening after the upgrade is a no-op, not a second migration.
@@ -4759,7 +5740,7 @@ fn a_v12_store_gains_the_observation_execution_index() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 13, "the upgrade lands on the current format");
+        assert_eq!(version, 16, "the upgrade lands on the current format");
     }
     drop(store);
     // Re-opening after the upgrade is a no-op, not a second migration.
@@ -6830,7 +7811,7 @@ fn a_previous_release_v1_store_is_upgraded_in_place() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 13, "the upgrade lands on the current format");
+        assert_eq!(version, 16, "the upgrade lands on the current format");
     }
     // Re-opening after the upgrade is a no-op, not a second migration.
     drop(store);

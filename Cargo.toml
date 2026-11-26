@@ -4,3 +4,80 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ttbc-dev/taisan"
+homepage = "https://github.com/ttbc-dev/taisan"
+
+# Config for 'dist' (cargo-dist). The generated CI lives at
+# .github/workflows/release.yml; regenerate with `dist generate`.
+[workspace.metadata.dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.34.0"
+# CI backends to support
+ci = "github"
+# Which actions to run on pull requests
+pr-run-mode = "plan"
+# release.yml carries a hand-applied permissions patch (GITHUB_TOKEN is
+# scoped per job; cargo-dist 0.34.0 cannot express built-in job
+# permissions). Mark the CI output dirty-tolerant so `dist generate`
+# does not silently clobber the patch — see docs/distribution.md.
+allow-dirty = ["ci"]
+# Target platforms to build apps for (Rust target-triple syntax).
+# Linux + macOS on x86_64 and aarch64 only: the codebase is unix-only
+# and containment is a Linux feature, so no Windows or musl matrix.
+targets = [
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+# The installers to generate for each app
+installers = ["shell", "homebrew"]
+# A GitHub repo to push Homebrew formulas to (personal tap; created
+# by the owner — see docs/distribution.md)
+tap = "shimpeiws/homebrew-tap"
+# Publish jobs to run in CI
+publish-jobs = ["homebrew"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false
+# How to checksum release artifacts
+checksum = "sha256"
+# Archive format for unix targets
+unix-archive = ".tar.xz"
+# Where to host releases
+hosting = "github"
+# Static files copied into every app's release archive. The licensing
+# audit (docs/licensing-prep.md) requires each binary bundle to carry
+# both license texts, the third-party inventory, and the full license
+# corpus — auto-includes picks a single arbitrary LICENSE* match per
+# kind (and duplicates entries with the explicit list), so the whole
+# set is declared here instead. Paths are relative to this Cargo.toml.
+auto-includes = false
+include = [
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "THIRD-PARTY.md",
+    "LICENSES",
+    "README.md",
+]
+# The workspace packages to distribute — the documented install
+# surface (docs/v0.3-installation.md, docs/reference-adapters.md,
+# README): the taisan CLI, the TUI console, the two public reference
+# adapters, and the fixture Worker the non-live bindings use.
+# Everything else in the workspace is an internal library crate or a
+# test-only fixture (workloop-fixture-selector,
+# workloop-contract-worker) and must not produce release artifacts.
+# Note: this list does not by itself suppress auto-detection — in dist
+# 0.34.0 a versioned binary crate outside `packages` still ships, so the
+# non-shipped binary crates (workloop-executor,
+# workloop-fixture-selector, workloop-contract-worker) also carry
+# `[package.metadata.dist] dist = false`.
+packages = [
+    "workloop-cli",
+    "workloop-tui",
+    "workloop-selector",
+    "taisan-worker-claude",
+    "workloop-fixture-worker",
+]

@@ -1048,12 +1048,17 @@ fn invariant_check_role_runs_the_wire(bin: &str, tag: &str) -> WireRun {
     let TaskBody::InvariantCheck {
         artifact,
         invariant_set,
+        verification_evidence,
     } = &wire.task
     else {
         panic!("expected invariant_check task: {:?}", wire.task)
     };
     assert_eq!(artifact.artifact_id, artifact_id);
     assert_eq!(invariant_set.id, "invariants-1");
+    assert!(
+        verification_evidence.is_empty(),
+        "no recorded results means no evidence member"
+    );
 
     drive_to_done(&sup, &store, &rid1);
     WireRun {

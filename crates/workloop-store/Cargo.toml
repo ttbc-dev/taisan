@@ -1,6 +1,7 @@
 [package]
 name = "workloop-store"
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 workloop-core = { path = "../workloop-core" }

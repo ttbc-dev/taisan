@@ -153,6 +153,25 @@ impl ReadView for FailingTx<'_> {
     ) -> Result<Option<workloop_core::worker_v2::WorkerRequestBody>, StoreError> {
         Ok(None)
     }
+    fn executor_binding(
+        &self,
+        _request_id: &str,
+    ) -> Result<Option<workloop_core::executor::ExecutorBinding>, StoreError> {
+        Ok(None)
+    }
+    fn executor_operation(
+        &self,
+        _request_id: &str,
+        _operation_id: &str,
+    ) -> Result<Option<workloop_core::executor::ExecutorOperation>, StoreError> {
+        Ok(None)
+    }
+    fn executor_operations_for_request(
+        &self,
+        _request_id: &str,
+    ) -> Result<Vec<workloop_core::executor::ExecutorOperation>, StoreError> {
+        Ok(vec![])
+    }
     fn reservation(&self, _resource_key: &str) -> Result<Option<ResourceReservation>, StoreError> {
         unimplemented!()
     }
@@ -310,6 +329,16 @@ impl ReadView for FailingTx<'_> {
 impl TxView for FailingTx<'_> {
     fn alloc_seq(&mut self) -> Result<EventSequence, StoreError> {
         Ok(1)
+    }
+    fn next_counter(&mut self, _name: &str) -> Result<i64, StoreError> {
+        Ok(1)
+    }
+    fn write_merge_check_services(
+        &mut self,
+        _work_id: &WorkId,
+        _services: &[MergeCheckService],
+    ) -> Result<(), StoreError> {
+        Err(self.fail.clone())
     }
     fn alloc_id(&mut self, prefix: &str) -> Result<String, StoreError> {
         Ok(format!("{prefix}-1"))

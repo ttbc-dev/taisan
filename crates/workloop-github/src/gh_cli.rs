@@ -833,6 +833,19 @@ impl GhCliApi {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false)
                 || value.get("merged_at").is_some_and(|v| v.is_string()),
+            mergeable: value.get("mergeable").and_then(|v| v.as_bool()),
+            mergeable_state: str_field("mergeable_state"),
+            base_sha: base_str("sha"),
+            conflicting_paths: value
+                .get("conflicting_paths")
+                .and_then(|v| v.as_array())
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(|p| p.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
     }
 }
@@ -1372,6 +1385,35 @@ impl GitHubApi for GhCliApi {
             .collect()
     }
 
+    fn list_open_pulls_on_base(
+        &mut self,
+        repository: &RepositoryRef,
+        target_branch: &str,
+    ) -> Result<Vec<RemotePull>, ApiError> {
+        let slug = Self::slug(repository)?;
+        if !valid_branch(target_branch) {
+            return Err(ApiError::Refused {
+                reason: format!("invalid target branch: {target_branch:?}"),
+            });
+        }
+        let pulls = self.api_pages(
+            &format!("repos/{slug}/pulls"),
+            &[
+                ("state", "open"),
+                ("base", target_branch),
+                ("per_page", "100"),
+            ],
+        )?;
+        pulls
+            .iter()
+            .filter(|pull| {
+                let base = pull.pointer("/base/ref").and_then(|v| v.as_str());
+                base.is_none_or(|b| b == target_branch)
+            })
+            .map(Self::remote_pull)
+            .collect()
+    }
+
     fn check_runs(
         &mut self,
         repository: &RepositoryRef,
@@ -1531,15 +1573,38 @@ impl GitHubApi for GhCliApi {
                 reason: format!("invalid revision: {descendant:?}"),
             });
         }
-        let value = self.api(
-            "GET",
-            &format!("repos/{slug}/compare/{ancestor}...{descendant}"),
-            None,
-        )?;
-        Ok(matches!(
-            value.get("status").and_then(|v| v.as_str()),
-            Some("ahead" | "identical")
-        ))
+        let endpoint = format!("repos/{slug}/compare/{ancestor}...{descendant}");
+        // A 404 is a definite answer, not a failed read: the remote
+        // cannot place one of the revisions. For a produced commit
+        // that is simply not pushed yet — the case the guarded write
+        // exists for — "not an ancestor" is exactly right; the lease
+        // on `expected_prior` is what makes the force write safe.
+        // Anything else (5xx, a lost response, an unparseable body)
+        // stays an error so the caller keeps the read indeterminate.
+        let value = match self.api_status("GET", &endpoint)? {
+            Ok(value) => value,
+            Err(404) => return Ok(false),
+            Err(status) if (400..500).contains(&status) => {
+                return Err(ApiError::Refused {
+                    reason: format!("gh api {endpoint}: HTTP {status}"),
+                });
+            }
+            Err(status) => {
+                return Err(ApiError::Unknown {
+                    reason: format!("gh api {endpoint}: HTTP {status}"),
+                });
+            }
+        };
+        match value.get("status").and_then(|v| v.as_str()) {
+            Some("ahead" | "identical") => Ok(true),
+            Some("diverged" | "behind") => Ok(false),
+            // A 200 without a decidable comparison status is a
+            // malformed success, not a "not contained" — never let it
+            // authorize the write.
+            _ => Err(ApiError::Unknown {
+                reason: format!("gh api {endpoint}: response missing comparison status"),
+            }),
+        }
     }
 
     fn read_issue(&mut self, issue: &IssueRef) -> Result<RemoteIssue, ApiError> {

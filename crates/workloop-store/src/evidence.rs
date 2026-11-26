@@ -24,6 +24,7 @@ use workloop_core::domain::*;
 use workloop_core::store::{Effect, StoreError};
 use workloop_evidence_protocol::*;
 
+use crate::artifact_class::ArtifactClass;
 use crate::sqlite::{SqliteStore, internal, map_err};
 
 /// One `event_log` row: the recorded sequence, the row kind and the
@@ -50,10 +51,31 @@ pub struct HistorySnapshot {
     /// `effect` rows in sequence order (the only rows that project to
     /// evidence records).
     pub events: Vec<HistoryEvent>,
+    /// Explicit artifact classifications recorded beside the history.
+    /// An entry is authoritative for its artifact id; unclassified
+    /// artifacts fall back to id/payload classification.
+    pub artifact_classes: BTreeMap<String, ArtifactClass>,
 }
 
 fn artifact_id(seq: u64) -> String {
     format!("event:{seq}")
+}
+
+/// The canonical artifact id one retained `effect` row is exported
+/// under — the same spelling [`artifact_seq`] resolves.
+pub(crate) fn event_artifact_id(seq: u64) -> String {
+    artifact_id(seq)
+}
+
+/// The descriptor an `event:<seq>` artifact declares in an export page:
+/// the event-log identity, the payload digest and length, the JSON
+/// media type, and payload-size availability.
+pub(crate) fn event_descriptor(
+    snap: &HistorySnapshot,
+    seq: u64,
+    payload: &[u8],
+) -> ArtifactDescriptor {
+    descriptor(&snap.installation_id, &snap.store_epoch, seq, payload)
 }
 
 fn descriptor(
@@ -158,6 +180,22 @@ impl SqliteStore {
             .collect::<Result<Vec<_>, _>>()
             .map_err(map_err)?;
         drop(stmt);
+        let mut classes = tx
+            .prepare("SELECT key, value FROM store_meta WHERE key LIKE 'artifact_class:%'")
+            .map_err(internal)?;
+        let artifact_classes = classes
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(map_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_err)?
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let id = key.strip_prefix("artifact_class:")?.to_string();
+                let class = ArtifactClass::parse(&value)?;
+                Some((id, class))
+            })
+            .collect();
+        drop(classes);
         let store_epoch: String = tx
             .query_row(
                 "SELECT value FROM store_meta WHERE key='history_epoch'",
@@ -172,7 +210,50 @@ impl SqliteStore {
             watermark: watermark as u64,
             retained_from_seq: retained_from as u64,
             events,
+            artifact_classes,
         })
+    }
+
+    /// Record an explicit class for one artifact id. Classification is
+    /// metadata only: it never changes the retained bytes or their
+    /// digest. Re-registering the same id overwrites the earlier class.
+    pub fn set_artifact_class(
+        &self,
+        artifact_id: &str,
+        class: ArtifactClass,
+    ) -> Result<(), StoreError> {
+        let guard = self.conn.lock().map_err(|_| StoreError::Internal {
+            detail: "store lock poisoned".into(),
+        })?;
+        guard
+            .execute(
+                "INSERT INTO store_meta (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                params![format!("artifact_class:{artifact_id}"), class.as_str()],
+            )
+            .map_err(map_err)?;
+        Ok(())
+    }
+
+    /// Read one explicit artifact class, if registered.
+    pub fn artifact_class(&self, artifact_id: &str) -> Result<Option<ArtifactClass>, StoreError> {
+        let guard = self.conn.lock().map_err(|_| StoreError::Internal {
+            detail: "store lock poisoned".into(),
+        })?;
+        let value: Option<String> = guard
+            .query_row(
+                "SELECT value FROM store_meta WHERE key=?1",
+                params![format!("artifact_class:{artifact_id}")],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        Ok(value.as_deref().and_then(ArtifactClass::parse))
+    }
+
+    /// Every explicitly registered artifact class.
+    pub fn artifact_classes(&self) -> Result<BTreeMap<String, ArtifactClass>, StoreError> {
+        Ok(self.evidence_history()?.artifact_classes)
     }
 
     /// One retained `effect` row by sequence — the byte source behind
@@ -294,6 +375,22 @@ pub fn artifact_from_payload(
 pub fn artifact_seq(id: &str) -> Option<u64> {
     let seq = id.strip_prefix("event:")?.parse::<u64>().ok()?;
     (artifact_id(seq) == id).then_some(seq)
+}
+
+/// The class of one page descriptor under the snapshot's explicit
+/// classification, id convention, and payload class field.
+pub fn classify_descriptor(
+    snap: &HistorySnapshot,
+    descriptor: &ArtifactDescriptor,
+) -> ArtifactClass {
+    let payload = artifact_seq(&descriptor.artifact_id)
+        .and_then(|seq| snap.events.iter().find(|event| event.seq == seq))
+        .map(|event| event.payload.as_bytes());
+    crate::artifact_class::classify_artifact(
+        &descriptor.artifact_id,
+        payload,
+        snap.artifact_classes.get(&descriptor.artifact_id).copied(),
+    )
 }
 
 // ------------------------------------------------------------------
@@ -1709,16 +1806,24 @@ fn project(
 /// (the consumer already committed everything at or below the lower
 /// checkpoint); derivation state is replayed from the retained boundary
 /// so revision numbering and endpoint bindings stay continuous.
+/// `excluded_events` names recorded rows an export profile withholds;
+/// an excluded row is skipped entirely — nothing is projected from it
+/// and none of its registered facts feed derived bindings — so the
+/// export can never carry a copy of excluded content.
 fn materialize(
     snap: &HistorySnapshot,
     watermark: u64,
     after_seq: Option<u64>,
+    excluded_events: &BTreeSet<u64>,
 ) -> Result<Materialized, ExportError> {
     let mut rep = Replay::default();
     let mut items = Vec::new();
     for event in &snap.events {
         if event.seq > watermark {
             break;
+        }
+        if excluded_events.contains(&event.seq) {
+            continue;
         }
         let effect: Effect = serde_json::from_str(&event.payload).map_err(|e| {
             ExportError::new(
@@ -1871,6 +1976,19 @@ pub fn export_page(
     snap: &HistorySnapshot,
     now_unix_seconds: i64,
 ) -> Result<ExportPage, ExportError> {
+    export_page_excluding(request, snap, now_unix_seconds, &BTreeSet::new())
+}
+
+/// `export_page` with the recorded rows listed in `excluded_events`
+/// removed from the replay: no record is projected from them and no
+/// replay state is derived from their payloads, so a profiled export
+/// carries neither the excluded artifacts nor copies of their content.
+pub(crate) fn export_page_excluding(
+    request: &ExportRequest,
+    snap: &HistorySnapshot,
+    now_unix_seconds: i64,
+    excluded_events: &BTreeSet<u64>,
+) -> Result<ExportPage, ExportError> {
     validate_request(request).map_err(|e| {
         ExportError::new(
             ErrorCode::InvalidRequest,
@@ -1955,7 +2073,7 @@ pub fn export_page(
         retained_from_seq: retained,
         after_seq,
     };
-    let mat = materialize(snap, watermark, after_seq)?;
+    let mat = materialize(snap, watermark, after_seq, excluded_events)?;
     let limit = usize::from(request.limit);
     let mut a = Assembly::new();
     if after_seq.is_none() && retained > 1 && position == 0 && gap_pos == 0 {

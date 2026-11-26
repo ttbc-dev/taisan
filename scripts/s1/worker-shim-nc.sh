@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Owner-operations tooling: clones the private repository
+# shimpeiws/coding-worker-smoke — runnable only by the owner.
+#
 # S1 scenario worker (U8.3): the non-converging variant of the S1
 # scenario worker. Same real spawned-worker contract as worker-shim.sh
 # — the supervisor spawns it as `worker_argv` with cwd = the Work's

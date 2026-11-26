@@ -8,7 +8,7 @@ use workloop_core::domain::*;
 use workloop_core::identity::RepositoryRef;
 use workloop_core::ports::WorkerEnv;
 use workloop_core::store::{Store, StoreError, TxView};
-use workloop_core::worker_v2::{TaskBody, WorkerRequestV2};
+use workloop_core::worker_v2::{FixOrigin, TaskBody, WorkerRequestV2};
 
 use crate::bounded::{self, ExchangeBounds, ExchangeError};
 use crate::handoff::{self, HandoffLayout};
@@ -366,6 +366,78 @@ fn fsync_dir(path: &Path) -> Result<(), PreparationError> {
         .map_err(PreparationError::Io)
 }
 
+/// The generated-residue set preparation owns in `.git/info/exclude`:
+/// interpreter caches a worker runtime drops into the tree it ran in
+/// (`python3 -m unittest` leaves `__pycache__/` and `*.pyc`/`*.pyo` at
+/// every tested package). They are by-products of the toolchain, never
+/// declared worker output and never real WIP, so the cleanliness gate
+/// excludes them by name — the bytes stay on disk, nothing is deleted.
+const RESIDUE_EXCLUDE_PATTERNS: &[&str] = &["__pycache__/", "*.pyc", "*.pyo"];
+
+/// Append any missing residue patterns to `.git/info/exclude`.
+/// Idempotent, non-destructive, and committed the same way a receipt
+/// is: O_NOFOLLOW read of the existing list, O_NOFOLLOW create of a
+/// tmp file, rename, dir fsync. Callers run it only where the `.git`
+/// tree is known safe — after `verify_git_dir_safe` on a reused tree,
+/// or on a staging tree `git init` just produced.
+pub(crate) fn seed_residue_excludes(git_dir: &Path) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let info = git_dir.join("info");
+    std::fs::create_dir_all(&info)?;
+    let exclude = info.join("exclude");
+    // Bytes, not text: an existing exclude with non-UTF-8 content stays
+    // byte-preserved — refusing a reusable tree over its encoding would
+    // be a new failure mode preparation never had before.
+    let mut content = Vec::new();
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&exclude)
+    {
+        Ok(mut f) => {
+            f.read_to_end(&mut content)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let missing: Vec<&str> = RESIDUE_EXCLUDE_PATTERNS
+        .iter()
+        .copied()
+        .filter(|pattern| {
+            !content
+                .split(|byte| *byte == b'\n')
+                .any(|line| line == pattern.as_bytes())
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    if !content.is_empty() && !content.ends_with(b"\n") {
+        content.push(b'\n');
+    }
+    for pattern in missing {
+        content.extend_from_slice(pattern.as_bytes());
+        content.push(b'\n');
+    }
+    let tmp = info.join(format!(
+        ".exclude-{}-{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        f.write_all(&content)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &exclude)?;
+    std::fs::File::open(&info).and_then(|f| f.sync_all())
+}
+
 fn read_receipt(control: &Path, work_id: &str) -> Result<Option<Receipt>, PreparationError> {
     let path = receipt_path(control, work_id);
     let meta = match std::fs::symlink_metadata(&path) {
@@ -459,7 +531,7 @@ fn no_symlink_tree(dir: &Path, depth: u32) -> Result<bool, PreparationError> {
     Ok(true)
 }
 
-fn verify_git_dir_safe(git_dir: &Path) -> Result<(), PreparationError> {
+pub(crate) fn verify_git_dir_safe(git_dir: &Path) -> Result<(), PreparationError> {
     let conflict = |detail: &str| PreparationError::WorkspaceConflict {
         detail: detail.to_string(),
     };
@@ -534,11 +606,14 @@ pub(crate) fn declared_porcelain_path(path: &str) -> Option<String> {
 }
 
 /// The reused-tree invariant: branch, HEAD pin, base anchor, and a
-/// porcelain-clean tree — with one exception. A writer's durable
+/// porcelain-clean tree — with two exceptions. A writer's durable
 /// Invocation declares the artifacts it must produce (`artifact.json`
 /// at the workspace root by default); an untracked file at exactly a
 /// declared workspace-relative path is expected output the previous
-/// round left behind, not WIP, and is tolerated. Anything else — a
+/// round left behind, not WIP, and is tolerated. And interpreter
+/// caches the toolchain dropped (`__pycache__/`, `*.pyc`, `*.pyo`)
+/// are normalized into `.git/info/exclude` — preserved, never deleted —
+/// so residue alone never presents as dirt. Anything else — a
 /// modified, staged, or deleted tracked file, or an untracked path the
 /// Invocation never declared — refuses exactly as before.
 fn verify_existing(
@@ -580,6 +655,10 @@ fn verify_existing(
     {
         return Err(conflict("base anchor differs"));
     }
+    // Normalize generated toolchain residue into the exclude file only
+    // after the pin checks proved this is this request's workspace —
+    // a wrong tree refuses before it is ever written to.
+    seed_residue_excludes(&git_dir).map_err(PreparationError::Io)?;
     // `-z` gives unquoted NUL-terminated v1 records and
     // `--untracked-files=all` lists every untracked file rather than a
     // collapsed `dir/` entry, so a declared artifact nested in a
@@ -610,6 +689,10 @@ struct Gate {
     base: String,
     head: String,
     predecessor: Option<(String, PathBuf)>,
+    /// A conflict-repair Fix binds the post-merge target revision the
+    /// worker must merge; it exists only in the configured source
+    /// repo, never in the handoff bare.
+    conflict_target: Option<String>,
     /// The required-artifact set the durable Invocation declared at
     /// consume time — the same record the artifact-evidence path
     /// digests, so the names `verify_existing` tolerates have exactly
@@ -753,9 +836,13 @@ fn gates(
             });
         }
     }
-    let (head, predecessor) = match &request.task {
-        TaskBody::Coding { .. } => (request.base.object.clone(), None),
-        TaskBody::Fix { predecessor, .. } => {
+    let (head, predecessor, conflict_target) = match &request.task {
+        TaskBody::Coding { .. } => (request.base.object.clone(), None, None),
+        TaskBody::Fix {
+            predecessor,
+            origin,
+            ..
+        } => {
             let layout = handoff.ok_or_else(|| PreparationError::InvalidPredecessor {
                 detail: "no handoff layout is configured".into(),
             })?;
@@ -797,9 +884,23 @@ fn gates(
                     detail: "handoff base disagrees".into(),
                 });
             }
+            let conflict_target = match origin.as_ref() {
+                FixOrigin::Conflict {
+                    target_revision, ..
+                } => {
+                    if !is_hex_sha1(target_revision) {
+                        return Err(invalid(
+                            "conflict target is not a 40-lowerhex object id".into(),
+                        ));
+                    }
+                    Some(target_revision.clone())
+                }
+                _ => None,
+            };
             (
                 predecessor.produced.clone(),
                 Some((predecessor.artifact_id.clone(), layout.repository.clone())),
+                conflict_target,
             )
         }
         _ => {
@@ -824,6 +925,7 @@ fn gates(
         workspace_id,
         head,
         predecessor,
+        conflict_target,
         declared_artifacts,
     })
 }
@@ -868,6 +970,18 @@ fn validate_git_gate(gate: &Gate, source: &RepositorySource) -> Result<(), Prepa
                     detail: "produced does not descend from the request base".into(),
                 });
             }
+            if let Some(target) = &gate.conflict_target {
+                // The bound target is a raw source revision the worker
+                // must merge; a bound-but-absent revision would stage a
+                // workspace that can never resolve it, so refuse before
+                // any tree exists.
+                let object = git(&source.path, &["cat-file", "-t", target]).unwrap_or_default();
+                if object != "commit" {
+                    return Err(PreparationError::MissingBase {
+                        detail: "conflict target is not present in the source".into(),
+                    });
+                }
+            }
         }
     }
     Ok(())
@@ -881,6 +995,7 @@ fn same_gate(a: &Gate, b: &Gate) -> bool {
         && a.base == b.base
         && a.head == b.head
         && a.predecessor == b.predecessor
+        && a.conflict_target == b.conflict_target
         && a.declared_artifacts == b.declared_artifacts
 }
 
@@ -926,15 +1041,51 @@ fn unique_staging(control: &Path, work_id: &str) -> PathBuf {
     ))
 }
 
+/// Import the bound conflict target into `repo_dir` from the
+/// configured source — the object exists only there, never in the
+/// handoff bare, and a remote-less workspace must resolve it to merge.
+/// The fresh-build and the workspace-reuse paths run the same import.
+fn import_conflict_target(
+    repo_dir: &Path,
+    source: &RepositorySource,
+    target: &str,
+) -> Result<(), PreparationError> {
+    let src = source.path.to_string_lossy().into_owned();
+    git(
+        repo_dir,
+        &[
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--",
+            &src,
+            &format!("+{target}"),
+        ],
+    )
+    .map_err(|_| PreparationError::MissingBase {
+        detail: "conflict target could not be imported".into(),
+    })?;
+    if git(repo_dir, &["cat-file", "-t", target])? != "commit" {
+        return Err(PreparationError::MissingBase {
+            detail: "conflict target is not present in the source".into(),
+        });
+    }
+    Ok(())
+}
+
 fn build_staging(
     staging: &Path,
     base: &str,
     head: &str,
     branch: &str,
     predecessor: &Option<(String, PathBuf)>,
+    conflict_target: Option<&str>,
     source: &RepositorySource,
 ) -> Result<(), PreparationError> {
     git(staging, &["init"])?;
+    // A workspace is born with the residue excludes in place so
+    // interpreter caches the first writer drops never dirty it.
+    seed_residue_excludes(&staging.join(".git")).map_err(PreparationError::Io)?;
     match predecessor {
         None => {
             let src = source.path.to_string_lossy().into_owned();
@@ -984,6 +1135,14 @@ fn build_staging(
                 return Err(PreparationError::InvalidPredecessor {
                     detail: "request base is not reachable from the predecessor".into(),
                 });
+            }
+            if let Some(target) = conflict_target {
+                // A conflict-repair Fix binds a post-merge target
+                // revision the worker must merge into the produced
+                // head; the handoff bare does not carry it, so import
+                // the raw object from the configured source repo the
+                // same way the Coding arm imports the base.
+                import_conflict_target(staging, source, target)?;
             }
         }
     }
@@ -1155,6 +1314,14 @@ fn prepare_locked(
                     },
                 )?;
             }
+            if let Some(target) = &gate.conflict_target {
+                // The reused tree pins the produced head but was built
+                // before this request bound the conflict target — the
+                // object the remote-less worker must merge. Import it
+                // from the configured source exactly as a fresh build
+                // does; the pin checks above already proved the tree.
+                import_conflict_target(&final_path, source, target)?;
+            }
             return Ok(PreparedWorkspace {
                 path: final_path,
                 branch: gate.branch,
@@ -1190,6 +1357,7 @@ fn prepare_locked(
             &gate.head,
             &gate.branch,
             &gate.predecessor,
+            gate.conflict_target.as_deref(),
             source,
         )?;
         verify_git_dir_safe(&staging.join(".git"))?;

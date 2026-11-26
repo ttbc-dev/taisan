@@ -5,6 +5,7 @@ use crate::identity::{
     ChangeRequestRef, CommitRevision, DiffSnapshot, DiffTarget, EvidenceRef, HostActorRef,
     HostCapability, HostInstanceId, IssueRef, RepositoryRef,
 };
+use crate::mergeability::MergeabilityState;
 use crate::worker_v2::ReportClassification;
 
 /// Delivery identity for transports that assign one (webhooks, worker
@@ -227,6 +228,46 @@ pub enum ObservationFact {
         repository: RepositoryRef,
         branch: String,
         state: BranchState,
+    },
+    /// A managed change was recorded merged. `head` is the source head
+    /// the merge landed and `base` is the target revision observed
+    /// immediately after the merge — the new base sibling changes are
+    /// re-checked against. `target_branch` names the branch the bounded
+    /// sibling scan is scoped to.
+    ChangeMerged {
+        change: ChangeRequestRef,
+        head: CommitRevision,
+        base: CommitRevision,
+        target_branch: String,
+    },
+    /// A merge-detection read or a merge-scan slot ran for the change —
+    /// the "last serviced" signal the bounded merge-detection and
+    /// merge-scan sets share, so a deferred pair is reached on a later
+    /// pass. `head` is the revision the pull reported at read time, the
+    /// recorded merge head for a consumed scan, or the last recorded
+    /// head when the read failed or reported an unusable revision — a
+    /// serviced pair must always advance the ordering key. The fact is
+    /// a delivery envelope for the service record, not history: ingest
+    /// overwrites the pair's durable cursor on the Work's usage row and
+    /// never appends an observation row, so the service can run every
+    /// pass without growing the log. It is evidence of the service
+    /// itself, never of a merge, a mergeability verdict, or new Work
+    /// evidence: it does not mint a new attention occurrence.
+    MergeCheck {
+        change: ChangeRequestRef,
+        head: CommitRevision,
+    },
+    /// The host's mergeability verdict for one exact `(head, base)`
+    /// pair. A `Conflicting` verdict carries the paths the host could
+    /// report; a verdict the host could not establish is `Unknown` with
+    /// a reason, never an invented conflict.
+    Mergeability {
+        target: DiffTarget,
+        state: MergeabilityState,
+        #[serde(default)]
+        conflicting_paths: Vec<String>,
+        #[serde(default)]
+        reason: Option<String>,
     },
     /// One named check conclusion on an exact head.
     Check {

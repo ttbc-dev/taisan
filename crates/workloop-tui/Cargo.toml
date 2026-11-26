@@ -1,8 +1,33 @@
 [package]
 name = "workloop-tui"
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 default-run = "taisan-tui"
 description = "taisan management console"
+
+# The Homebrew formula is named after the shipped binary.
+[package.metadata.dist]
+# Required while workspace crates carry no `version` field (0.0.0 →
+# publish = false, which dist otherwise skips); see workloop-cli.
+dist = true
+formula = "taisan-tui"
+# This package also builds the legacy-named workloop-tui binary;
+# the override keeps only taisan-tui in the release artifacts and
+# installers.
+[package.metadata.dist.binaries]
+x86_64-apple-darwin = ["taisan-tui"]
+aarch64-apple-darwin = ["taisan-tui"]
+x86_64-unknown-linux-gnu = ["taisan-tui"]
+aarch64-unknown-linux-gnu = ["taisan-tui"]
+
+# cargo-binstall manifest for cargo-dist prebuilt archives; the
+# archive holds only taisan-tui, so installs need `--bin taisan-tui`.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.{ archive-format }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "txz"
 
 [dependencies]
 workloop-config = { path = "../workloop-config" }

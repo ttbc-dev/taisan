@@ -6,6 +6,13 @@ spawns a Worker, or mutates a store is owner-executed and begins only
 after the owner records authorization on #183. This document
 authorizes nothing; a prepared runbook is not permission.
 
+> **Owner-operations procedure — private references.** Every live step
+> here runs only for the owner, against the private repository
+> `shimpeiws/coding-worker-smoke`; links, `#N` citations, owner-local
+> credential paths, and recorded App/installation identities are
+> verbatim owner context and do not resolve publicly. Retained as a
+> record under the owner publication decision (#438).
+
 Stage C re-runs the S-3a (invariant-check) and S-5 (reviewer
 identity) legs of the S1 success path — and, per the owner's Stage C
 scope decision, all three variants — after Stage A (#190, merged)

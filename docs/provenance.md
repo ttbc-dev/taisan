@@ -9,9 +9,9 @@ retained as maintainer locators. The
 detailed audit — inspected revisions, per-behavior
 retain/re-model/omit decisions, incident analysis, and evidence
 classification — lives in
-[source-workflow-audit](source-workflow-audit.md) (issue #33), which is
-the audit record and needs its own disclosure review before this
-repository is published.
+[source-workflow-audit](source-workflow-audit.md) (issue #33), the
+audit record, which stays in the published tree under the owner
+decision recorded in [release-audit](release-audit.md) §7 (#438).
 
 ## Source systems
 
@@ -27,9 +27,29 @@ referred to here by role, using the legend in the audit document:
 | the infra repo | Remote execution infrastructure running bounded worker jobs in isolated containers | Execution-environment evidence: bounded runs, idempotent lifecycle operations, and the observation that a lost acknowledgement is not proof of failure |
 
 All four systems are private. Their names, contents, histories, and
-internal identifiers are not reproduced in this project's
-publication-facing documents and are not consulted at build or runtime;
-the audit document records what was inspected and at which revisions.
+internal identifiers are not consulted at build or runtime and are not
+reproduced in publication-facing documents outside the two
+owner-controlled audit records (`docs/source-workflow-audit.md`,
+`docs/release-audit.md`); the one name that does surface outside them
+is the worker repo's, embedded in the smoke repo's name and owner-local
+config paths described in the next section. The audit document records
+what was inspected and at which revisions.
+
+## Private references in this repository
+
+Separately from the source systems above, this tree records live
+acceptance work executed against `shimpeiws/coding-worker-smoke`, a
+private GitHub repository owned by this project's owner. Documents
+that cite it — under `docs/s1/`, `docs/evidence/`, and
+`fixtures/s1/` — retain the name verbatim: links and `#N` issue/PR
+citations to it resolve only for the owner (they 404 publicly), and
+each citing document marks those references as private/owner-only.
+The same applies to owner-local paths (`~/.config/coding-worker/`,
+`~/s1-*` run directories) and owner-recorded runtime identities
+(GitHub App, installation, and user ids) inside owner-run records.
+Disclosure of these names and the owner identity was accepted by
+owner decision under issue #438; no credential values are recorded
+anywhere in the tree.
 
 ## Provenance versus dependency
 
@@ -49,14 +69,17 @@ Concretely:
   `taisan run` behind the `GhCliApi` transport — every GitHub call goes
   through the `gh` CLI as a bounded subprocess. Bounded reads are scoped
   to served hosts and active executions; writes reconcile by read-back
-  before retry. Live-verified behavior against a real repository is
-  still pending owner-run acceptance.
+  before retry. Live-verified against a real repository in the
+  owner-run acceptance recorded in
+  [release-acceptance-v0.3.md](release-acceptance-v0.3.md).
 - The Worker port is exercised by `workloop-fixture-worker` and the
   independent `workloop-contract-worker`, both real local processes
   implementing the executable
   `taisan.worker.declaration/1` / `request/2` / `report/2` wire — not
-  by a source-system worker. A real conforming Worker is owner-supplied
-  and validated by the owner-run checklist.
+  by a source-system worker. The in-repo reference adapter
+  `taisan-worker-claude` is the validated conforming Worker —
+  owner-run live under the owner-run checklist; the runtime it drives
+  and its credential remain operator-supplied.
 - The Work Selector port has a reference implementation
   (`workloop-selector`, shipped as the `public-issue-selector`
   binary), a fixture selector, and the intake scheduler's
@@ -124,8 +147,12 @@ integrations.
 **Missing integrations and open gaps:**
 
 - Owner-run live acceptance of the real Worker path and the production
-  GitHub driver — the [v0.3 owner-run checklist](v0.3-owner-acceptance-checklist.md)
-  defines the scenarios; no live evidence exists yet.
+  GitHub driver — **recorded, no longer a gap**: the
+  [v0.3 owner-run checklist](v0.3-owner-acceptance-checklist.md)
+  scenarios ran live across manual runs 1–6 and the scheduled-intake
+  pilot; evidence and dispositions in
+  [release-acceptance-v0.3.md](release-acceptance-v0.3.md) and
+  [evidence/v0.3-manual-acceptance.md](evidence/v0.3-manual-acceptance.md).
 - The `fixture` driver emits no `CapabilityReport` — it is the
   deterministic test double, so a fixture-driven run still parks at
   the host-effect boundary. The in-process `github` driver is a real
@@ -136,9 +163,11 @@ integrations.
   outside its scope.
 - `check --probe` has no wired adapter probe backend; the stage fails
   closed `capability.unknown` by design.
-- A real, owner-supplied conforming Worker implementation — the wire
-  and conformance suite exist; the production Worker is not in this
-  repository.
+- A conforming Worker beyond the in-repo reference:
+  `taisan-worker-claude` is the validated conforming Worker (above);
+  the agent runtime it drives and its credential are operator-supplied
+  and not in this repository. Any alternative Worker is owner-supplied
+  behind the same wire and conformance suite.
 - GitHub comment command adapter and Projects projection.
 - CI pipeline (tracked by issue #28) and the end-to-end v0.1 validation
   against a real GitHub repository.

@@ -1062,6 +1062,95 @@ fn a_root_separation_violation_fails_the_paths_stage() {
     let _ = std::fs::remove_dir_all(&setup.dir);
 }
 
+/// Stage (4): a declared verification cache path that is a symlink
+/// fails the paths stage — the sandbox binds the declared name while
+/// the link target is never mounted, so the boundary path dangles
+/// inside the sandbox and every verification degrades to inconclusive
+/// (#469).
+#[test]
+fn a_symlinked_verification_cache_fails_the_paths_stage() {
+    let setup = clean_setup("paths-cachelink", 1_763_000_000);
+    let real = setup.dir.join("real-cache");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = setup.dir.join("cache-link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let report = {
+        let mut options = CheckOptions::new(&setup.state);
+        options.env_lookup = &env_present;
+        options.verification_cache_paths = vec![link];
+        check(&setup.config, &mut options)
+    };
+    assert!(!report.success);
+    assert_stage(&report, CheckStage::Paths, StageStatus::Fail);
+    let diagnostics = failed(&report, CheckStage::Paths);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "paths.cache_symlink"),
+        "names the linked cache path: {diagnostics:?}"
+    );
+    let _ = std::fs::remove_dir_all(&setup.dir);
+}
+
+/// Stage (4): the same symlink shape on the declared verification
+/// toolchain fails with `paths.toolchain_symlink` (#469).
+#[test]
+fn a_symlinked_verification_toolchain_fails_the_paths_stage() {
+    let setup = clean_setup("paths-toolchainlink", 1_763_000_000);
+    let real = setup.dir.join("real-toolchain");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = setup.dir.join("toolchain-link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    let report = {
+        let mut options = CheckOptions::new(&setup.state);
+        options.env_lookup = &env_present;
+        options.verification_toolchain = Some(link);
+        check(&setup.config, &mut options)
+    };
+    assert!(!report.success);
+    assert_stage(&report, CheckStage::Paths, StageStatus::Fail);
+    let diagnostics = failed(&report, CheckStage::Paths);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "paths.toolchain_symlink"),
+        "names the linked toolchain path: {diagnostics:?}"
+    );
+    let _ = std::fs::remove_dir_all(&setup.dir);
+}
+
+/// Stage (4): real directory/file boundary paths are exactly what the
+/// sandbox can mount — the stage passes and later stages still run.
+#[test]
+fn real_verification_boundary_paths_pass_the_paths_stage() {
+    let setup = clean_setup("paths-verification-real", 1_763_000_000);
+    let toolchain = setup.dir.join("toolchain");
+    std::fs::create_dir_all(&toolchain).unwrap();
+    let cache = setup.dir.join("deps-cache");
+    std::fs::create_dir_all(&cache).unwrap();
+
+    let report = {
+        let mut options = CheckOptions::new(&setup.state);
+        options.env_lookup = &env_present;
+        options.verification_toolchain = Some(toolchain);
+        options.verification_cache_paths = vec![cache];
+        check(&setup.config, &mut options)
+    };
+    assert_stage(&report, CheckStage::Paths, StageStatus::Pass);
+    assert!(
+        report
+            .stages
+            .iter()
+            .any(|stage| stage.stage == CheckStage::WorkerRuntime
+                && stage.status != StageStatus::NotRun),
+        "later stages still run: {:?}",
+        report.stages
+    );
+    let _ = std::fs::remove_dir_all(&setup.dir);
+}
+
 /// Stage (5): a `worker.argv` that does not resolve is `runtime.missing`
 /// with the argv named, and the isolation stage never runs.
 #[test]
@@ -1786,7 +1875,7 @@ fn store_header_classification_covers_fresh_unversioned_and_newer_formats() {
         ),
         (
             "newer format",
-            header(1, 14),
+            header(1, 17),
             false,
             Some("store.unsupported"),
         ),

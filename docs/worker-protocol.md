@@ -143,6 +143,8 @@ enum FixOrigin {
     Prepublication { failed_evidence: NonEmptyVec<EvidenceId> },
     Review { target: DiffTarget, round: ReviewRoundId, judgment: JudgmentId,
              findings: NonEmptyVec<OccurrenceRef> },
+    Conflict { change: ChangeRequestId, source_revision: ObjectId,
+               target_revision: ObjectId, paths: Vec<String> },
 }
 struct WorkerCapabilities {
     adapter: AdapterId,

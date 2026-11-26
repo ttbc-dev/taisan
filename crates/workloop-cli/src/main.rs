@@ -19,7 +19,7 @@ use workloop_config::preflight::{
     ProbeMode, check as preflight_check, init as preflight_init,
 };
 use workloop_config::profile::resolve_paths_from_env;
-use workloop_config::{Installation, load_or_create};
+use workloop_config::{Installation, load_existing, load_or_create};
 use workloop_core::command::*;
 use workloop_core::domain::*;
 use workloop_core::identity::{
@@ -311,6 +311,23 @@ enum EvidenceCommands {
         /// Maximum records on this page (1..=500).
         #[arg(long, default_value_t = 100)]
         limit: u16,
+        /// Named export profile: `full` (default), `sanitized`, or
+        /// `shared`. Sanitized/shared exclude planner-authored classes
+        /// by default.
+        #[arg(long, alias = "export-profile", default_value = "full")]
+        profile: String,
+        /// Explicitly include an artifact class the profile excludes
+        /// by default. Recorded as a widening in the export manifest.
+        #[arg(long = "include-class", alias = "widen", alias = "include")]
+        include_class: Vec<String>,
+        /// Write an export bundle (page, manifest, included artifacts,
+        /// and previews) into this directory. The bundle follows the
+        /// selected `--profile`; `full` exports every artifact class.
+        #[arg(long, alias = "out-dir")]
+        output: Option<PathBuf>,
+        /// Write the export manifest to this file.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
     },
     /// Write one retained artifact's exact bytes to a new file after
     /// digest verification. Refuses an existing destination.
@@ -324,6 +341,9 @@ enum EvidenceCommands {
         /// New file to receive the exact retained bytes.
         #[arg(long)]
         output: PathBuf,
+        /// Named export profile; an excluded class is refused.
+        #[arg(long, alias = "export-profile", default_value = "full")]
+        profile: String,
     },
 }
 
@@ -1510,10 +1530,29 @@ fn run(cli: Cli) -> i32 {
                     after,
                     cursor,
                     limit,
-                } => evidence::export(&store, &actor_label, after, cursor, limit),
-                EvidenceCommands::Artifact { id, sha256, output } => {
-                    evidence::artifact(&store, &actor_label, id, sha256, output)
-                }
+                    profile,
+                    include_class,
+                    output,
+                    manifest,
+                } => evidence::export(
+                    &store,
+                    &actor_label,
+                    evidence::ExportOptions {
+                        after,
+                        cursor,
+                        limit,
+                        profile,
+                        include_classes: include_class,
+                        output,
+                        manifest,
+                    },
+                ),
+                EvidenceCommands::Artifact {
+                    id,
+                    sha256,
+                    output,
+                    profile,
+                } => evidence::artifact(&store, &actor_label, id, sha256, output, &profile),
             }
         }
         Commands::Retention { command } => {
@@ -1979,6 +2018,46 @@ fn run_check(cli: &Cli, probe: bool) -> i32 {
         // request. The stage runs after (1)–(7), performs no reads and
         // no writes, and the report carries an empty operation log.
         options.probe = ProbeMode::Unavailable;
+    }
+    // The verification boundary paths live on the JSON installation
+    // record beside the store file the `store` stage inspects —
+    // `<state_root>/store.config.json` under the documented layout —
+    // not the profile and not the `--db` flag, which belongs to the
+    // store-backed surface `check` never opens. Read it strictly
+    // read-only — never `load_or_create`, which would publish a fresh
+    // record on first use — so the Paths stage can inspect declared
+    // toolchain/cache paths for the symlink shape the sandbox cannot
+    // mount (#469). An absent record leaves the paths uninspected; a
+    // present-but-foreign record (empty, malformed, or unreadable) is
+    // a config-class failure — the fail-closed preflight never passes
+    // with the declared boundary uninspected.
+    let store_path = options
+        .store_path
+        .clone()
+        .unwrap_or_else(|| paths.state_root.join("store.db"));
+    match load_existing(&store_path.with_extension("config.json")) {
+        Ok(Some(installation)) => {
+            let boundary = match installation.verification_boundary() {
+                Ok(boundary) => boundary,
+                Err(e) => {
+                    return emit(envelope::error_envelope(
+                        None,
+                        envelope::ErrorClass::Config,
+                        &e,
+                    ));
+                }
+            };
+            options.verification_toolchain = boundary.toolchain;
+            options.verification_cache_paths = boundary.cache_paths;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            return emit(envelope::error_envelope(
+                None,
+                envelope::ErrorClass::Config,
+                &e,
+            ));
+        }
     }
     let report = preflight_check(&paths.config_path, &mut options);
     if report.success {

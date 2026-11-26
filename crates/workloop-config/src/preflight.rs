@@ -46,7 +46,7 @@ use crate::profile::{
 /// store itself stays authoritative at open; this constant only lets
 /// `check` name a newer header without linking the store — `check`
 /// never opens, migrates, or writes the store.
-const KNOWN_STORE_FORMAT_MAX: i64 = 13;
+const KNOWN_STORE_FORMAT_MAX: i64 = 16;
 
 /// The SQLite header magic ("SQLite format 3\0") — a file without it
 /// is not a store at all.
@@ -248,6 +248,13 @@ pub struct CheckOptions<'a> {
     pub which: &'a dyn Fn(&str) -> Option<PathBuf>,
     /// Observation clock for stage-8 evidence refresh.
     pub now_unix_seconds: i64,
+    /// The verification boundary paths the installation record
+    /// declares (`verification_toolchain`/`verification_cache_paths`),
+    /// supplied already resolved — `check` reads only the profile, so
+    /// the caller owns the record read. `None`/empty when no record
+    /// declares them.
+    pub verification_toolchain: Option<PathBuf>,
+    pub verification_cache_paths: Vec<PathBuf>,
 }
 
 /// The current unix time in seconds.
@@ -276,6 +283,8 @@ impl<'a> CheckOptions<'a> {
             env_lookup: &default_env_lookup,
             which: &real_which,
             now_unix_seconds: now_unix_seconds(),
+            verification_toolchain: None,
+            verification_cache_paths: Vec::new(),
         }
     }
 }
@@ -816,8 +825,15 @@ fn file_slot_exists(path: &Path) -> Result<(), (String, String)> {
 /// Stage (4): installation paths — all absolute (never the ambient
 /// working directory), correctly nested per the documented layout, and
 /// each state/workspace root present-and-writable or creatable. The
-/// stage only inspects: it creates nothing and writes nothing.
-fn stage_paths(config_path: &Path, state_root: &Path, workspace_root: &Path) -> Vec<Diagnostic> {
+/// declared verification boundary paths are additionally inspected for
+/// the symlink shape the sandbox cannot mount. The stage only
+/// inspects: it creates nothing and writes nothing.
+fn stage_paths(
+    config_path: &Path,
+    options: &CheckOptions,
+    workspace_root: &Path,
+) -> Vec<Diagnostic> {
+    let state_root = options.state_root.as_path();
     let mut diagnostics = Vec::new();
     for (name, path) in [
         ("config path", config_path),
@@ -863,6 +879,42 @@ fn stage_paths(config_path: &Path, state_root: &Path, workspace_root: &Path) -> 
                 &message.0,
                 path.display().to_string(),
                 format!("{name}: {}", message.1),
+            ));
+        }
+    }
+    // Verification boundary paths the installation record declares.
+    // A symlinked entry resolves on the host — `exists()` follows it —
+    // but the sandbox binds the declared path, never the link target,
+    // so the boundary path dangles inside the sandbox and every
+    // verification degrades to inconclusive (#469). The test is
+    // `symlink_metadata` on the declared path itself — the same
+    // boundary the enforcement digest inspects — so ancestor links the
+    // mount resolves on the host (and platform-standard indirections
+    // like `/var` → `/private/var`) are not flagged.
+    for (key, code, path) in options
+        .verification_toolchain
+        .iter()
+        .map(|path| ("verification_toolchain", "paths.toolchain_symlink", path))
+        .chain(
+            options
+                .verification_cache_paths
+                .iter()
+                .map(|path| ("verification_cache_paths", "paths.cache_symlink", path)),
+        )
+    {
+        if std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            diagnostics.push(Diagnostic::new(
+                code,
+                format!("{key}: {}", path.display()),
+                format!(
+                    "{} is a symlink — the verification sandbox binds the declared path, \
+                     never the link target, so the boundary path dangles inside the \
+                     sandbox and every verification run degrades to inconclusive",
+                    path.display()
+                ),
             ));
         }
     }
@@ -1807,7 +1859,7 @@ pub fn check(config_path: &Path, options: &mut CheckOptions) -> CheckReport {
     if !advance(
         &mut report,
         CheckStage::Paths,
-        stage_paths(config_path, &options.state_root, &workspace_root),
+        stage_paths(config_path, options, &workspace_root),
     ) {
         return finish(report, false);
     }

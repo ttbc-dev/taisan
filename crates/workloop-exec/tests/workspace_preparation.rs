@@ -617,6 +617,184 @@ fn fix_fixture_aid(
     (w, e, rid, src, base, produced, aid.into())
 }
 
+fn conflict_fix_task(artifact_id: &str, manifest: &str, produced: &str, target: &str) -> TaskBody {
+    TaskBody::Fix {
+        goal: GoalRef {
+            body_ref: "goal-1".into(),
+            media_type: "text/markdown".into(),
+            bytes: 4,
+            digest: "0".repeat(64),
+        },
+        issues: vec![],
+        predecessor: ArtifactRef {
+            artifact_id: artifact_id.into(),
+            manifest_digest: manifest.into(),
+            produced: produced.into(),
+        },
+        origin: Box::new(FixOrigin::Conflict {
+            change: "cr-1".into(),
+            source_revision: produced.into(),
+            target_revision: target.into(),
+            paths: vec![],
+        }),
+        constraints: vec![],
+        verification_argv: vec![],
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn conflict_fix_fixture(
+    store: &SqliteStore,
+    root: &Path,
+    key: &str,
+    manifest: &str,
+    aid: &str,
+) -> (
+    WorkId,
+    ExecutionId,
+    String,
+    PathBuf,
+    String,
+    String,
+    String,
+    String,
+) {
+    let (w, e, _rid0) = admit(store, key);
+    let (src, base, _n) = git_source(root);
+    std::fs::write(src.join("fix.txt"), "fix").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "produced"]);
+    let produced = git(&src, &["rev-parse", "HEAD"]);
+    // The post-merge target revision the conflict binds: an object the
+    // source repo carries but the handoff bare never stages on its own.
+    std::fs::write(src.join("target.txt"), "target").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "post-merge target"]);
+    let target = git(&src, &["rev-parse", "HEAD"]);
+    let rid = format!("{}:inv:1", e.0);
+    insert_request_row(store, &w, &e, &rid, InvocationRole::Fix);
+    let request = v2_request(
+        store,
+        &w,
+        &e,
+        &rid,
+        InvocationRole::Fix,
+        &base,
+        conflict_fix_task(aid, manifest, &produced, &target),
+    );
+    insert_body(store, &request);
+    (w, e, rid, src, base, produced, target, aid.into())
+}
+
+#[test]
+fn a_conflict_workspace_contains_the_bound_target_revision() {
+    let root = tmp_root("fix-conflict");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e, rid, src, base, produced, target, aid) =
+        conflict_fix_fixture(&store, &root, "p-conflict", "m-1", "art-1");
+    let (sup, layout) = supervisor(&root);
+    acknowledge_predecessor(&store, &layout, &src, &w, &e, &aid, &produced, &base, "m-1");
+
+    let prepared = sup
+        .prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    assert_eq!(prepared.head, produced);
+    let ws = ws_path(&root, &w);
+    assert_clean_pinned(&ws, &format!("work/{}", w.0), &base, &produced);
+    assert_eq!(
+        git(&ws, &["cat-file", "-t", &target]),
+        "commit",
+        "the bound conflict target resolves in the remote-less workspace"
+    );
+}
+
+#[test]
+fn a_reused_workspace_still_carries_the_bound_conflict_target() {
+    let root = tmp_root("fix-conflict-reuse");
+    let store = SqliteStore::in_memory(1).unwrap();
+    // A non-conflict Fix prepared the managed workspace at the
+    // produced head; no conflict target was bound to that request.
+    let (w, e, rid, src, base, produced, aid) =
+        fix_fixture(&store, &root, "p-reuse-conflict", "m-1");
+    let (sup, layout) = supervisor(&root);
+    acknowledge_predecessor(&store, &layout, &src, &w, &e, &aid, &produced, &base, "m-1");
+    sup.prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    let ws = ws_path(&root, &w);
+    assert_clean_pinned(&ws, &format!("work/{}", w.0), &base, &produced);
+
+    // The post-merge target revision lands in the source only after
+    // the workspace was built — the handoff bare never carries it.
+    std::fs::write(src.join("target.txt"), "target").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "post-merge target"]);
+    let target = git(&src, &["rev-parse", "HEAD"]);
+
+    // The conflict repair binds the same pins under a fresh request
+    // digest, so preparation takes the reuse branch instead of a
+    // fresh build — the workspace must still resolve the target.
+    let rid2 = format!("{}:inv:2", e.0);
+    insert_request_row(&store, &w, &e, &rid2, InvocationRole::Fix);
+    let request = v2_request(
+        &store,
+        &w,
+        &e,
+        &rid2,
+        InvocationRole::Fix,
+        &base,
+        conflict_fix_task(&aid, "m-1", &produced, &target),
+    );
+    insert_body(&store, &request);
+
+    let prepared = sup
+        .prepare_workspace(&store, &rid2, &source(&root, &src), NOW)
+        .unwrap();
+    assert_eq!(prepared.path, ws, "the existing workspace is reused");
+    assert_eq!(
+        git(&ws, &["cat-file", "-t", &target]),
+        "commit",
+        "the reused workspace resolves the bound conflict target"
+    );
+}
+
+#[test]
+fn a_conflict_target_absent_from_the_source_refuses_before_a_workspace() {
+    let root = tmp_root("fix-conflict-missing");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e, _rid0) = admit(&store, "p-conflict-missing");
+    let (src, base, _n) = git_source(&root);
+    std::fs::write(src.join("fix.txt"), "fix").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "produced"]);
+    let produced = git(&src, &["rev-parse", "HEAD"]);
+    let rid = format!("{}:inv:1", e.0);
+    insert_request_row(&store, &w, &e, &rid, InvocationRole::Fix);
+    let absent = "1".repeat(40);
+    let request = v2_request(
+        &store,
+        &w,
+        &e,
+        &rid,
+        InvocationRole::Fix,
+        &base,
+        conflict_fix_task("art-1", "m-1", &produced, &absent),
+    );
+    insert_body(&store, &request);
+    let (sup, layout) = supervisor(&root);
+    acknowledge_predecessor(
+        &store, &layout, &src, &w, &e, "art-1", &produced, &base, "m-1",
+    );
+
+    let err = sup
+        .prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap_err();
+    assert!(
+        matches!(err, PreparationError::MissingBase { .. }),
+        "{err:?}"
+    );
+    assert!(!ws_path(&root, &w).exists());
+}
+
 #[test]
 fn fix_workspace_starts_at_the_exact_acknowledged_predecessor() {
     let root = tmp_root("fix-ok");
@@ -975,6 +1153,143 @@ fn declared_untracked_artifacts_are_output_not_dirt() {
         std::fs::read_to_string(ws.join("stray.txt")).unwrap(),
         "wip"
     );
+}
+
+/// Issue #449: a worker runtime leaves interpreter caches in the tree
+/// it ran in (`python3 -m unittest` writes `__pycache__/` under every
+/// tested package plus loose `*.pyc`/`*.pyo` files). Residue is
+/// normalized into `.git/info/exclude` — preserved, never deleted — so
+/// reuse proceeds, while genuinely untracked WIP still refuses.
+#[test]
+fn worker_runtime_residue_never_refuses_reuse_but_wip_still_does() {
+    let root = tmp_root("residue");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, _n) = git_source(&root);
+    let (w, _e, rid, _r) = coding_fixture(&store, "p-residue", &base, coding_task(vec![]));
+    let (sup, _layout) = supervisor(&root);
+    sup.prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    let ws = ws_path(&root, &w);
+
+    // A fresh workspace is born carrying the residue excludes.
+    let exclude = std::fs::read_to_string(ws.join(".git/info/exclude")).unwrap();
+    for pattern in ["__pycache__/", "*.pyc", "*.pyo"] {
+        assert!(
+            exclude.lines().any(|line| line == pattern),
+            "{pattern} missing from .git/info/exclude: {exclude}"
+        );
+    }
+
+    // Residue at two package depths plus a loose compiled file: the
+    // same request reuses the tree and nothing is deleted.
+    std::fs::create_dir_all(ws.join("__pycache__")).unwrap();
+    std::fs::write(ws.join("__pycache__/mod.cpython-311.pyc"), "x").unwrap();
+    std::fs::create_dir_all(ws.join("tests/__pycache__")).unwrap();
+    std::fs::write(ws.join("tests/__pycache__/test_mod.cpython-311.pyc"), "x").unwrap();
+    std::fs::write(ws.join("loose.pyc"), "x").unwrap();
+    let prepared = sup
+        .prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    assert_eq!(prepared.path, ws);
+    assert!(
+        ws.join("__pycache__/mod.cpython-311.pyc").exists(),
+        "residue is preserved, never deleted"
+    );
+    assert!(
+        ws.join("tests/__pycache__/test_mod.cpython-311.pyc")
+            .exists()
+    );
+    assert!(ws.join("loose.pyc").exists());
+
+    // A workspace predating the seeded excludes normalizes on the
+    // reuse pass — the upgrade path never needs a rebuild.
+    std::fs::write(ws.join(".git/info/exclude"), "").unwrap();
+    let prepared = sup
+        .prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    assert_eq!(prepared.path, ws);
+    let exclude = std::fs::read_to_string(ws.join(".git/info/exclude")).unwrap();
+    assert!(exclude.lines().any(|line| line == "__pycache__/"));
+
+    // Untracked WIP beside residue still refuses, untouched.
+    std::fs::write(ws.join("wip.txt"), "wip").unwrap();
+    let err = sup
+        .prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap_err();
+    assert!(
+        matches!(err, PreparationError::WorkspaceConflict { .. }),
+        "{err:?}"
+    );
+    assert_eq!(std::fs::read_to_string(ws.join("wip.txt")).unwrap(), "wip");
+}
+
+/// An `.git/info/exclude` a tool wrote with non-UTF-8 bytes is not a
+/// reason to refuse reuse: the seed reads bytes, preserves them, and
+/// appends the residue patterns after a newline.
+#[test]
+fn a_non_utf8_exclude_still_gains_the_residue_patterns() {
+    let root = tmp_root("residue-nonutf8");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, _n) = git_source(&root);
+    let (w, _e, rid, _r) = coding_fixture(&store, "p-nonutf8", &base, coding_task(vec![]));
+    let (sup, _layout) = supervisor(&root);
+    sup.prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    let ws = ws_path(&root, &w);
+
+    let foreign: &[u8] = b"\xFF\xFE-not-utf8\n";
+    std::fs::write(ws.join(".git/info/exclude"), foreign).unwrap();
+    let prepared = sup
+        .prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    assert_eq!(prepared.path, ws, "reuse proceeds over the raw bytes");
+
+    let exclude = std::fs::read(ws.join(".git/info/exclude")).unwrap();
+    assert!(
+        exclude.starts_with(foreign),
+        "existing content is byte-preserved: {exclude:?}"
+    );
+    for pattern in [b"__pycache__/".as_slice(), b"*.pyc", b"*.pyo"] {
+        assert!(
+            exclude
+                .split(|byte| *byte == b'\n')
+                .any(|line| line == pattern),
+            "{pattern:?} missing from .git/info/exclude: {exclude:?}"
+        );
+    }
+}
+
+/// A `.git/info/exclude` planted as a symlink is never followed: the
+/// seed opens O_NOFOLLOW, so reuse refuses instead of writing through
+/// to the link target.
+#[test]
+fn a_symlinked_exclude_refuses_and_never_writes_through() {
+    let root = tmp_root("residue-symlink");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, _n) = git_source(&root);
+    let (w, _e, rid, _r) = coding_fixture(&store, "p-symlink", &base, coding_task(vec![]));
+    let (sup, _layout) = supervisor(&root);
+    sup.prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap();
+    let ws = ws_path(&root, &w);
+
+    let victim = root.join("victim.txt");
+    std::fs::write(&victim, "untouched").unwrap();
+    let exclude = ws.join(".git/info/exclude");
+    std::fs::remove_file(&exclude).unwrap();
+    std::os::unix::fs::symlink(&victim, &exclude).unwrap();
+
+    let err = sup
+        .prepare_workspace(&store, &rid, &source(&root, &src), NOW)
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            PreparationError::WorkspaceConflict { .. } | PreparationError::Io(_)
+        ),
+        "a symlinked exclude refuses, never writes through: {err:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
 }
 
 #[test]

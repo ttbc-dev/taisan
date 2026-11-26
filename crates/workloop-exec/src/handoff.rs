@@ -193,7 +193,7 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, HandoffError> {
 /// `git merge-base --is-ancestor` distinguishes a real descendant (0)
 /// from a non-descendant (1); any other exit is a transport failure,
 /// never a quiet "no".
-fn is_ancestor(dir: &Path, base: &str, produced: &str) -> Result<bool, HandoffError> {
+pub(crate) fn is_ancestor(dir: &Path, base: &str, produced: &str) -> Result<bool, HandoffError> {
     let out = git_output(dir, &["merge-base", "--is-ancestor", base, produced])?;
     match out.status.code() {
         Some(0) => Ok(true),
@@ -1003,9 +1003,25 @@ fn prepare_enforcement(
             toolchain.display()
         ));
     }
+    // A declared boundary path that is a symlink resolves on the host
+    // — `exists()` follows it — but the sandbox bind mounts the
+    // declared path, never the link target, so the path dangles
+    // inside. Name the shape explicitly rather than reporting the
+    // unreadable-path refusal the boundary digest would emit.
+    if let Some(toolchain) = &sandbox.toolchain
+        && toolchain.is_symlink()
+    {
+        return Err(format!(
+            "verification.toolchain_symlink: {}",
+            toolchain.display()
+        ));
+    }
     for cache in &sandbox.caches {
         if !cache.exists() {
             return Err(format!("verification.cache_missing: {}", cache.display()));
+        }
+        if cache.is_symlink() {
+            return Err(format!("verification.cache_symlink: {}", cache.display()));
         }
     }
     let mut hosts = sandbox.egress_allowlist.clone();

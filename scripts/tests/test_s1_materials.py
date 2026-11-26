@@ -1,3 +1,5 @@
+# Validates the S1 materials against their recorded scenario repository
+# shimpeiws/coding-worker-smoke — a private, owner-only repository.
 import copy
 import importlib.util
 import json

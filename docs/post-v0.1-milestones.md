@@ -4,7 +4,7 @@ The owner approved deferring the following seven behaviors from v0.1 and retaini
 
 ## Planning and bounded replanning
 
-Track delivery in [milestone 3](https://github.com/shimpeiws/taisan/milestone/3).
+Track delivery in [milestone 3](https://github.com/ttbc-dev/taisan/milestone/3).
 
 | Behavior | Scope and acceptance |
 | --- | --- |
@@ -18,7 +18,7 @@ The owner also approved two follow-up capabilities under this milestone. Automat
 
 ## Evaluation and independent adjudication
 
-Track delivery in [milestone 4](https://github.com/shimpeiws/taisan/milestone/4).
+Track delivery in [milestone 4](https://github.com/ttbc-dev/taisan/milestone/4).
 
 | Behavior | Scope and acceptance |
 | --- | --- |

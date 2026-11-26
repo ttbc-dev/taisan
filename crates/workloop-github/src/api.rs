@@ -20,6 +20,7 @@
 
 use std::time::Instant;
 use workloop_core::identity::{ChangeRequestId, HostActorRef, IssueRef, RepositoryRef};
+use workloop_core::mergeability::MergeabilityState;
 use workloop_core::observation::{CheckConclusion, IssueState};
 
 use crate::credential::{CredentialError, ResolvedCredential};
@@ -69,6 +70,60 @@ pub struct RemotePull {
     /// Whether GitHub reports the PR merged. Nothing in this adapter
     /// can set it: merge is a human/policy action outside the port.
     pub merged: bool,
+    /// GitHub's `mergeable` tri-state. `None` means the host has not
+    /// computed it yet (or the transport could not report it) — an
+    /// unknown answer, never a clean or conflicted verdict.
+    pub mergeable: Option<bool>,
+    /// GitHub's `mergeable_state` string (`clean`, `dirty`,
+    /// `unknown`, `blocked`, ...). Empty when the transport cannot
+    /// report it.
+    pub mergeable_state: String,
+    /// The exact target revision the pull request currently targets
+    /// (`base.sha`); empty when the host did not report it.
+    pub base_sha: String,
+    /// Paths the host reported as conflicting for this pair. A host
+    /// that reports only a verdict leaves this empty; the bounded
+    /// trigger still binds both revisions.
+    pub conflicting_paths: Vec<String>,
+}
+
+impl RemotePull {
+    /// The normalized mergeability verdict. `Conflicting` requires an
+    /// explicit conflict report: the `mergeable` tri-state also goes
+    /// false for non-conflict blocks (required reviews, checks, a
+    /// stale head), so the state string — not the bare tri-state — is
+    /// what names a conflict. `Mergeable` requires a positive host
+    /// answer; an absent or unrecognized state is `Unknown`, never a
+    /// conflict and never a clean pass.
+    pub fn mergeability_state(&self) -> MergeabilityState {
+        if matches!(self.mergeable_state.as_str(), "dirty" | "conflicting") {
+            return MergeabilityState::Conflicting;
+        }
+        if self.mergeable != Some(false)
+            && (self.mergeable == Some(true)
+                || matches!(
+                    self.mergeable_state.as_str(),
+                    "clean" | "has_hooks" | "unstable"
+                ))
+        {
+            return MergeabilityState::Mergeable;
+        }
+        MergeabilityState::Unknown
+    }
+}
+
+/// One host mergeability read bound to the exact revisions it judged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteMergeability {
+    pub change_id: String,
+    pub head_sha: String,
+    /// The target revision the verdict was computed against.
+    pub base_sha: Option<String>,
+    pub target_branch: String,
+    pub state: MergeabilityState,
+    pub conflicting_paths: Vec<String>,
+    /// Why the state is `Unknown`, when the transport knows.
+    pub reason: Option<String>,
 }
 
 /// One check run as GitHub reports it. `head_sha` is the exact
@@ -282,13 +337,84 @@ pub trait GitHubApi {
 
     /// Whether `descendant`'s recorded ancestry contains `ancestor` —
     /// used to classify a push read-back (`Equal`/`Ancestor`/
-    /// `Diverged`).
+    /// `Diverged`). A revision the remote does not know (a produced
+    /// commit not yet pushed) is a definite `false`, never an error —
+    /// the guarded write's lease is what makes the ensuing force
+    /// update safe. `Err` is reserved for the read itself failing.
     fn contains_revision(
         &mut self,
         repository: &RepositoryRef,
         ancestor: &str,
         descendant: &str,
     ) -> Result<bool, ApiError>;
+
+    /// List every open pull request whose base is `target_branch` — the
+    /// sibling scan a recorded merge triggers. The default answers
+    /// unsupported rather than guessing; an adapter that cannot list
+    /// open changes fails the re-check closed.
+    fn list_open_pulls_on_base(
+        &mut self,
+        _repository: &RepositoryRef,
+        _target_branch: &str,
+    ) -> Result<Vec<RemotePull>, ApiError> {
+        Err(ApiError::Refused {
+            reason: "open pull listing is not supported by this transport".into(),
+        })
+    }
+
+    /// Alias used by callers naming the filter rather than the state.
+    fn list_open_pulls(
+        &mut self,
+        repository: &RepositoryRef,
+        target_branch: &str,
+    ) -> Result<Vec<RemotePull>, ApiError> {
+        self.list_open_pulls_on_base(repository, target_branch)
+    }
+
+    /// Alias used by callers naming the pull-request list.
+    fn list_pulls_by_base(
+        &mut self,
+        repository: &RepositoryRef,
+        target_branch: &str,
+    ) -> Result<Vec<RemotePull>, ApiError> {
+        self.list_open_pulls_on_base(repository, target_branch)
+    }
+
+    /// Read one change's mergeability verdict. The default derives it
+    /// from the pull read (whose fields already carry the host's
+    /// tri-state), so a transport that reports mergeability on the PR
+    /// needs no extra call.
+    fn read_mergeability(
+        &mut self,
+        repository: &RepositoryRef,
+        change_id: &ChangeRequestId,
+    ) -> Result<RemoteMergeability, ApiError> {
+        let pull = self.read_pull(repository, change_id)?;
+        let state = pull.mergeability_state();
+        Ok(RemoteMergeability {
+            change_id: change_id.as_str().to_string(),
+            head_sha: pull.head_sha.clone(),
+            base_sha: (!pull.base_sha.is_empty()).then_some(pull.base_sha.clone()),
+            target_branch: pull.target_branch.clone(),
+            state,
+            conflicting_paths: pull.conflicting_paths.clone(),
+            reason: (state == MergeabilityState::Unknown).then(|| {
+                format!(
+                    "host mergeable state {:?} is not a verdict",
+                    pull.mergeable_state
+                )
+            }),
+        })
+    }
+
+    /// Alias used by callers naming the pull-request mergeability read.
+    fn read_pull_mergeability(
+        &mut self,
+        repository: &RepositoryRef,
+        change_id: &ChangeRequestId,
+    ) -> Result<RemoteMergeability, ApiError> {
+        self.read_mergeability(repository, change_id)
+    }
 
     fn read_issue(&mut self, _issue: &IssueRef) -> Result<RemoteIssue, ApiError> {
         Err(ApiError::Refused {
