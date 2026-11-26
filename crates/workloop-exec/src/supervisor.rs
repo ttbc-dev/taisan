@@ -1838,6 +1838,20 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 }
             }
         }
+        // The contained-verification credential mask: a `file:`
+        // credential source stays readable inside the verification
+        // sandbox wherever a covered bind carries it unless the mount
+        // plans shadow it — the same source `contained_exec` masks for
+        // launches. Resolved once per pass (only when a verification
+        // sandbox is configured); a boundary refusal fails the
+        // verification closed — recorded `Inconclusive` — rather than
+        // masking nothing.
+        let credential_source = if layout.verification.is_some() {
+            self.boundary_grant()
+                .map(|grant| grant.and_then(|grant| grant.credential_source))
+        } else {
+            Ok(None)
+        };
         for (artifact_id, seed, bound) in seeds {
             if deadline_reached(clock, deadline) {
                 break;
@@ -1845,7 +1859,15 @@ impl<P: ProcessControlPort> Supervisor<P> {
             // A charged transport retry is not an error to the sweep —
             // but a store or filesystem failure must surface, never be
             // counted as a successful pass.
-            match crate::handoff::drive(store, layout, &artifact_id, &seed, bound, clock) {
+            match crate::handoff::drive(
+                store,
+                layout,
+                &artifact_id,
+                &seed,
+                bound,
+                &credential_source,
+                clock,
+            ) {
                 Ok(handoff_row) => {
                     self.record_claim_check(
                         store,

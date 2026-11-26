@@ -263,16 +263,17 @@ supported independently.
   comment** — recorded 'fixed per §6' there, issues still open
   (release-acceptance §6); 'fixed per §6' is the owner's
   disposition wording for closing the issues, not a code-state
-  claim — all four are confirmed present on the candidate and
-  open with no milestone (#398/#400 also needs-human): #313 (two
-  unrecorded same-signature processes can hold an unidentified
-  launch unresolved — honest-uncertain wedge, not a false
-  absence), #398
-  and #399 (`file:` credential sources can stay readable inside
-  contained verification — same credential-hygiene class #364 gated
-  on), #400 (v2 `report.json` full-body retention dropped by a merge
-  resolution — bounded evidence survives via the CAS prefix, the
-  full report does not).
+  claim. #313 (two unrecorded same-signature processes can hold an
+  unidentified launch unresolved — honest-uncertain wedge, not a
+  false absence) and #400 (v2 `report.json` full-body retention
+  dropped by a merge resolution — bounded evidence survives via
+  the CAS prefix, the full report does not) are confirmed present
+  on the candidate and open with no milestone (#400 also
+  needs-human). #398/#399 (`file:` credential sources readable
+  inside contained verification — same credential-hygiene class
+  #364 gated on) were confirmed present at the §6 re-check and
+  are repaired on the post-pin branch `issue-398-399-fix`,
+  pending merge into the candidate line (#398 also needs-human).
 - **Fixed defects worth noting** — #344 (absence proof), #363
   (spent-deadline ordering), #364 (staged runtime-auth cleanup),
   #447–#450 (refusal budget burn, judged-role resume, runtime
