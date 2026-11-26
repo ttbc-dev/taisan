@@ -163,9 +163,11 @@ integrations.
   outside its scope.
 - `check --probe` has no wired adapter probe backend; the stage fails
   closed `capability.unknown` by design.
-- A real, owner-supplied conforming Worker implementation — the wire
-  and conformance suite exist; the production Worker is not in this
-  repository.
+- A conforming Worker beyond the in-repo reference:
+  `taisan-worker-claude` is the validated conforming Worker (above);
+  the agent runtime it drives and its credential are operator-supplied
+  and not in this repository. Any alternative Worker is owner-supplied
+  behind the same wire and conformance suite.
 - GitHub comment command adapter and Projects projection.
 - CI pipeline (tracked by issue #28) and the end-to-end v0.1 validation
   against a real GitHub repository.

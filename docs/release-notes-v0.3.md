@@ -240,8 +240,8 @@ source-build path above remains supported independently.
     deterministically, so repeated installs against the same
     repository collide with earlier `work/w-N` branches: publish
     refuses `stale_head` (correctly — it never overwrites a foreign
-    head) and the Work needs an operator cancel. 5 of 7 pilot Works
-    hit this.
+    head) and the Work needs an operator cancel. 4 of 7 pilot Works
+    hit this (w-1/w-3/w-4/w-5).
   - **#471** — replayed candidates consume the selector's
     `max_candidates` budget each tick, so a permanently-replayed
     issue can starve new proposals. Workaround used in the pilot:

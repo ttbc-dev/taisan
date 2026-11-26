@@ -165,9 +165,9 @@ pending the §7 decision). Proposed policy:
   not ship.
 - **Evidence-class discipline is preserved**: fixture/contract-tested
   behavior is described as such; only owner-run live evidence
-  authorizes "verified live" wording. Unexercised scope (e.g.
-  scheduled intake, #271) appears under known limitations, never as a
-  capability.
+  authorizes "verified live" wording. Unexercised scope (e.g. remote
+  execution and remote review) appears under known limitations, never
+  as a capability.
 - **Public-artifact rules apply**: English, standalone,
   provider-neutral, no private source names, no personal schedule —
   per the milestone-#8 boundary and `AGENTS.md`.
