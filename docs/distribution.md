@@ -161,11 +161,10 @@ These steps are owner operations, not part of this change:
   write access to the tap (the generated publish job checks out the
   tap with it and commits the formulas as the workflow's configured
   git identity).
-- Cut the first tag only after the #370 candidate/version decision;
-  until then every package version is `0.0.0`, which is why each
-  disted crate carries `dist = true` (cargo reports unversioned
-  crates as `publish = false`, and dist would skip them). The freeze
-  version bump makes artifacts report the real version.
+- Cut the first tag only after the #370 candidate/version decision.
+  Each disted crate carries `dist = true` so cargo-dist builds it as
+  a declared app; since the freeze version bump (workspace
+  `0.3.0`) every package reports the real release version.
 - The `publish-homebrew-formula` job fails a release if the tap repo
   or token is missing; the GitHub Release itself is unaffected.
 

@@ -577,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "taisan-worker-claude"
-version = "0.0.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "serde",
@@ -737,7 +737,7 @@ dependencies = [
 
 [[package]]
 name = "workloop-cli"
-version = "0.0.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "libc",
@@ -756,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "workloop-config"
-version = "0.0.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "serde",
@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "workloop-contract-worker"
-version = "0.0.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "sha2",
@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "workloop-core"
-version = "0.0.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "workloop-evidence-protocol"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "schemars",
  "serde",
@@ -797,7 +797,7 @@ dependencies = [
 
 [[package]]
 name = "workloop-exec"
-version = "0.0.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "serde",
@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "workloop-executor"
-version = "0.0.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "serde",
@@ -823,7 +823,7 @@ dependencies = [
 
 [[package]]
 name = "workloop-fixture-selector"
-version = "0.0.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "workloop-fixture-worker"
-version = "0.0.0"
+version = "0.3.0"
 dependencies = [
  "serde_json",
  "workloop-core",
@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "workloop-github"
-version = "0.0.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "serde",
@@ -852,7 +852,7 @@ dependencies = [
 
 [[package]]
 name = "workloop-intake"
-version = "0.0.0"
+version = "0.3.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -866,7 +866,7 @@ dependencies = [
 
 [[package]]
 name = "workloop-selector"
-version = "0.0.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -876,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "workloop-store"
-version = "0.0.0"
+version = "0.3.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -887,7 +887,7 @@ dependencies = [
 
 [[package]]
 name = "workloop-tui"
-version = "0.0.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "serde_json",

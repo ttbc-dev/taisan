@@ -1,13 +1,14 @@
 [package]
 name = "workloop-fixture-worker"
+version.workspace = true
 edition.workspace = true
 description = "deterministic fixture Worker for taisan contract tests"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
-# Required while workspace crates carry no `version` field (0.0.0 →
-# publish = false, which dist otherwise skips); see workloop-cli.
+# Declares this package a shipped app (cargo-dist builds declared
+# apps only); see workloop-cli.
 [package.metadata.dist]
 dist = true
 

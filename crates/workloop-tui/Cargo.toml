@@ -1,5 +1,6 @@
 [package]
 name = "workloop-tui"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -9,8 +10,8 @@ description = "taisan management console"
 
 # The Homebrew formula is named after the shipped binary.
 [package.metadata.dist]
-# Required while workspace crates carry no `version` field (0.0.0 →
-# publish = false, which dist otherwise skips); see workloop-cli.
+# Declares this package a shipped app (cargo-dist builds declared
+# apps only); see workloop-cli.
 dist = true
 formula = "taisan-tui"
 # This package also builds the legacy-named workloop-tui binary;
