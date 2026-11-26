@@ -145,9 +145,11 @@ git rev-list -n 1 v<version>           # must equal <recorded-sha>
 
 - [x] Re-mark every walkthrough section: "retained — predates
       candidate" where the frozen commit differs from the exercised
-      code — done in the freeze record: the only drift is the
-      version self-report (`0.0.0` → `0.3.0`), labelled in
-      [release-walkthrough-v0.3.md](release-walkthrough-v0.3.md);
+      code — done in the freeze record: the drift is the version
+      self-report (`0.0.0` → `0.3.0`) plus the post-pin behavioral
+      repairs #466/#469/#419/#323, labelled in
+      [release-walkthrough-v0.3.md](release-walkthrough-v0.3.md)
+      (§6 w-2 carries the #469 re-mark inline);
       re-recording a live-demo segment stays an owner decision.
 - [x] Consistency pass: README, notes, walkthrough tell one story;
       no claim exceeds the ledger — verified in the freeze record

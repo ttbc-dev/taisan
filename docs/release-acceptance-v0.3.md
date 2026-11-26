@@ -156,8 +156,9 @@ orphaned `running` invocations were re-minted and scheduled intake
 resumed (`loop-03.log`, `32-work-detail-w5-paused.json` in
 `acceptance-v03-pilot/`). Owner approval of the acceptance record was
 posted per §8 (issue #270 comment `7171973494`). #267 (real-Worker
-stop/restart/recovery integration), which feeds this row, remains open
-and in flight at record time.
+stop/restart/recovery integration), which feeds this row, was open
+and in flight at record time — subsequently implemented by PR #352
+and closed by the owner 2026-11-26 (§8 ledger).
 
 ## 5. Scheduled processing (#271) — exercised on the candidate
 
