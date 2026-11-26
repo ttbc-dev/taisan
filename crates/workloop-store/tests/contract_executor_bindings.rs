@@ -870,7 +870,7 @@ fn a_v13_store_gains_the_executor_tables() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 15, "the upgrade lands on the current format");
+    assert_eq!(version, 16, "the upgrade lands on the current format");
     assert!(
         store
             .transact(|tx| tx.request(&request_id))

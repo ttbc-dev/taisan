@@ -17,6 +17,10 @@ use crate::identity::{
     HostInstanceId, IssueRef, RepositoryRef, RoleBinding, SourceGate, SourceSnapshot,
     canonical_host_instance,
 };
+use crate::mergeability::{
+    ConflictDisposition, ConflictEpisode, ConflictEscalation, ConflictFixRequest,
+    MergeabilityState, bound_conflict_paths, bound_reason_text, conflict_payload, plan_conflict,
+};
 use crate::observation::{
     ArtifactFact, BranchState, CheckConclusion, Completeness, HostActionStatus, IssueState,
     NormalizedEffectFact, Observation, ObservationFact, Outcome, ProcessStateFact, RefRelation,
@@ -25,6 +29,7 @@ use crate::store::{
     Effect, HostAction, HostActionIntent, IntakeSettingsRecord, ReadView, RecoveryIntent,
     RecoveryIntentState, Store, StoreError, TxView,
 };
+use crate::worker_v2::{TaskBody, WorkerRequestV2};
 
 /// The resolved installation binding template: which host installation,
 /// repository, adapter contract, and role actors every accepted Work
@@ -2273,7 +2278,15 @@ pub fn admit_queued_role(
     }
 
     let seq = tx.alloc_seq()?;
-    let mut payload = serde_json::to_value(&execution.input).unwrap_or_default();
+    // A conflict-repair trigger already carries the canonical binding
+    // object; promote it as the request payload so both revisions sit
+    // at the request's top level rather than under the generic
+    // InvocationInput wrapper.
+    let conflict_payload = (role == InvocationRole::Fix)
+        .then(|| execution.input.input.clone())
+        .filter(|v| v.get("kind").and_then(|k| k.as_str()) == Some("conflict_repair"));
+    let mut payload = conflict_payload
+        .unwrap_or_else(|| serde_json::to_value(&execution.input).unwrap_or_default());
     if matches!(
         role,
         InvocationRole::InvariantCheck | InvocationRole::Review
@@ -2590,6 +2603,45 @@ pub fn handle_observation(
             "stage evidence is Core-authored; ingest cannot write pipeline records".into(),
         ));
     }
+    // The merge-check service record is a position, not history: each
+    // service overwrites the pair's durable least-recently-serviced key
+    // on the Work's usage row. Appending one observation per pair per
+    // pass would grow the log without bound — and the per-pass rescans
+    // with it — so the fact never enters the observation log at all.
+    // The update deliberately bypasses the audited effect path too: a
+    // position write per service must not mint an event_log row either.
+    if let ObservationFact::MergeCheck { change, head } = &obs.fact {
+        let Some(work_id) = &obs.subject_work_id else {
+            return Ok(IngestReceipt::Rejected(
+                "merge-check service record carries no work subject".into(),
+            ));
+        };
+        return store.transact(|tx| {
+            if let Some(mut usage) = tx.work_usage(work_id)? {
+                usage.record_merge_check_service(
+                    change,
+                    head,
+                    obs.observed_unix_seconds,
+                    tx.next_counter("merge-check")?,
+                );
+                tx.write_merge_check_services(work_id, &usage.merge_check_services)?;
+            }
+            Ok(IngestReceipt::Recorded)
+        });
+    }
+    // A host-reported mergeability verdict is untrusted input: its path
+    // list and reason text reach durable records and the worker prompt,
+    // so the fact is normalized at the ingest boundary — covering every
+    // producer, not only adapters that bound their own construction.
+    let normalized;
+    let obs = if matches!(obs.fact, ObservationFact::Mergeability { .. }) {
+        let mut fact_obs = obs.clone();
+        normalize_mergeability_fact(&mut fact_obs.fact);
+        normalized = fact_obs;
+        &normalized
+    } else {
+        obs
+    };
     store
         .transact(|tx| {
             tx.apply(&Effect::InsertObservation {
@@ -2716,6 +2768,7 @@ fn assess(
                     | ObservationFact::HostActionResult { .. }
                     | ObservationFact::Issue { .. }
                     | ObservationFact::Assessment { .. }
+                    | ObservationFact::Mergeability { .. }
             ) =>
         {
             crate::projection::current_execution(tx, work_id)?
@@ -3030,6 +3083,9 @@ fn assess(
             Ok(())
         }
         ObservationFact::Check { .. } => assess_check_failure(tx, &execution, now_unix_seconds),
+        ObservationFact::Mergeability { .. } => {
+            assess_mergeability(tx, config, &execution, obs, now_unix_seconds)
+        }
         // The handoff acknowledgement these facts ride on is the
         // moment the produced commit became durable: publication may
         // now name it, so a waiting Execution re-evaluates its stage
@@ -3045,6 +3101,452 @@ fn assess(
         return Ok(());
     };
     assess_completion(tx, &current)
+}
+
+/// Decide one mergeability observation: a required-window conflict mints
+/// exactly one bounded Fix request bound to `(head, base)`, while a
+/// conflict that cannot be bound (or whose Work cannot accept a repair)
+/// escalates to a paused human decision carrying the conflicting paths.
+fn assess_mergeability(
+    tx: &mut dyn TxView,
+    config: &WorkloopConfig,
+    execution: &Execution,
+    obs: &Observation,
+    now_unix_seconds: i64,
+) -> Result<(), StoreError> {
+    let ObservationFact::Mergeability {
+        target,
+        state,
+        conflicting_paths,
+        reason,
+    } = &obs.fact
+    else {
+        return Ok(());
+    };
+    let disposition = plan_conflict(Some(target), *state, conflicting_paths, reason.as_deref());
+    let repair = match disposition {
+        ConflictDisposition::NotConflicting => return Ok(()),
+        ConflictDisposition::Repair(request) => request,
+        ConflictDisposition::Escalate(escalation) => {
+            if conflict_episode_already_recorded(tx, &execution.work_id, None, target)? {
+                return Ok(());
+            }
+            return escalate_conflict(tx, config, &execution.work_id, escalation, now_unix_seconds);
+        }
+    };
+    if conflict_episode_already_recorded(tx, &execution.work_id, Some(&repair), target)? {
+        return Ok(());
+    }
+    trigger_conflict_repair(tx, config, &execution.work_id, repair, now_unix_seconds)
+}
+
+/// Whether this exact conflict episode already produced a trigger. The
+/// observation that is being assessed is already in the transaction, so
+/// the first occurrence sees one matching fact and a repeat scan sees
+/// two. The successor's input payload carries the episode id as a second,
+/// scan-independent marker.
+fn conflict_episode_already_recorded(
+    tx: &mut dyn TxView,
+    work_id: &WorkId,
+    request: Option<&ConflictFixRequest>,
+    target: &DiffTarget,
+) -> Result<bool, StoreError> {
+    let current_episode = ConflictEpisode::from_target(target).ok();
+    let episode_id = request
+        .map(ConflictFixRequest::episode_id)
+        .or_else(|| current_episode.as_ref().map(ConflictEpisode::episode_id));
+    let target_key = mergeability_target_key(target);
+    let mut matching = 0usize;
+    for observation in tx.observations_for_work(work_id)? {
+        if let ObservationFact::Mergeability {
+            target: observed,
+            state,
+            ..
+        } = &observation.fact
+            && *state == MergeabilityState::Conflicting
+        {
+            let candidate = ConflictEpisode::from_target(observed).ok();
+            let same = match (&candidate, &current_episode) {
+                (Some(a), Some(b)) => a == b,
+                // An unbindable target has no episode id; its exact
+                // `(change, head, optional base)` is still a stable
+                // identity for suppressing repeated escalations.
+                (None, None) => mergeability_target_key(observed) == target_key,
+                (Some(a), None) => episode_id.as_ref().is_some_and(|id| a.episode_id() == *id),
+                (None, Some(_)) => false,
+            };
+            if same {
+                matching += 1;
+            }
+        }
+    }
+    if matching > 1 {
+        return Ok(true);
+    }
+    let Some(episode_id) = episode_id else {
+        return Ok(false);
+    };
+    Ok(tx.executions_for_work(work_id)?.iter().any(|execution| {
+        execution
+            .input
+            .input
+            .get("episode_id")
+            .and_then(|v| v.as_str())
+            == Some(episode_id.as_str())
+            && execution.input.input.get("kind").and_then(|v| v.as_str()) == Some("conflict_repair")
+    }))
+}
+
+fn mergeability_target_key(target: &DiffTarget) -> Vec<u8> {
+    canonical_json(&serde_json::json!({
+        "change": {
+            "repository": target.change.repository,
+            "change_request": target.change.change_request,
+        },
+        "head": target.head,
+        "base": target.base,
+        "target_revision": target.target_revision,
+    }))
+}
+
+/// Produce the bounded Fix-class request for a conflict. A terminal Work
+/// gets a successor Execution dedicated to the repair; a queued Work can
+/// re-enter under the Fix role. A Work with a writer already in flight is
+/// never disturbed — its conflict escalates instead.
+fn trigger_conflict_repair(
+    tx: &mut dyn TxView,
+    config: &WorkloopConfig,
+    work_id: &WorkId,
+    request: ConflictFixRequest,
+    now_unix_seconds: i64,
+) -> Result<(), StoreError> {
+    let Some(work) = tx.work(work_id)? else {
+        return escalate_conflict(
+            tx,
+            config,
+            work_id,
+            ConflictEscalation {
+                episode: Some(request.episode.clone()),
+                reason: "conflict belongs to an unknown Work".into(),
+                paths: request.paths.clone(),
+            },
+            now_unix_seconds,
+        );
+    };
+    // A conflict repair is a new automatic attempt charged against the
+    // Work-wide automatic-time budget. When that budget is already
+    // spent, admission would terminally fail the Execution with
+    // `automatic_time_exhausted` instead of dispatching the Fix.
+    // Escalate with the exact conflict paths so a human decides.
+    let usage = tx
+        .work_usage(work_id)?
+        .unwrap_or_else(|| WorkUsage::new(work_id));
+    if automatic_seconds_used(&usage, now_unix_seconds)
+        .is_some_and(|automatic| automatic > work.policy.automatic_time_limit_seconds)
+    {
+        return escalate_conflict(
+            tx,
+            config,
+            work_id,
+            ConflictEscalation {
+                episode: Some(request.episode.clone()),
+                reason: "Work-wide automatic time limit reached; conflict repair requires an operator decision".into(),
+                paths: request.paths.clone(),
+            },
+            now_unix_seconds,
+        );
+    }
+    // The Work-wide Fix bound gates at this seam for the same reason:
+    // admission would hold the Execution with a bare
+    // `fix_budget_exhausted` that drops the conflict reason and paths,
+    // and the recorded episode never re-triggers. Escalate while the
+    // exact paths are still in hand.
+    if usage.fix_invocations_used >= work.policy.max_fix_invocations {
+        return escalate_conflict(
+            tx,
+            config,
+            work_id,
+            ConflictEscalation {
+                episode: Some(request.episode.clone()),
+                reason: "Work-wide fix invocation bound reached; conflict repair requires an operator decision".into(),
+                paths: request.paths.clone(),
+            },
+            now_unix_seconds,
+        );
+    }
+    if let Some(active) = tx.active_execution(work_id)? {
+        return match active.state {
+            ExecutionState::Queued | ExecutionState::Waiting => {
+                let payload = conflict_payload(&request.episode, &request.paths);
+                let seq = tx.alloc_seq()?;
+                let mut next = active.clone();
+                next.state = ExecutionState::Queued;
+                next.enqueued_seq = seq;
+                next.waiting_reason = None;
+                next.next_role = Some(InvocationRole::Fix);
+                next.input.input = payload;
+                tx.apply(&Effect::UpdateExecution {
+                    execution: next,
+                    expected_state: active.state.clone(),
+                })?;
+                // Admission is the single request-creation seam; it also
+                // enforces the Work-wide Fix budget before any emission.
+                admit_queued_role(
+                    tx,
+                    config,
+                    &active.id,
+                    InvocationRole::Fix,
+                    now_unix_seconds,
+                )?;
+                Ok(())
+            }
+            // A writer already in flight (ready/running) or a human-held
+            // pause is never overwritten by an automatic repair. Hold for
+            // human action with the exact pair and paths instead.
+            _ => escalate_conflict(
+                tx,
+                config,
+                work_id,
+                ConflictEscalation {
+                    episode: Some(request.episode.clone()),
+                    reason: format!(
+                        "conflict repair requires a queued or terminal Work; active Execution is {}",
+                        execution_state_name(&active.state)
+                    ),
+                    paths: request.paths.clone(),
+                },
+                now_unix_seconds,
+            ),
+        };
+    }
+    let executions = tx.executions_for_work(work_id)?;
+    let Some(last) = executions.last() else {
+        return escalate_conflict(
+            tx,
+            config,
+            work_id,
+            ConflictEscalation {
+                episode: Some(request.episode.clone()),
+                reason: "conflict repair has no Execution lineage to extend".into(),
+                paths: request.paths.clone(),
+            },
+            now_unix_seconds,
+        );
+    };
+    if last.state != ExecutionState::Succeeded {
+        return escalate_conflict(
+            tx,
+            config,
+            work_id,
+            ConflictEscalation {
+                episode: Some(request.episode.clone()),
+                reason: format!(
+                    "conflict repair requires a completed Work; latest Execution is {}",
+                    execution_state_name(&last.state)
+                ),
+                paths: request.paths.clone(),
+            },
+            now_unix_seconds,
+        );
+    }
+    let issue_refs = tx.issue_refs(work_id)?;
+    for issue in &issue_refs {
+        if let Some(owner) = tx.issue_claim(issue)?
+            && &owner != work_id
+        {
+            return escalate_conflict(
+                tx,
+                config,
+                work_id,
+                ConflictEscalation {
+                    episode: Some(request.episode.clone()),
+                    reason: format!("source {issue} is now owned by {}", owner.0),
+                    paths: request.paths.clone(),
+                },
+                now_unix_seconds,
+            );
+        }
+    }
+    let spec = tx
+        .spec(work_id, Some(work.spec))?
+        .ok_or_else(|| StoreError::Internal {
+            detail: "conflict repair Work has no spec".into(),
+        })?;
+    let seq = tx.alloc_seq()?;
+    let mut input = last.input.clone();
+    input.input = conflict_payload(&request.episode, &request.paths);
+    input.resume = false;
+    input.next_execution_input = last.input.next_execution_input.clone();
+    input.previous_execution_outcome = last.outcome.clone();
+    let mut successor = new_execution(
+        tx,
+        config,
+        &work,
+        &spec.payload,
+        last.ordinal + 1,
+        seq,
+        input,
+    )?;
+    successor.next_role = Some(InvocationRole::Fix);
+    tx.apply(&Effect::InsertExecution {
+        execution: successor.clone(),
+    })?;
+    if !issue_refs.is_empty() {
+        tx.apply(&Effect::InsertIssueClaims {
+            work_id: work_id.clone(),
+            issues: issue_refs,
+        })?;
+    }
+    admit_queued_role(
+        tx,
+        config,
+        &successor.id,
+        InvocationRole::Fix,
+        now_unix_seconds,
+    )?;
+    Ok(())
+}
+
+/// Hold an unbindable/unrepairable conflict for a human with the paths
+/// the host reported. A Work with an active Execution pauses that
+/// Execution; a completed Work gets a paused successor so the Attention
+/// projection names the conflict instead of hiding it.
+fn escalate_conflict(
+    tx: &mut dyn TxView,
+    config: &WorkloopConfig,
+    work_id: &WorkId,
+    escalation: ConflictEscalation,
+    now_unix_seconds: i64,
+) -> Result<(), StoreError> {
+    let reason = conflict_reason(&escalation.reason, &escalation.paths);
+    let Some(work) = tx.work(work_id)? else {
+        return Ok(());
+    };
+    if let Some(active) = tx.active_execution(work_id)? {
+        // A human-held pause is never overwritten by an automatic
+        // repair — but the escalation must still be recorded, or the
+        // new conflict episode drops silently: an identical
+        // re-observation dedupes at ingest, so nothing would ever mint
+        // the hold the contract requires. The decision ledger carries
+        // the same reason and paths the moved-state pause would write.
+        if matches!(
+            active.state,
+            ExecutionState::Paused | ExecutionState::Stopping
+        ) {
+            let usage = tx
+                .work_usage(work_id)?
+                .unwrap_or_else(|| WorkUsage::new(work_id));
+            let seq = tx.alloc_seq()?;
+            tx.apply(&Effect::InsertRecoveryDecision {
+                decision: RecoveryDecision {
+                    id: new_id("rd"),
+                    work_id: work_id.clone(),
+                    execution_id: Some(active.id.clone()),
+                    classification: "conflict_unresolvable".into(),
+                    signature: None,
+                    prerequisites: vec![RepairPrerequisite::OperatorDecision],
+                    detail: reason,
+                    usage_after: serde_json::to_value(&usage).unwrap_or_default(),
+                    seq,
+                },
+            })?;
+            return Ok(());
+        }
+        pause_for_repair(
+            tx,
+            &active,
+            "conflict_unresolvable",
+            &reason,
+            vec![RepairPrerequisite::OperatorDecision],
+            now_unix_seconds,
+        )?;
+        return Ok(());
+    }
+    let executions = tx.executions_for_work(work_id)?;
+    let Some(last) = executions.last() else {
+        return Ok(());
+    };
+    let spec = tx
+        .spec(work_id, Some(work.spec))?
+        .ok_or_else(|| StoreError::Internal {
+            detail: "conflict escalation Work has no spec".into(),
+        })?;
+    let seq = tx.alloc_seq()?;
+    let mut input = last.input.clone();
+    input.previous_execution_outcome = last.outcome.clone();
+    let mut paused = new_execution(
+        tx,
+        config,
+        &work,
+        &spec.payload,
+        last.ordinal + 1,
+        seq,
+        input,
+    )?;
+    paused.state = ExecutionState::Paused;
+    paused.pause_reason = Some(reason);
+    paused.repair_prerequisites = vec![RepairPrerequisite::OperatorDecision];
+    paused.paused_since_unix_seconds = Some(now_unix_seconds);
+    tx.apply(&Effect::InsertExecution { execution: paused })?;
+    // A paused successor holds no issue claims — only an active
+    // Execution does. Re-acquiring them here would both contradict
+    // that rule and collide with a newer Work already owning a
+    // source (the very case this escalation records), rolling back
+    // the observation instead of recording the hold.
+    Ok(())
+}
+
+/// Bound a mergeability fact's host-controlled free text at the ingest
+/// boundary: the stored row, the repair request payload, and the worker
+/// prompt all read only the bounded form.
+fn normalize_mergeability_fact(fact: &mut ObservationFact) {
+    if let ObservationFact::Mergeability {
+        conflicting_paths,
+        reason,
+        ..
+    } = fact
+    {
+        *conflicting_paths = bound_conflict_paths(conflicting_paths);
+        if let Some(reason) = reason {
+            *reason = bound_reason_text(reason);
+        }
+    }
+}
+
+/// A bounded human-facing diagnostic: the reason plus the reported
+/// conflicting paths, capped so an attacker-controlled path list cannot
+/// grow the pause record without bound.
+fn conflict_reason(reason: &str, paths: &[String]) -> String {
+    const MAX_PATHS: usize = 20;
+    const MAX_CHARS: usize = 1024;
+    let rendered = paths.iter().take(MAX_PATHS).cloned().collect::<Vec<_>>();
+    let mut out = if rendered.is_empty() {
+        reason.to_string()
+    } else {
+        format!("{reason}; conflicting paths: {}", rendered.join(", "))
+    };
+    if paths.len() > MAX_PATHS {
+        out.push_str(&format!(" (+{} more)", paths.len() - MAX_PATHS));
+    }
+    if out.chars().count() > MAX_CHARS {
+        out = out.chars().take(MAX_CHARS).collect();
+    }
+    out
+}
+
+fn execution_state_name(state: &ExecutionState) -> &'static str {
+    match state {
+        ExecutionState::Queued => "queued",
+        ExecutionState::Ready => "ready",
+        ExecutionState::Running => "running",
+        ExecutionState::Waiting => "waiting",
+        ExecutionState::Stopping => "stopping",
+        ExecutionState::Paused => "paused",
+        ExecutionState::Uncertain => "uncertain",
+        ExecutionState::Succeeded => "succeeded",
+        ExecutionState::Failed => "failed",
+        ExecutionState::Cancelled => "cancelled",
+    }
 }
 
 /// Record the reconciled intent status. `applied` requires a normalized
@@ -4099,7 +4601,15 @@ fn maybe_publish(
     // other Invocation.
     if spec.payload.lanes.invariant_check {
         let checked = satisfied_invariant_check(tx, &execution.id, &invocations[producing + 1..])?;
-        if !checked {
+        // A satisfied-but-inconclusive check is not terminal evidence
+        // either: when a conclusive verification result exists that
+        // the newest check's request never bound, the lane owes that
+        // evidence a re-judged assessment — re-mint the check rather
+        // than park the lane on the stale verdict (#469). The mint is
+        // the same `waiting → ready` re-request `!checked` already
+        // uses, budget-bounded through `accepts_invocation` like every
+        // other Invocation.
+        if !checked || unjudged_conclusive_evidence(tx, &work.id, &invocations[producing + 1..])? {
             admit_queued_role(
                 tx,
                 config,
@@ -4468,6 +4978,98 @@ fn satisfied_invariant_check(
         return Ok(false);
     };
     Ok(latest.state == InvocationState::Done && check_exited_zero(tx, execution_id, latest)?)
+}
+
+/// New conclusive evidence the lane's satisfied check never judged
+/// (#469): the lane's latest `Assessment` on the current target is not
+/// all-positive AND a conclusive `VerificationResult` (`Pass`|`Fail`)
+/// exists on the assessed artifact that the newest check's bound
+/// request did not carry — recorded after every result that request
+/// did bind, so it is genuinely newer evidence and never an older run
+/// the request's evidence bound skipped.
+///
+/// The ordering anchor is `recorded_seq` on the verification-results
+/// table itself — the same domain on both sides — because observation
+/// rows carry no recorded sequence to compare against: the check's
+/// bound evidence set is the authoritative account of what it judged.
+/// A satisfied check with no bound body row (a legacy v1 dispatch) or
+/// an unparseable one cannot prove evidence is unjudged and never
+/// re-mints here.
+fn unjudged_conclusive_evidence(
+    tx: &dyn ReadView,
+    work_id: &WorkId,
+    trailing: &[Invocation],
+) -> Result<bool, StoreError> {
+    let Some(target) = current_target(tx, work_id)? else {
+        return Ok(false);
+    };
+    let lane_all_positive = tx
+        .observations_for_work(work_id)?
+        .iter()
+        .rev()
+        .find_map(|o| match &o.fact {
+            ObservationFact::Assessment {
+                target: t,
+                complete,
+                items,
+                ..
+            } if t == &target => Some(
+                *complete
+                    && !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|i| i.verdict == crate::observation::AssessmentVerdict::Positive),
+            ),
+            _ => None,
+        })
+        .unwrap_or(false);
+    if lane_all_positive {
+        return Ok(false);
+    }
+    // The newest check — the one the gate just proved — is the request
+    // whose bound evidence set is "what the lane last judged".
+    let Some(check) = trailing
+        .iter()
+        .rev()
+        .find(|i| i.role == InvocationRole::InvariantCheck)
+    else {
+        return Ok(false);
+    };
+    let Some(body) = tx.worker_request_body(&check.request_id)? else {
+        return Ok(false);
+    };
+    if !body.verifies() {
+        return Ok(false);
+    }
+    let Ok(request) = WorkerRequestV2::parse(&body.canonical_body) else {
+        return Ok(false);
+    };
+    let TaskBody::InvariantCheck {
+        artifact,
+        verification_evidence,
+        ..
+    } = &request.task
+    else {
+        return Ok(false);
+    };
+    let bound: BTreeSet<&str> = verification_evidence
+        .iter()
+        .map(|e| e.evidence_id.as_str())
+        .collect();
+    let results = tx.verification_results(&artifact.artifact_id)?;
+    let bound_newest = results
+        .iter()
+        .filter(|r| bound.contains(r.id.as_str()))
+        .map(|r| r.recorded_seq)
+        .max()
+        .unwrap_or(0);
+    Ok(results.iter().any(|r| {
+        matches!(
+            r.result,
+            VerificationOutcome::Pass | VerificationOutcome::Fail
+        ) && !bound.contains(r.id.as_str())
+            && r.recorded_seq > bound_newest
+    }))
 }
 
 /// `succeeded` requires the required stage effects applied, the declared
@@ -4892,7 +5494,7 @@ pub fn sweep_scoped(
         }
         report.examined += 1;
         let execution_id = listed.id.clone();
-        match store.transact(|tx| sweep_one(tx, &execution_id, now_unix_seconds)) {
+        match store.transact(|tx| sweep_one(tx, config, &execution_id, now_unix_seconds)) {
             Ok(SweepOutcome::Absent | SweepOutcome::Unchanged) => {}
             Ok(SweepOutcome::StopRecorded) => report.stops_recorded += 1,
             Ok(SweepOutcome::TerminalFailure) => report.terminal_failures += 1,
@@ -4910,7 +5512,6 @@ pub fn sweep_scoped(
             Err(e) => return Err(e),
         }
     }
-    let _ = config;
     Ok(report)
 }
 
@@ -4978,6 +5579,7 @@ fn defer_terminal_while_outstanding(
 /// taken is observed fresh, never acted on from a stale snapshot.
 fn sweep_one(
     tx: &mut dyn TxView,
+    config: &WorkloopConfig,
     execution_id: &ExecutionId,
     now_unix_seconds: i64,
 ) -> Result<SweepOutcome, StoreError> {
@@ -5092,12 +5694,30 @@ fn sweep_one(
     // precedence: an Execution this sweep stops or fails never
     // reaches re-assessment in the same pass.
     if execution.state == ExecutionState::Waiting {
-        assess_completion(tx, &execution)?;
-        if tx
-            .execution(&execution.id)?
-            .is_some_and(|e| e.state == ExecutionState::Succeeded)
-        {
-            return Ok(SweepOutcome::Completed);
+        // The publish seam is level-triggered for the same reason:
+        // handoff verification records its result rows directly, so a
+        // conclusive rerun lands with no observation and nothing
+        // re-drives the invariant lane — the re-mint for evidence the
+        // satisfied check never judged (#469) — unless the sweep runs
+        // the same `maybe_publish` pass the observation paths do.
+        maybe_publish(tx, config, &execution, now_unix_seconds)?;
+        let Some(execution) = tx.execution(&execution.id)? else {
+            return Ok(SweepOutcome::Absent);
+        };
+        if execution.state == ExecutionState::Failed {
+            return Ok(SweepOutcome::TerminalFailure);
+        }
+        // A re-minted check moved the Execution back to `ready` — its
+        // lane now belongs to the new check's evidence, not to this
+        // pass's re-assessment.
+        if execution.state == ExecutionState::Waiting {
+            assess_completion(tx, &execution)?;
+            if tx
+                .execution(&execution.id)?
+                .is_some_and(|e| e.state == ExecutionState::Succeeded)
+            {
+                return Ok(SweepOutcome::Completed);
+            }
         }
     }
     clear_sweep_conflict(tx, execution_id)?;

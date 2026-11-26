@@ -154,8 +154,10 @@ declared `--runtime-arg --verbose` knob for stream-json mode
 - **Rust toolchain** supporting edition 2024 for source builds
   (`cargo build --workspace`; `cargo install --path
   crates/workloop-cli --bin taisan`). The packaged binaries are
-  `taisan`, `taisan-tui`, `public-issue-selector`, and
-  `taisan-worker-claude` ([licensing inventory](licensing-prep.md) §2).
+  `taisan`, `taisan-tui`, `public-issue-selector`,
+  `taisan-worker-claude`, and the fixture Worker
+  `workloop-fixture-worker` ([licensing inventory](licensing-prep.md)
+  §2, [distribution](distribution.md)).
 - **`gh` CLI** for the GitHub host driver and the Selector's live
   source reads — a current release is required: a distribution-default
   `gh` 2.45.0 lacked `gh api --slurp` and broke adapter list calls;
@@ -204,9 +206,10 @@ generated release notes — with the same cargo-dist setup feeding a
 homebrew-core deferred until notability) and **cargo-binstall**
 metadata (`cargo binstall` fetches the prebuilt binary). crates.io is
 not a channel: taisan is a CLI tool, not a library. The dist
-workflow itself is #441's lane. **TODO at release:** record the
-packaged-artifact checksums cargo-dist produces here; the
-source-build path above remains supported independently.
+workflow itself is #441's lane ([distribution](distribution.md)).
+**TODO at release:** record the packaged-artifact checksums
+cargo-dist produces here; the source-build path above remains
+supported independently.
 
 ## Known limitations
 

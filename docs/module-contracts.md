@@ -263,6 +263,13 @@ type HostFact =
 	| { kind: "branch"; repository: RepositoryRef; branch: string;
 	    state: { kind: "absent" } | { kind: "at"; revision: CommitRevision } }
 	| { kind: "change_head"; change_request: ChangeRequestRef; head: CommitRevision }
+	| { kind: "change_merged"; change_request: ChangeRequestRef; head: CommitRevision;
+	    base: CommitRevision; target_branch: string }
+	| { kind: "merge_check"; change_request: ChangeRequestRef; head: CommitRevision }
+	| { kind: "mergeability"; change_request: ChangeRequestRef; head: CommitRevision;
+	    base?: CommitRevision; target_revision?: CommitRevision;
+	    state: "mergeable" | "conflicting" | "unknown";
+	    conflicting_paths?: string[]; reason?: string }
 	| { kind: "check"; change_request: ChangeRequestRef; head: CommitRevision;
 	    check_id: string; producer: HostActorRef; conclusion: CheckResult }
 	| { kind: "review"; change_request: ChangeRequestRef; head: CommitRevision;
@@ -303,7 +310,9 @@ type CodingTask = TaskBase & { kind: "coding"; issue_refs: IssueRef[] };
 type FixTask = TaskBase & { kind: "fix"; predecessor: EvidenceRef;
 	origin: { kind: "prepublication"; failed_evidence: EvidenceRef[] }
 	    | { kind: "review"; target: EvidenceRef; round: EvidenceRef;
-	        judgment: EvidenceRef; findings: FindingRef[] } };
+	        judgment: EvidenceRef; findings: FindingRef[] }
+	    | { kind: "conflict"; change: ChangeRequestId; source_revision: CommitRevision;
+	        target_revision: CommitRevision; paths: string[] } };
 type ReviewTask = TaskBase & { kind: "review"; reviewed_revision: CommitRevision };
 type InvariantCheckTask = TaskBase & { kind: "invariant_check";
 	artifact: EvidenceRef; invariant_set: EvidenceRef;

@@ -2565,6 +2565,10 @@ mod tests {
                 title: "t".into(),
                 body: String::new(),
                 merged: false,
+                mergeable: None,
+                mergeable_state: String::new(),
+                base_sha: String::new(),
+                conflicting_paths: vec![],
             }
         }
 
@@ -2722,6 +2726,10 @@ mod tests {
                 title: title.to_string(),
                 body: body.to_string(),
                 merged: false,
+                mergeable: None,
+                mergeable_state: String::new(),
+                base_sha: String::new(),
+                conflicting_paths: vec![],
             };
             self.pulls
                 .insert(format!("{repository}:{}", pull.id), Ok(pull.clone()));
@@ -4277,19 +4285,34 @@ mod tests {
         let mut adapter = production_adapter(fake);
         let settings = settings();
         run_production(&store, &settings, &mut adapter, &mut || NOW);
+        // A merge-detection check is service bookkeeping, not evidence:
+        // its durable record is the pair's service cursor on the usage
+        // row, overwritten in place — never an observation per pass.
         let count = |store: &SqliteStore| {
             store
                 .transact(|tx| tx.observations_for_work(&w))
                 .unwrap()
                 .len()
         };
+        let service_position = |store: &SqliteStore| {
+            store
+                .transact(|tx| tx.work_usage(&w))
+                .unwrap()
+                .and_then(|usage| usage.merge_check_position(&change))
+        };
         let first = count(&store);
+        let first_service = service_position(&store);
         run_production(&store, &settings, &mut adapter, &mut || NOW);
         run_production(&store, &settings, &mut adapter, &mut || NOW);
         assert_eq!(
             count(&store),
             first,
             "identical polls record no duplicate facts"
+        );
+        let service = service_position(&store);
+        assert!(
+            service.is_some() && service > first_service,
+            "each pass advances the pair's service cursor"
         );
         let rounds = store.transact(|tx| tx.rounds_for_work(&w)).unwrap().len();
         assert_eq!(rounds, 1, "identical polls seal no extra round");

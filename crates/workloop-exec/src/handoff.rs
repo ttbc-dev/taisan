@@ -1003,9 +1003,25 @@ fn prepare_enforcement(
             toolchain.display()
         ));
     }
+    // A declared boundary path that is a symlink resolves on the host
+    // — `exists()` follows it — but the sandbox bind mounts the
+    // declared path, never the link target, so the path dangles
+    // inside. Name the shape explicitly rather than reporting the
+    // unreadable-path refusal the boundary digest would emit.
+    if let Some(toolchain) = &sandbox.toolchain
+        && toolchain.is_symlink()
+    {
+        return Err(format!(
+            "verification.toolchain_symlink: {}",
+            toolchain.display()
+        ));
+    }
     for cache in &sandbox.caches {
         if !cache.exists() {
             return Err(format!("verification.cache_missing: {}", cache.display()));
+        }
+        if cache.is_symlink() {
+            return Err(format!("verification.cache_symlink: {}", cache.display()));
         }
     }
     let mut hosts = sandbox.egress_allowlist.clone();
