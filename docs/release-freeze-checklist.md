@@ -1,10 +1,14 @@
 # Release freeze checklist — mechanical steps
 
-Status: **executed through §4** (issue #370). The owner signed off
+Status: **executed through §4 — candidate re-pinned** (issue #370).
+The owner signed off
 2026-11-26 (version `0.3.0`; defect issues closed; #437 deferred to
-v0.6); the candidate is pinned at
-`00fed690cf2993e220116901f1c2d14584305e18` and the §4 gates re-ran on
-it — the record lives in
+v0.6); the candidate was first pinned at
+`00fed690cf2993e220116901f1c2d14584305e18`, then re-pinned the same
+day to `5f134b964aca05637d4fa1fc8198779dd408913f` when the
+owner-directed pre-publication repair for #398/#399 merged as PR
+#479 — §3's "a merge never silently extends the candidate" rule
+applied, and the §4 gates re-ran on the new SHA. The record lives in
 [release-notes-v0.3.md](release-notes-v0.3.md)'s Verification
 record. **No tag exists and no release is published** — §5.2/§5.3 and
 the owner acts (live-demo segment, visibility flip) remain.
@@ -153,7 +157,7 @@ git rev-list -n 1 v<version>           # must equal <recorded-sha>
       candidate" where the frozen commit differs from the exercised
       code — done in the freeze record: the drift is the version
       self-report (`0.0.0` → `0.3.0`) plus the post-pin behavioral
-      repairs #466/#469/#419/#323, labelled in
+      repairs #466/#469/#419/#323/#398/#399, labelled in
       [release-walkthrough-v0.3.md](release-walkthrough-v0.3.md)
       (§6 w-2 carries the #469 re-mark inline);
       re-recording a live-demo segment stays an owner decision.

@@ -4,11 +4,15 @@ Status: **decided — version `0.3.0`, candidate frozen** (issue #370).
 This document proposed the version/tag policy and the procedures the
 release freeze follows; the owner signed off 2026-11-26 — the release
 version is `0.3.0`, the candidate is pinned at
-`00fed690cf2993e220116901f1c2d14584305e18`, and the defect
+`5f134b964aca05637d4fa1fc8198779dd408913f` (re-pinned 2026-11-26
+from `00fed690cf2993e220116901f1c2d14584305e18` after the #398/#399
+repair merged as PR #479), and the defect
 dispositions are all recorded: the dispositioned defect issues were
 closed under the owner's 'Fixed on the release candidate' wording
-(#313/#358/#359/#361/#398/#399/#400; #398/#399/#400 plus #313 remain
-confirmed present — closure was a disposition act) and #437 was
+(#313/#358/#359/#361/#398/#399/#400; #313 and #400 remain
+confirmed present — closure was a disposition act — while
+#398/#399 were reopened as pre-publication fix targets, repaired
+under #479, and re-closed on merge) and #437 was
 deferred to v0.6 (milestone 11). The evidence issues behind the
 acceptance record are complete (#270 manual acceptance
 owner-approved, #271 pilot and #367 clean install closed, #368
@@ -220,8 +224,8 @@ binaries**, not as a registry package.
 
 | Decision | Options | This draft |
 | --- | --- | --- |
-| Release version | `0.3.0` (proposed) / `1.0.0` | **decided: `0.3.0`** — owner decision, 2026-11-26; accompanying owner acts also exercised (candidate sign-off → `00fed69`, #437 disposition recorded on the issue) — status paragraph, freeze checklist |
-| Candidate commit | recorded `origin/main` SHA at sign-off (§3) | **named** — `00fed690cf2993e220116901f1c2d14584305e18`, recorded 2026-11-26 |
+| Release version | `0.3.0` (proposed) / `1.0.0` | **decided: `0.3.0`** — owner decision, 2026-11-26; accompanying owner acts also exercised (candidate sign-off → `00fed69`, re-pinned `5f134b96` on merge of the #398/#399 repair; #437 disposition recorded on the issue) — status paragraph, freeze checklist |
+| Candidate commit | recorded `origin/main` SHA at sign-off (§3) | **named** — `5f134b964aca05637d4fa1fc8198779dd408913f`, re-pinned 2026-11-26 (original pin `00fed690cf2993e220116901f1c2d14584305e18` recorded earlier the same day, superseded when PR #479 merged) |
 | Publication route | in-place, history kept | **decided** — #438 ruling ([release audit](release-audit.md) §7) |
 | Distribution route | cargo-dist → GitHub Releases + Homebrew tap + cargo-binstall; no crates.io | **decided** — #370 comment, 2026-11-25 (§6); workflow is #441's lane |
 | Crate version alignment | workspace `0.3.0` inheritance (proposed) / leave `0.0.0` | **applied** — PR #477 applies the workspace `0.3.0` inheritance, following the owner's version choice |

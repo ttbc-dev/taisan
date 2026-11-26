@@ -4,14 +4,20 @@ Status: **release materials on the frozen candidate**
 (issue #370). The owner decided `0.3.0` on 2026-11-26
 ([release-versioning.md](release-versioning.md) §7) and the
 candidate is frozen at
-`00fed690cf2993e220116901f1c2d14584305e18` — the workspace `0.3.0`
-version-metadata alignment (PR #477) is the last change inside it.
+`5f134b964aca05637d4fa1fc8198779dd408913f` — the #398/#399
+credential-mask fix (PR #479) is the last change inside it. The
+candidate was first pinned at
+`00fed690cf2993e220116901f1c2d14584305e18` on 2026-11-26 and
+re-pinned the same day when the owner-directed pre-publication
+repair for #398/#399 merged — per the freeze checklist, a merge
+never silently extends the candidate, so the record and the §4
+gates were re-established on the new SHA.
 No tag exists yet — the tag, the cargo-dist artifacts, and the
 repository visibility flip are the remaining release acts (freeze
 checklist §5–§6). One structural note on reading the tag: the
 pinned tree necessarily carries this file's *pre-freeze draft*
 (a commit cannot contain the record of its own pin), so tagging
-`00fed69` ships the draft copy — this finalized text lives on
+`5f134b96` ships the draft copy — this finalized text lives on
 `main` after the freeze-record merge and is the version of record.
 The upstream evidence these notes
 depended on is now in hand: the #270 manual real-Worker acceptance
@@ -143,7 +149,7 @@ values in the pilot install): `adapter: "taisan-worker-claude"`,
 `adapter_version: "0.0.0"` (pre-version-bump retained value — the §4 metadata
 alignment in
 [release-versioning.md](release-versioning.md) was applied at
-freeze, so the released binaries on the `00fed69` candidate
+freeze, so the released binaries on the `5f134b96` candidate
 self-report `0.3.0`), `runtime.product:
 "claude-code"`, `runtime.version: "2.1.331 (Claude Code)"`,
 `protocol_versions: ["taisan.worker.request/2",
@@ -186,24 +192,30 @@ declared `--runtime-arg --verbose` knob for stream-json mode
 ## Verification record
 
 Gates re-run on the **frozen candidate** — `origin/main` HEAD at
-freeze (2026-11-26, retrieval `date -u`): the workspace `0.3.0`
-version-metadata alignment (PR #477) is the last change inside the
-candidate.
+the 2026-11-26 re-pin (retrieval `date -u` 2026-11-26T18:46:55Z):
+the #398/#399 credential-mask fix (PR #479) is the last change
+inside the candidate. The first pin
+`00fed690cf2993e220116901f1c2d14584305e18` (merge of PR #477, the
+workspace `0.3.0` version-metadata alignment) passed the same four
+gates earlier the same day — 1866 tests, 0 failures, 6 ignored —
+and was superseded when the pre-publication repair merged; per the
+freeze checklist the record was re-established on the new SHA, not
+inherited.
 
 ```text
 git rev-parse origin/main
-00fed690cf2993e220116901f1c2d14584305e18
+5f134b964aca05637d4fa1fc8198779dd408913f
 git log -1 --format='%H%n%ad%n%s' --date=iso-strict origin/main
-00fed690cf2993e220116901f1c2d14584305e18
-2026-11-26T07:15:28+09:00
-Merge pull request #477 from ttbc-dev/issue-370-freeze
+5f134b964aca05637d4fa1fc8198779dd408913f
+2026-11-26T22:16:25+09:00
+Merge pull request #479 from ttbc-dev/issue-398-399-fix
 ```
 
 | Gate | Result |
 | --- | --- |
 | `cargo fmt --check` | Passed |
 | `cargo build --workspace` | Passed |
-| `cargo test --workspace` | Passed — 1866 tests, 0 failures, 6 ignored (the `u36e_live` cases requiring `TAISAN_U36E_*` credentials and owner authorization; fixture-selector/fixture-worker contract tests ran against `target/debug/` binaries produced by the build gate) |
+| `cargo test --workspace` | Passed — 1871 tests, 0 failures, 6 ignored (the `u36e_live` cases requiring `TAISAN_U36E_*` credentials and owner authorization; fixture-selector/fixture-worker contract tests ran against `target/debug/` binaries produced by the build gate). One pre-existing timing flake — `exchange_deadline_terminates_the_process_group` (`bounded_exchange.rs`, a fixture pgid-write racing the 1200 ms exchange deadline under parallel load, unrelated to the #479 diff) — failed once and passed on rerun; the recorded count is from the clean full-workspace pass. |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
 
 Build precedes test because contract tests spawn
@@ -287,8 +299,10 @@ supported independently.
   (spent-deadline ordering), #364 (staged runtime-auth cleanup),
   #447–#450 (refusal budget burn, judged-role resume, runtime
   residue, divergent-head republish), #466 (fast-exiting output
-  flood misclassified `success` — fixed by PR #467), and #419
-  (`artifact.json` collision — fixed by PR #431) are repaired on
+  flood misclassified `success` — fixed by PR #467), #419
+  (`artifact.json` collision — fixed by PR #431), and #398/#399
+  (`file:` credential-source masking inside contained
+  verification — fixed by PR #479) are repaired on
   the candidate line.
 - **Open operator-facing defects** — recorded in release-acceptance
   §7 and unfixed; the earlier deferred set stays deferred to v0.6

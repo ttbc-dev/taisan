@@ -9,7 +9,7 @@ re-executing it requires the owner-authorized environment described
 below. The evidence predates the release freeze: the retained drivers
 span `28afb72`/`179f6fe`/`c445feee` (runs 4–6), earlier heads (runs
 1–3), and `81c62cf` (the pilot install); none is the frozen candidate
-`00fed69` —
+`5f134b96` —
 every section is
 labelled "retained" and was re-marked at freeze (see the closing
 checklist). The candidate differs from the retained drivers in two
@@ -40,7 +40,7 @@ Three owner-side record sets supply every quoted fact:
   `[intake] enabled`, real reference Worker `taisan-worker-claude`
   `0.0.0` driving `claude-code` `2.1.331 (Claude Code)`, in-process
   `github` host driver, capacity 1 — the `0.0.0` self-report predates
-  the freeze: on the frozen candidate `00fed69` every crate reports
+  the freeze: on the frozen candidate `5f134b96` every crate reports
   `0.3.0` (`version.workspace = true`, PR #477).
 - **Manual runs (#270)** — `acceptance-v03-run5/` and
   `acceptance-v03-run6/` under the same owner-side root, with the
@@ -205,7 +205,7 @@ would overstate the release:
   Work was cancelled after the symlink was replaced with a real
   directory (`22-cache-fix.txt`, `23-resume-w2.json`,
   `24-work-detail-w2-pre-cancel.json`) — filed as #469.
-  *Retained — predates candidate:* on `00fed69` this path resolves
+  *Retained — predates candidate:* on `5f134b96` this path resolves
   differently — the symlinked verification-boundary path is refused
   up front, and the invariant check re-drives an unjudged conclusive
   item instead of leaving a sticky `inconclusive` (#474).
@@ -244,14 +244,15 @@ cited to the release notes' known-limitations section
 
 ## Remaining steps before this walkthrough ships
 
-- [x] Frozen candidate commit exists — `00fed69`
-      (`00fed690cf2993e220116901f1c2d14584305e18`, pinned 2026-11-26;
-      see
+- [x] Frozen candidate commit exists — `5f134b96`
+      (`5f134b964aca05637d4fa1fc8198779dd408913f`, re-pinned
+      2026-11-26 after the first pin `00fed69` was superseded by
+      the #398/#399 repair merge, PR #479; see
       [release-freeze-checklist.md](release-freeze-checklist.md)).
 - [x] Each retained section re-marked: the drift between the
-      retained drivers and `00fed69` — version self-reports
+      retained drivers and `5f134b96` — version self-reports
       (`0.0.0` → `0.3.0`) and the post-pin repairs #466/#469/
-      #419/#323 — is labelled where it surfaces (§6 w-2 carries the
+      #419/#323/#398/#399 — is labelled where it surfaces (§6 w-2 carries the
       #469 re-mark inline).
 - [ ] Owner decision: whether to add a fresh live-demonstration
       segment on the frozen commit (re-authorization required).
