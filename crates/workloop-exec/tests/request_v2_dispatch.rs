@@ -4958,6 +4958,7 @@ fn v2_verification_runs_on_the_produced_commit_with_bounded_output() {
         Duration::from_millis(300),
         64 * 1024,
         &[],
+        &Ok(None),
     )
     .unwrap();
     assert_eq!(timed_out.result, VerificationOutcome::Inconclusive);

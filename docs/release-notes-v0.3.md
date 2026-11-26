@@ -272,17 +272,17 @@ supported independently.
   comment** — recorded 'fixed per §6' there and closed
   2026-11-26 under that owner disposition (release-acceptance §6);
   'fixed per §6' was the owner's disposition wording for closing
-  the issues, not a code-state claim — all four remain confirmed
-  present on the candidate (release notes carry them as
-  limitations): #313 (two
+  the issues, not a code-state claim. #313 (two
   unrecorded same-signature processes can hold an unidentified
   launch unresolved — honest-uncertain wedge, not a false
-  absence), #398
-  and #399 (`file:` credential sources can stay readable inside
-  contained verification — same credential-hygiene class #364 gated
-  on), #400 (v2 `report.json` full-body retention dropped by a merge
-  resolution — bounded evidence survives via the CAS prefix, the
-  full report does not).
+  absence) and #400 (v2 `report.json` full-body retention dropped
+  by a merge resolution — bounded evidence survives via the CAS
+  prefix, the full report does not) remain confirmed present on
+  the candidate. #398/#399 (`file:` credential sources readable
+  inside contained verification — same credential-hygiene class
+  #364 gated on) were confirmed present at the §6 re-check,
+  reopened as v0.3 pre-publication fix targets, and are repaired
+  on the candidate — PR #479 merged `5f134b96` 2026-11-26.
 - **Fixed defects worth noting** — #344 (absence proof), #363
   (spent-deadline ordering), #364 (staged runtime-auth cleanup),
   #447–#450 (refusal budget burn, judged-role resume, runtime

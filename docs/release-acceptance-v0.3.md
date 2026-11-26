@@ -253,11 +253,14 @@ wording** — the instruction under which the owner closes the
 dispositioned issues — not a code-state claim. The Disposition and
 Reason columns state the verified code state: where they say
 confirmed present, the defect is present in the candidate's code.
-#313/#398/#399/#400 are confirmed present; their issue records were
-closed 2026-11-26 under the owner's disposition wording (no fix
-release is scheduled — the confirmed-present code state stands and
-is carried in the release notes' known limitations) — unlike the
-pilot set deferred to v0.6.
+#313/#400 are confirmed present and their issue records
+are open with no milestone (no fix release is scheduled; #400
+also carries a `needs-human` spec quarantine) — unlike the pilot set
+deferred to v0.6. #398/#399 were confirmed present at this
+re-check and are repaired on the candidate: they were reopened as
+v0.3 pre-publication fix targets, and PR #479 merged `5f134b96`
+2026-11-26 — the re-pinned candidate carries the fix (see their
+rows; both issues are closed).
 
 | Issue | Disposition | Reason (verified on `119dcb7`) |
 | --- | --- | --- |
@@ -278,8 +281,8 @@ names):
 | Issue | Disposition | Reason (verified on `119dcb7` unless the row says otherwise) |
 | --- | --- | --- |
 | #313 — unidentified launch cannot converge with ≥2 unrecorded same-signature processes | **Confirmed present — open defect; the code re-check on the right still shows the behavior** (owner disposition wording, quoted verbatim from #365's final comment 2026-11-25 — a closing-disposition label, not a code-state claim: 'fixed per §6', grouped under 'Fixed on the release candidate'; issue closed 2026-11-26 under that disposition) | Confirmed present and adjacent to the fixed #344 class: an ambiguous match restarts the unprovable streak and reports `Unknown` (`supervisor.rs:4220-4232`) — correct never-guess behavior, but the convergence gap persists: two same-signature lost-identity launches can hold capacity indefinitely. Honest-uncertain wedge, not a false-absence or duplicate-writer violation. |
-| #398 — contained verification leaves `masked_files` empty | **Confirmed present — open defect; the code re-check on the right still shows the behavior** (owner disposition wording, quoted verbatim from #365's final comment 2026-11-25 — a closing-disposition label, not a code-state claim: 'fixed per §6', grouped under 'Fixed on the release candidate'; issue closed 2026-11-26 under that disposition) | Confirmed present: the contained-verification `MountPlan`s carry `masked_files: vec![]` (`handoff.rs:1119`, `handoff.rs:1277`) while `contained_exec` pushes `grant.credential_source` into the mask (`supervisor.rs:1474-1475`); a `file:` credential source under a system-bind prefix stays readable inside contained verification. Same credential-hygiene class for which #364 was release-blocking before #425. |
-| #399 — credential mask only under system-bind prefixes | **Confirmed present — open defect; the code re-check on the right still shows the behavior** (owner disposition wording, quoted verbatim from #365's final comment 2026-11-25 — a closing-disposition label, not a code-state claim: 'fixed per §6', grouped under 'Fixed on the release candidate'; issue closed 2026-11-26 under that disposition) | Confirmed present: the `/dev/null` shadow renders only when `system_bind_covers(file)` (`containment.rs:562-567`); a credential source outside `/usr`/`/bin`/`/sbin`/`/lib`/`/lib64` (e.g. `/etc`, `/run`) gets no mask and can still be bound read-only by the argv-derived own-path `extra_binds`. |
+| #398 — contained verification leaves `masked_files` empty | **Fixed on the candidate — PR #479 merged `5f134b96` 2026-11-26 post-pin; the issue was reopened as a v0.3 pre-publication fix target after the confirmed-present re-check and re-closed on merge** | Repaired: both contained-verification `MountPlan`s populate `masked_files` from the resolved boundary credential source — the toolchain-preflight plan (`handoff.rs:1165`) and the run plan (`handoff.rs:1323`). The source is plumbed `drive` → `run_verifications` → `verify` → `verify_with_timeout` → `prepare_enforcement` → `ContainedVerification` (`handoff.rs:269,991,1023,1110,1354,1444`), resolved once per pass via `boundary_grant()` (`supervisor.rs:1849-1868`), and an `Err` grant records `Inconclusive` — fail closed — rather than masking nothing (`handoff.rs:1023`). Regression coverage: `contained_verification_shadows_the_credential_source`, `a_refused_credential_mask_source_records_inconclusive` (`handoff_contract.rs`). Sentinel-verified on a fresh OrbStack Ubuntu 24.04 VM (bubblewrap 0.9.0): the generated argv renders `--ro-bind /dev/null <source>` after every plan bind, and `cat` inside a real sandbox is denied where an unmasked control reads the sentinel. |
+| #399 — credential mask only under system-bind prefixes | **Fixed on the candidate — PR #479 merged `5f134b96` 2026-11-26 post-pin; the issue was reopened as a v0.3 pre-publication fix target after the confirmed-present re-check and re-closed on merge** | Repaired: `masked_file_dests_among` (`containment.rs`) computes every sandbox spelling at which an entry stays reachable — own-path binds literal and symlink-resolved, plus per-member system-bind coverage: each bound member is its own mount of its canonical target, so on a merged-`/usr` layout a file under the shared target is masked at every bound spelling (`/usr/bin/x` and `/bin/x` are separate mounts), excluding spellings under an emitted tmpfs mask-root — and the mask loop renders `--ro-bind /dev/null <dest>` per spelling after all plan binds, so an own-path `extra_binds` entry can no longer re-mount a masked file readable. `plan_denial` fails closed on entries that would stay visible but cannot be shadowed: carried by a fixed-destination bind, or visible and not a regular file. An entry no mount reaches emits nothing by design — a `/dev/null` bind whose destination nothing created would fail the mount setup. Regression coverage: `a_masked_file_outside_system_binds_is_shadowed_when_bound`, `a_visible_but_unmaskable_masked_file_is_refused`, `a_merged_usr_masked_file_is_shadowed_at_every_bound_spelling` (`containment.rs`); sentinel-verified on the same VM — own-path-bind case masked/denied, directory and fixed-destination cases refused at plan time. |
 | #400 — v2 `report.json` retention dropped by #360 merge resolution | **Confirmed present — open defect; the code re-check on the right still shows the behavior** (owner disposition wording, quoted verbatim from #365's final comment 2026-11-25 — a closing-disposition label, not a code-state claim: 'fixed per §6', grouped under 'Fixed on the release candidate'; issue closed 2026-11-26 under that disposition) | Confirmed present: `retain_report` does not exist in `handoff.rs` on the candidate — the retention implemented in `706b8e1` was dropped by the merge-conflict resolution `630e53b`. Impact is bounded but real: `report_v2::collect` already retains a bounded prefix of the report content-addressed in the CAS body store (`report_v2.rs:113-125,253-268`), so completion facts and bounded evidence survive — but the full `report.json` dies with the per-Invocation io-tree reclaim, an evidence-completeness gap on the v2 path the release advertises. |
 | #437 — `remote_collect` reports zero-byte required artifact `Present` where local reports `Missing` | **Confirmed present — deferred to v0.6 (milestone 11)** (owner disposition recorded 2026-11-26 on the issue; it was flagged for owner review in #365 with no disposition in its final comment) | Shadow finding on #435, merged with the finding open: `remote_collect.rs` treats `blob_at` → `Some(empty)` as `Present` (size and claimed-digest checks pass at `bytes=0`) while the local supervisor returns `Missing`. v0.4 remote path — outside this release's exercised surface but on the candidate's shipped code; carried in the notes' known limitations. |
 | #419 — tracked `artifact.json` collision burns ArtifactRecovery | **Fixed on the candidate — issue closed** (repair PR #431 merged `e0e31e9`, inside the frozen pin `00fed69`) | PR #431 merged post-record: the collision guard and the component-wise symlink guard on artifact paths landed on the candidate line; the issue auto-closed. |
@@ -485,10 +488,13 @@ record.
   ancestors of `119dcb7` but are ancestors of the frozen
   `00fed69`), so they are on the released candidate line. The flagged defects are dispositioned in
   #365's closing comment (2026-11-25): #313 (ambiguous-match
-  convergence wedge), #398/#399 (credential masking — the same
-  class #364 gated on) and #400 (v2 report-retention regression)
-  remain confirmed present on the candidate — closed 2026-11-26
-  under the
+  convergence wedge) and #400 (v2 report-retention regression)
+  remain confirmed present on the candidate; #398/#399
+  (credential masking — the same class #364 gated on) were
+  likewise confirmed present at the re-check, reopened as v0.3
+  pre-publication fix targets, and repaired on the candidate —
+  PR #479 merged `5f134b96` 2026-11-26 —; the dispositioned
+  issues were closed 2026-11-26 under the
   owner-recorded 'fixed per §6', the owner's disposition wording
   for issue closure, not a code-state claim;
   the pilot-discovered #468, #470, #471 are deferred to v0.6

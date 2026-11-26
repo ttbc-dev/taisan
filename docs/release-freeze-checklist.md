@@ -34,24 +34,30 @@ Resolved at freeze (2026-11-26):
 
 - [x] *owner* — defect dispositions are recorded in #365's closing
       comment (2026-11-25): #313/#398/#399/#400 'fixed per §6'
-      (owner's disposition wording — the four defects are confirmed
-      present on the candidate per
-      [release-acceptance-v0.3.md](release-acceptance-v0.3.md) §6;
-      the label is not a code-state claim),
+      (owner's disposition wording — per
+      [release-acceptance-v0.3.md](release-acceptance-v0.3.md) §6,
+      #313/#400 are confirmed present on the candidate while
+      #398/#399 are repaired on the candidate —
+      PR #479 merged `5f134b96`; the label is not a
+      code-state claim),
       #468/#470/#471 deferred to v0.6 (milestone 11) and the earlier
       deferred set #453–#456 unchanged → v0.6,
       #469 fixed post-pin by #474. Owner acts completed
       2026-11-26: the dispositioned defect issues #313/#358/#359/
       #361/#398/#399/#400 were closed under the owner's 'Fixed on
       the release candidate' wording (a disposition act, not
-      evidence a fix landed — #313/#398/#399/#400 remain confirmed
-      present), and #437 received its recorded disposition —
-      deferred to v0.6 (milestone 11). Ledger:
+      evidence a fix landed — #313/#400 remain confirmed
+      present; #398/#399 were reopened as v0.3 pre-publication
+      fix targets, repaired under #479 — merged `5f134b96` —
+      and re-closed on merge), and #437 received its recorded
+      disposition — deferred to v0.6 (milestone 11). Ledger:
       [release-acceptance-v0.3.md](release-acceptance-v0.3.md) §6–§7;
       user-facing ones sit in the notes' known-limitations.
-- [x] Merge the open repair PR or defer it explicitly:
-      #431 (#419) — **merged `e0e31e9` 2026-11-26**, inside the
-      pinned candidate. (#472's ledger fold-in merged as `d87d5dc` — the
+- [x] Merge the open repair PRs or defer them explicitly:
+      #431 (#419) — **merged `e0e31e9` 2026-11-26** — and
+      #479 (#398/#399) — **merged `5f134b96` 2026-11-26**,
+      post-pin; the re-pinned candidate carries the fix. (#472's
+      ledger fold-in merged as `d87d5dc` — the
       notes cite the retained owner-side run records, not that PR —
       and #427 merged as `52a5493`.)
 - [x] *owner* — pick the release version: **`0.3.0`** decided
