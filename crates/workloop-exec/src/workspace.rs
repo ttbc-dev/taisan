@@ -1152,8 +1152,11 @@ fn build_staging(
             // local mirror (the dispatch profile's `source_path`), never
             // a worker workspace, so fetching from it is inside the
             // trust boundary. `git fetch <path>` spawns `git-upload-pack`
-            // in that source; `GIT_CONFIG_ARGS`/`git_env` cannot unset
-            // its repo-local config, so non-exec keys (for example
+            // in that source; git strips `GIT_CONFIG_PARAMETERS` (the
+            // `-c` scope) and `GIT_CONFIG_COUNT` (the environment scope)
+            // from the spawned server's environment, so
+            // `GIT_CONFIG_ARGS`/`git_env` cannot unset its repo-local
+            // config. Non-exec keys (for example
             // `uploadpack.allowFilter`, `uploadpack.allowTipSHA1InWant`)
             // still reach the spawned server. Exec-capable keys such as
             // `uploadpack.packObjectsHook` are honored only from
@@ -1187,9 +1190,11 @@ fn build_staging(
             // operator-configured source mirror. `git fetch <path>`
             // still spawns `git-upload-pack` in it and that server keeps
             // its non-exec repo-local config (`allowFilter`,
-            // `allowTipSHA1InWant`, ...); the exec-capable
-            // `uploadpack.packObjectsHook` is protected-configuration
-            // only on git >= 2.30.2, which `check_git_version` enforces.
+            // `allowTipSHA1InWant`, ...), because git strips the client
+            // `-c`/environment config from the spawned server; the
+            // exec-capable `uploadpack.packObjectsHook` is
+            // protected-configuration only on git >= 2.30.2, which
+            // `check_git_version` enforces.
             let src = handoff_repo.to_string_lossy().into_owned();
             let reference = handoff::artifact_ref(artifact_id);
             git(
