@@ -1783,6 +1783,77 @@ fn auth_token_reaches_runtime_but_not_verification() {
     assert!(!verify_env.contains("gh-secret-should-strip"));
 }
 
+/// The contract's `proxy_endpoint` member is a worker-owned override:
+/// the runtime child gets exactly one proxy pair carrying the
+/// configured endpoint — the supervisor-delivered relay URL is
+/// replaced outright, never duplicated into ambiguous ordering.
+#[test]
+fn provider_proxy_endpoint_replaces_the_supervisor_proxy_env() {
+    let dir = tmp("proxyenv");
+    let ws = workspace(&dir);
+    let provider = dir.join("provider.json");
+    fs::write(
+        &provider,
+        "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\",\"proxy_endpoint\":\"http://127.0.0.1:9123\"}\n",
+    )
+    .unwrap();
+    let env_capture = dir.join("env.txt");
+    let fake = dir.join("fake-env-claude");
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nenv | grep -iE '^https_proxy=' > {}\ncat {}\nexit 0\n",
+            env_capture.display(),
+            events_file(&dir, "done", json!({})).display(),
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let req = request_json(
+        "coding",
+        json!({"kind": "coding", "goal": goal_ref(), "issues": [],
+               "constraints": [], "verification_argv": []}),
+        &ws,
+        false,
+    );
+    let (request_path, _, out_dir) = dispatch("proxyenv", &req, &[("goal.md", "goal\n")]);
+    let out = Command::new(shim())
+        .args(["--runtime"])
+        .arg(&fake)
+        .args(["--provider-config"])
+        .arg(&provider)
+        .args(["run", "--request"])
+        .arg(&request_path)
+        .args(["--out"])
+        .arg(&out_dir)
+        .current_dir(&ws)
+        // The supervisor-delivered contained env — the relay URL.
+        .env("HTTPS_PROXY", "http://127.0.0.1:18080")
+        .env("https_proxy", "http://127.0.0.1:18080")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out.stderr);
+    let runtime_env = fs::read_to_string(&env_capture).unwrap();
+    let proxy_lines: Vec<&str> = runtime_env.lines().collect();
+    assert_eq!(
+        proxy_lines.len(),
+        2,
+        "exactly one proxy pair reaches the runtime: {runtime_env}"
+    );
+    assert!(
+        runtime_env.contains("http://127.0.0.1:9123"),
+        "the configured proxy_endpoint wins: {runtime_env}"
+    );
+    assert!(
+        !runtime_env.contains("18080"),
+        "the supervisor relay URL is replaced, not duplicated: {runtime_env}"
+    );
+}
+
 /// Recompute `request_digest` after mutating a minted request.
 fn redigest(req: &mut Value) {
     let digest = request_v2_digest(&canonical_json(&{

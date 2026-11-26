@@ -83,6 +83,18 @@ pub struct BoundaryGrant {
 
 struct BoundaryReady {
     provider_config: Option<PathBuf>,
+    /// The staged credential files this instance created — one
+    /// unique path per grant. A grant's file must survive until its
+    /// launch has mounted it, and the boundary cannot observe the
+    /// mount, so owned files are removed only by this instance's
+    /// `Drop`: a boundary that staged nothing removes nothing, and a
+    /// later grant can never rewrite or unlink a file a pending
+    /// launch is about to bind.
+    staged: Vec<PathBuf>,
+    /// The next per-grant staging suffix — the unique name is what
+    /// keeps a later grant's restage from clobbering an earlier
+    /// grant's pending mount.
+    next_grant: u64,
     /// The proxy persists for the boundary's life: its allowlist is
     /// static configuration, so a provider-config edit never rebuilds
     /// the listener.
@@ -150,58 +162,59 @@ impl RuntimeBoundary {
     /// records it as a launch repair.
     pub fn ensure(&self) -> Result<BoundaryGrant, String> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let grant = self.grant_locked(&mut state);
-        if grant.is_err() {
-            // A refused ensure unstages: the staged credential exists
-            // only while a grant needs it, and the staging sibling
-            // holds the same secret material while it lives.
-            let _ = self.unstage_credential();
-        }
-        grant
+        // A refused ensure still swept foreign staging files inside
+        // `grant_locked`; a failed stage removes its own partial copy.
+        // It never touches an earlier grant's file — that file may be
+        // a pending launch's only credential surface.
+        self.grant_locked(&mut state)
     }
 
-    /// The per-call grant path under the state mutex: resolve the
-    /// credential reference fresh, validate the provider contract
-    /// against the resolved bytes, stage the credential, and start
-    /// the CONNECT proxy once when hosts are configured. Nothing is
-    /// cached across calls except the proxy itself.
+    /// The per-call grant path under the state mutex: sweep foreign
+    /// staging files, resolve the credential reference fresh, validate
+    /// the provider contract against the resolved bytes, start the
+    /// CONNECT proxy once when hosts are configured, and stage the
+    /// credential under a unique per-grant name. Nothing is cached
+    /// across calls except the proxy itself and the set of files this
+    /// instance staged.
     fn grant_locked(&self, state: &mut BoundaryState) -> Result<BoundaryGrant, String> {
+        {
+            let owned: &[PathBuf] = match state {
+                BoundaryState::Ready(ready) => &ready.staged,
+                BoundaryState::Unresolved => &[],
+            };
+            self.sweep_foreign_staging(owned)?;
+        }
         let resolved = match &self.config.credential_ref {
             None => None,
             Some(reference) => Some(credentials::resolve(reference).map_err(|e| e.to_string())?),
         };
         self.validate_provider_config(resolved.as_ref().map(|r| r.bytes()))?;
-        let credential_file = match &resolved {
-            None => {
-                // A grant carrying no credential still owns the staged
-                // paths: a file or staging sibling an earlier grant
-                // left behind is stale secret material and is unlinked
-                // here.
-                self.unstage_credential()?;
-                None
-            }
-            Some(resolved) => Some(self.stage_credential(resolved)?),
-        };
         if matches!(*state, BoundaryState::Unresolved) {
             *state = BoundaryState::Ready(BoundaryReady {
                 provider_config: self.config.provider_config.clone(),
+                staged: Vec::new(),
+                next_grant: 0,
                 proxy: self.start_proxy()?,
             });
         }
-        match state {
-            BoundaryState::Ready(ready) => Ok(BoundaryGrant {
-                credential_file,
-                credential_source: resolved
-                    .as_ref()
-                    .and_then(|r| r.source_path().map(Path::to_path_buf)),
-                provider_config: ready.provider_config.clone(),
-                proxy_sock: ready
-                    .proxy
-                    .as_ref()
-                    .map(|proxy| proxy.sock_path().to_path_buf()),
-            }),
-            BoundaryState::Unresolved => unreachable!("state resolved above"),
-        }
+        let BoundaryState::Ready(ready) = state else {
+            unreachable!("state resolved above")
+        };
+        let credential_file = match &resolved {
+            None => None,
+            Some(resolved) => Some(self.stage_credential(ready, resolved)?),
+        };
+        Ok(BoundaryGrant {
+            credential_file,
+            credential_source: resolved
+                .as_ref()
+                .and_then(|r| r.source_path().map(Path::to_path_buf)),
+            provider_config: ready.provider_config.clone(),
+            proxy_sock: ready
+                .proxy
+                .as_ref()
+                .map(|proxy| proxy.sock_path().to_path_buf()),
+        })
     }
 
     /// The CONNECT proxy, started the first time a grant needs the
@@ -221,41 +234,82 @@ impl RuntimeBoundary {
             .map_err(|e| format!("egress.proxy_unavailable: {e}"))
     }
 
-    /// Stage the resolved credential as a single owner-only file the
-    /// mount plan binds read-only. The value exists only in this file
-    /// and the provider's own storage — never argv, logs, or evidence.
-    fn stage_credential(&self, credential: &ResolvedCredential) -> Result<PathBuf, String> {
+    /// Stage the resolved credential as an owner-only file unique to
+    /// this grant — the mount plan binds it read-only. The value
+    /// exists only in this file and the provider's own storage, never
+    /// argv, logs, or evidence. The unique name is the load-bearing
+    /// property: a later grant stages a *new* file rather than
+    /// rewriting the path a pending launch is about to bind, and the
+    /// recorded path is what this instance's `Drop` removes.
+    fn stage_credential(
+        &self,
+        ready: &mut BoundaryReady,
+        credential: &ResolvedCredential,
+    ) -> Result<PathBuf, String> {
         std::fs::create_dir_all(&self.config.runtime_dir).map_err(|e| {
             format!(
                 "credential.stage_failed: create {}: {e}",
                 self.config.runtime_dir.display()
             )
         })?;
-        let path = self.config.runtime_dir.join("runtime-auth");
-        let tmp = self.config.runtime_dir.join("runtime-auth.tmp");
-        // The staging sibling carries the same secret bytes the moment
-        // it is created: a failure past that point must not leave the
-        // copy at its predictable path.
-        let staged = write_staged_credential(&tmp, &path, credential);
-        if staged.is_err() {
-            let _ = self.unstage_credential();
+        let tag = ready.next_grant;
+        ready.next_grant += 1;
+        let path = self.config.runtime_dir.join(format!("runtime-auth.{tag}"));
+        let tmp = self
+            .config
+            .runtime_dir
+            .join(format!("runtime-auth.{tag}.tmp"));
+        match write_staged_credential(&tmp, &path, credential) {
+            Ok(()) => {
+                ready.staged.push(path.clone());
+                Ok(path)
+            }
+            // The staging sibling carries the same secret bytes the
+            // moment it is created: a failure past that point must
+            // not leave the copy at its predictable path.
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
         }
-        staged.map(|()| path)
     }
 
-    /// Remove the staged credential file and its staging sibling —
-    /// `runtime-auth.tmp` holds the same secret material from the
-    /// moment a stage creates it, so an orphaned tmp is stale secret
-    /// too. Both paths are tried even when the first removal fails.
-    /// An already-absent file is not an error — cleanup runs on
-    /// refusals, re-resolves, and drops and must be idempotent. A
-    /// real removal failure refuses the resolve that asks for it; the
-    /// error-cleanup and Drop paths ignore it because they cannot
-    /// report it.
-    fn unstage_credential(&self) -> Result<(), String> {
+    /// Remove staging files in `runtime_dir` this instance does not
+    /// own — a crashed supervisor's `runtime-auth*` leftovers are
+    /// stale secret material and every resolve sweeps them. Owned
+    /// files are skipped: a grant's file is a live credential surface
+    /// until its launch binds it. Only regular files and links can
+    /// hold the secret — a same-named directory is an obstruction the
+    /// stage itself refuses on, not secret material. An already-absent
+    /// file is not an error; a real removal failure refuses the
+    /// resolve — the boundary cannot certify a clean staging dir it
+    /// failed to clean.
+    fn sweep_foreign_staging(&self, owned: &[PathBuf]) -> Result<(), String> {
+        let entries = match std::fs::read_dir(&self.config.runtime_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("credential.unstage_failed: {e}")),
+        };
         let mut failed = None;
-        for name in ["runtime-auth", "runtime-auth.tmp"] {
-            match std::fs::remove_file(self.config.runtime_dir.join(name)) {
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("credential.unstage_failed: {e}"))?;
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("runtime-auth")
+            {
+                continue;
+            }
+            let path = entry.path();
+            if owned.contains(&path) {
+                continue;
+            }
+            match entry.file_type() {
+                Ok(t) if t.is_file() || t.is_symlink() => {}
+                Ok(_) => continue,
+                Err(e) => return Err(format!("credential.unstage_failed: {e}")),
+            }
+            match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
@@ -287,17 +341,23 @@ impl RuntimeBoundary {
 impl Drop for RuntimeBoundary {
     fn drop(&mut self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let BoundaryState::Ready(ready) = &mut *state
-            && let Some(proxy) = ready.proxy.take()
-        {
+        let BoundaryState::Ready(ready) = &mut *state else {
+            // A boundary that never resolved staged nothing and owns
+            // nothing — dropping it must not unlink another
+            // supervisor's credential at the shared runtime dir (a
+            // `run` that loses the lease drops a boundary that was
+            // constructed but never ensured).
+            return;
+        };
+        if let Some(proxy) = ready.proxy.take() {
             proxy.shutdown();
         }
-        drop(state);
-        // The staged credential's lifetime is the grant's — with the
-        // boundary gone, any staged file or staging sibling is stale
-        // secret material. Unconditional: a credential staged by a
-        // grant whose state never reached Ready is still removed.
-        let _ = self.unstage_credential();
+        // The staged credential's lifetime is its grant's — and only
+        // this instance's grants: with the boundary gone, its own
+        // staged files are stale secret material.
+        for path in &ready.staged {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -330,18 +390,38 @@ fn write_staged_credential(
     std::fs::rename(tmp, path).map_err(|e| format!("credential.stage_failed: {e}"))
 }
 
-/// Bounded-memory digest of one file's full content: every byte feeds
-/// the digest through fixed-size chunks, so a same-size edit anywhere
-/// in the file changes the identity without buffering the file.
+/// Bounded digest of one file's content: at most the contract's own
+/// size bound is read, through fixed-size chunks, so a same-size edit
+/// anywhere in an admitted file changes the identity without
+/// buffering the file. A larger source cannot be a valid contract —
+/// `bindings::validate` refuses it unread — so the identity fails
+/// the same way instead of hashing an unbounded file before the
+/// refusal runs.
 fn file_content_digest(path: &Path) -> Result<String, std::io::Error> {
     use std::io::Read;
+    if std::fs::metadata(path)?.len() > crate::bindings::MAX_CONTRACT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "provider config exceeds the contract size bound",
+        ));
+    }
     let mut file = std::fs::File::open(path)?;
     let mut chunks = String::new();
+    let mut total = 0u64;
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
+        }
+        total += n as u64;
+        // The metadata check and the read race: a file that grew
+        // between them is still refused at the bound.
+        if total > crate::bindings::MAX_CONTRACT_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "provider config exceeds the contract size bound",
+            ));
         }
         chunks.push_str(&sha256_hex("provider-config-chunk-v1", &buf[..n]));
     }
@@ -438,6 +518,23 @@ mod tests {
             egress_dir: dir.join("egress"),
             relay_exe: PathBuf::from("/bin/taisan"),
         }
+    }
+
+    /// Every `runtime-auth*` entry — staged grants and staging
+    /// siblings — currently in the staging dir.
+    fn staged_entries(dir: &Path) -> Vec<PathBuf> {
+        let runtime = dir.join("runtime");
+        let Ok(entries) = std::fs::read_dir(&runtime) else {
+            return vec![];
+        };
+        entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("runtime-auth"))
+            })
+            .collect()
     }
 
     #[test]
@@ -678,16 +775,17 @@ mod tests {
         let err = boundary.ensure().unwrap_err();
         assert!(err.contains("provider_config.contains_credential"), "{err}");
         assert!(
-            !dir.join("runtime/runtime-auth").exists(),
+            staged_entries(&dir).is_empty(),
             "a refused resolve must not leave the staged credential"
         );
         unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN4") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A resolve carrying no `credential_ref` owns the staged paths:
-    /// a file — or a staging sibling a killed stage left behind — is
-    /// stale secret material and is unlinked.
+    /// A resolve carrying no `credential_ref` still owns the staging
+    /// dir: a file a crashed predecessor left behind — or a staging
+    /// sibling a killed stage orphaned — is stale secret material and
+    /// is swept.
     #[test]
     fn a_no_credential_resolve_unlinks_an_earlier_grants_file() {
         let dir = tmp("unstage");
@@ -697,7 +795,7 @@ mod tests {
         cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_TOKEN5".into());
         let boundary = RuntimeBoundary::new(cfg);
         boundary.ensure().unwrap();
-        let staged = dir.join("runtime/runtime-auth");
+        let staged = dir.join("runtime/runtime-auth.0");
         assert!(staged.exists(), "the first grant staged the file");
         // Forget the boundary so its file survives like a crashed
         // supervisor's — Drop would remove it. A tmp orphaned
@@ -709,12 +807,13 @@ mod tests {
         boundary2.ensure().unwrap();
         assert!(!staged.exists(), "the stale staged file is unlinked");
         assert!(!orphan.exists(), "the orphaned staging file is unlinked");
+        assert!(staged_entries(&dir).is_empty());
         unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN5") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A stage that fails after the tmp file carries secret bytes —
-    /// here the rename refuses because `runtime-auth` is a directory —
+    /// here the rename refuses because the staged name is a directory —
     /// must remove the partial copy rather than leave it at the
     /// predictable staging path.
     #[test]
@@ -722,24 +821,26 @@ mod tests {
         let dir = tmp("stagefail");
         // SAFETY: test-only env mutation.
         unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_TOKEN8", "sekrit8") };
-        std::fs::create_dir_all(dir.join("runtime/runtime-auth")).unwrap();
+        std::fs::create_dir_all(dir.join("runtime/runtime-auth.0")).unwrap();
         let mut cfg = config(&dir);
         cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_TOKEN8".into());
         let boundary = RuntimeBoundary::new(cfg);
         let err = boundary.ensure().unwrap_err();
         assert!(err.contains("credential.stage_failed"), "{err}");
         assert!(
-            !dir.join("runtime/runtime-auth.tmp").exists(),
+            !dir.join("runtime/runtime-auth.0.tmp").exists(),
             "a failed stage must not leave the tmp credential copy"
         );
         unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN8") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A failed stale re-resolve releases the stale grant and must
-    /// not leave it cached: once the provider config recovers, the
-    /// next `ensure` resolves from scratch and hands out a grant
-    /// whose staged file actually exists — never the dismantled one.
+    /// A failed stale re-resolve never dismantles an earlier grant:
+    /// the first grant's file is a pending launch's credential
+    /// surface until it mounts, so a refusal leaves it untouched.
+    /// Once the provider config recovers, the next `ensure` resolves
+    /// from scratch and hands out a new grant whose staged file
+    /// actually exists.
     #[test]
     fn a_failed_reresolve_does_not_serve_a_dismantled_grant() {
         let dir = tmp("dismantle");
@@ -755,8 +856,10 @@ mod tests {
         cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_TOKEN7".into());
         cfg.provider_config = Some(member.clone());
         let boundary = RuntimeBoundary::new(cfg);
-        boundary.ensure().expect("a clean config resolves");
-        // A re-validate that fails past resolution leaves no file.
+        let first = boundary.ensure().expect("a clean config resolves");
+        let first_file = first.credential_file.expect("the first grant stages");
+        // A re-validate that fails past resolution must not touch the
+        // earlier grant's file — a pending launch may still bind it.
         std::fs::write(
             &member,
             "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"sekrit7\"}\n",
@@ -764,10 +867,14 @@ mod tests {
         .unwrap();
         let err = boundary.ensure().unwrap_err();
         assert!(err.contains("provider_config.contains_credential"), "{err}");
-        assert!(!dir.join("runtime/runtime-auth").exists());
-        // Restoring the original content resolves again: the grant
-        // carries a live staged file, never a dismantled grant's dead
-        // path.
+        assert_eq!(
+            std::fs::read(&first_file).unwrap(),
+            b"sekrit7",
+            "a refused re-resolve leaves the earlier grant's file intact"
+        );
+        // Restoring the original content resolves again: the new grant
+        // carries a live staged file of its own, never a dismantled
+        // grant's dead path.
         std::fs::write(
             &member,
             "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"aaaaaa\"}\n",
@@ -775,6 +882,7 @@ mod tests {
         .unwrap();
         let grant = boundary.ensure().unwrap();
         let staged = grant.credential_file.expect("credential restaged");
+        assert_ne!(staged, first_file, "each grant stages its own file");
         assert_eq!(std::fs::read(&staged).unwrap(), b"sekrit7");
         unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN7") };
         let _ = std::fs::remove_dir_all(&dir);
@@ -796,6 +904,97 @@ mod tests {
         drop(boundary);
         assert!(!staged.exists(), "drop unlinks the staged credential");
         unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN6") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `run` that loses the lease drops a boundary it constructed
+    /// but never resolved against the same workspace staging dir —
+    /// its drop must not unlink the active supervisor's staged
+    /// credential.
+    #[test]
+    fn a_never_resolved_boundarys_drop_keeps_the_holders_credential() {
+        let dir = tmp("contender");
+        // SAFETY: test-only env mutation.
+        unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_TOKEN9", "sekrit9") };
+        let mut cfg = config(&dir);
+        cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_TOKEN9".into());
+        let holder = RuntimeBoundary::new(cfg.clone());
+        let grant = holder.ensure().unwrap();
+        let staged = grant.credential_file.expect("the holder staged");
+        assert!(staged.exists());
+        // The lease contender shares the staging dir and drops
+        // without ever resolving — as `run` does on `lock.held`.
+        let contender = RuntimeBoundary::new(cfg);
+        drop(contender);
+        assert!(
+            staged.exists(),
+            "a contender's drop must not unlink the holder's staged credential"
+        );
+        assert_eq!(std::fs::read(&staged).unwrap(), b"sekrit9");
+        unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN9") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Each grant stages its own file: a later grant — including one
+    /// that observes a rotated provider value — can never rewrite the
+    /// path a pending launch is about to bind, and a refused
+    /// re-resolve never unlinks it either.
+    #[test]
+    fn a_later_grant_never_rewrites_a_pending_grants_file() {
+        let dir = tmp("pergrant");
+        let source = dir.join("token");
+        std::fs::write(&source, "credential-v1").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut cfg = config(&dir);
+        cfg.credential_ref = Some(format!("file:{}", source.display()));
+        let boundary = RuntimeBoundary::new(cfg);
+        let first = boundary.ensure().unwrap();
+        let first_file = first.credential_file.expect("the first grant stages");
+        // The provider value rotates before the first grant's launch
+        // has mounted its file: the second grant must observe v2 at a
+        // NEW path, leaving the pending mount's file untouched.
+        std::fs::write(&source, "credential-v2").unwrap();
+        let second = boundary.ensure().unwrap();
+        let second_file = second.credential_file.expect("the second grant stages");
+        assert_ne!(first_file, second_file, "each grant stages its own file");
+        assert_eq!(
+            std::fs::read(&first_file).unwrap(),
+            b"credential-v1",
+            "the pending grant's file keeps the content it was granted"
+        );
+        assert_eq!(std::fs::read(&second_file).unwrap(), b"credential-v2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The identity digest reads at most the contract's own size
+    /// bound: an oversized provider source — file or directory
+    /// member — fails the identity the same way validation refuses
+    /// it, instead of being hashed unbounded before the refusal runs.
+    #[test]
+    fn an_oversized_provider_config_fails_the_bounded_identity_read() {
+        let dir = tmp("oversize");
+        let big = dir.join("provider.json");
+        std::fs::write(
+            &big,
+            vec![b'x'; crate::bindings::MAX_CONTRACT_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(provider_config_digest(&big).is_err());
+        let mut cfg = config(&dir);
+        cfg.provider_config = Some(big);
+        let boundary = RuntimeBoundary::new(cfg);
+        let err = boundary.identity_digest().unwrap_err();
+        assert!(err.contains("provider_config.unreadable"), "{err}");
+        // An oversized member of a directory config fails the same
+        // bounded read — the entry cap does not bound member bytes.
+        let cfg_dir = dir.join("provider.d");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("big.json"),
+            vec![b'x'; crate::bindings::MAX_CONTRACT_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(provider_config_digest(&cfg_dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

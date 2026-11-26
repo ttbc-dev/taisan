@@ -72,8 +72,7 @@ pub fn validate(path: &Path, credential_bytes: Option<&[u8]>) -> Result<(), Stri
     if bytes.len() as u64 > MAX_CONTRACT_BYTES {
         return Err(invalid("exceeds the contract size bound"));
     }
-    let document: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| invalid(format!("not a contract JSON object: {e}")))?;
+    let document = parse_contract(&bytes)?;
     let object = document
         .as_object()
         .ok_or_else(|| invalid("not a contract JSON object"))?;
@@ -138,6 +137,100 @@ fn validate_member(
 
 fn invalid(detail: impl Into<String>) -> String {
     format!("provider_config.contract_invalid: {}", detail.into())
+}
+
+/// Parse the contract document, refusing duplicate member names at
+/// every depth. A lenient last-wins parse would validate only the
+/// final value while the document the Worker mounts still carries the
+/// ambiguity — and a strict consumer (the adapter's own field parse)
+/// then rejects the whole document and silently falls back to
+/// defaults. The boundary fails closed instead: a repeated member
+/// name anywhere in the document is not a contract document.
+fn parse_contract(bytes: &[u8]) -> Result<serde_json::Value, String> {
+    serde_json::from_slice::<UniqueMembers>(bytes)
+        .map(|document| document.0)
+        .map_err(|e| invalid(format!("not a contract JSON object: {e}")))
+}
+
+/// A `serde_json::Value` whose object member names are unique at
+/// every depth — see [`parse_contract`].
+struct UniqueMembers(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for UniqueMembers {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(UniqueVisitor)
+    }
+}
+
+struct UniqueVisitor;
+
+impl<'de> serde::de::Visitor<'de> for UniqueVisitor {
+    type Value = UniqueMembers;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(UniqueMembers(serde_json::Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(UniqueMembers(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(UniqueMembers(value.into()))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+        serde_json::Number::from_f64(value)
+            .map(|n| UniqueMembers(serde_json::Value::Number(n)))
+            .ok_or_else(|| E::custom("non-finite number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(UniqueMembers(value.into()))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueMembers(serde_json::Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueMembers(serde_json::Value::Null))
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        <UniqueMembers as serde::Deserialize>::deserialize(deserializer)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+        while let Some(UniqueMembers(item)) = seq.next_element::<UniqueMembers>()? {
+            items.push(item);
+        }
+        Ok(UniqueMembers(serde_json::Value::Array(items)))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut object = serde_json::Map::new();
+        while let Some((key, UniqueMembers(value))) = map.next_entry::<String, UniqueMembers>()? {
+            if object.contains_key(&key) {
+                // Member names are part of the contract — the
+                // diagnostic may name a bounded prefix of one.
+                let name: String = key.chars().take(64).collect();
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate member name '{name}'"
+                )));
+            }
+            object.insert(key, value);
+        }
+        Ok(UniqueMembers(serde_json::Value::Object(object)))
+    }
 }
 
 #[cfg(test)]
@@ -227,6 +320,27 @@ mod tests {
             "{err}"
         );
         assert!(!err.contains("xx-secret-yy"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repeated member name — required, extension, or nested —
+    /// refuses the document: a last-wins parse would validate only the
+    /// final value while the mounted document still carries the
+    /// ambiguity a strict consumer rejects wholesale.
+    #[test]
+    fn duplicate_member_names_refuse() {
+        let dir = tmp("dup");
+        for content in [
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"a\",\"model\":\"b\"}",
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\"}",
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\",\"adapter_option\":1,\"adapter_option\":2}",
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\",\"nested\":{\"a\":1,\"a\":2}}",
+        ] {
+            let path = write(&dir, "dup.json", content);
+            let err = validate(&path, None).unwrap_err();
+            assert!(err.starts_with("provider_config."), "{err}");
+            assert!(err.contains("duplicate member name"), "{err}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

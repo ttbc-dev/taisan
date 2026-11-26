@@ -34,7 +34,7 @@ The provider configuration is exactly one regular file — a bounded
 | `format_version` | yes | Exactly `"taisan.worker.bindings/1"`. Any other value, or absence, is a version refusal — never a tolerant parse |
 | `model` | yes | Non-empty bounded string (≤ 1024 chars) naming the model the Worker runs |
 | `endpoint` | no | Non-empty bounded string naming the provider endpoint the runtime calls |
-| `proxy_endpoint` | no | Non-empty bounded string naming a proxy endpoint the adapter may additionally honor; the supervisor-delivered `HTTPS_PROXY` environment is authoritative for egress |
+| `proxy_endpoint` | no | Non-empty bounded string naming a proxy endpoint the adapter may additionally honor. Worker-owned override: the adapter may replace the supervisor-delivered `HTTPS_PROXY` pair for the runtime child with this endpoint. Under containment only loopback and the bound supervisor socket are reachable, so the override can route inside the sandbox but can never widen egress past the supervisor's CONNECT allowlist — and an endpoint that is not reachable inside the sandbox simply fails the child's egress |
 | extension members | no | Adapter-owned; Core neither names nor interprets them. They never loosen the required bindings |
 
 The document is non-secret by construction: it is validated *after*
@@ -51,12 +51,15 @@ the failed rule, never the document's content:
 | Diagnostic | Cause |
 | --- | --- |
 | `provider_config.unreadable` | Path absent or not readable |
-| `provider_config.contract_invalid` | Not a regular file, over the size bound, not a JSON object, or a fixed member violates its shape rule (missing `model`, empty/over-long/wrong-typed value) |
+| `provider_config.contract_invalid` | Not a regular file, over the size bound, not a JSON object, a repeated member name anywhere in the document, or a fixed member violates its shape rule (missing `model`, empty/over-long/wrong-typed value) |
 | `provider_config.contract_version` | `format_version` absent or not exactly `taisan.worker.bindings/1` |
 | `provider_config.contains_credential` | The resolved credential value appears in the document bytes |
 
 An invalid or missing required binding refuses the launch; there is
-no partial mount and no ambient fallback.
+no partial mount and no ambient fallback. The preflight identity hash
+is bounded the same way — at most the contract size bound is read, so
+an oversized source fails the gate unread instead of being hashed
+before validation runs.
 
 ## Runtime credential delivery
 
@@ -64,11 +67,15 @@ The credential is configured only as a provider *reference*
 (`env:`/`file:`/`command:` — see
 [installation-config.md](installation-config.md)) and is resolved and
 staged fresh at every contained launch and `describe` probe: the
-latest provider value is what the next Invocation observes. The
-resolved bytes live only in the provider's own storage and a single
-`0600` supervisor-owned file bound read-only at
-`/taisan/runtime-auth` for the grant's lifetime; the file is removed
-when the grant is dismantled or the boundary drops.
+latest provider value is what the next Invocation observes. Each
+grant stages its own `0600` supervisor-owned file under a unique
+per-grant name, bound read-only at `/taisan/runtime-auth` — a later
+grant can never rewrite the path a pending launch is about to bind,
+and a refused re-resolve never unlinks it. A boundary removes only
+the files it staged: a boundary that was constructed but never
+resolved (a `run` that lost the lease) removes nothing at the shared
+staging dir, while every resolve sweeps `runtime-auth*` leftovers a
+crashed predecessor left behind as stale secret material.
 
 The credential value never enters argv, the request body,
 `runtime.log`, the report, evidence, the provider contract document,
@@ -112,13 +119,22 @@ unchanged.
 The packaged Worker runtime — executable, language-runtime
 dependencies, package files, and runtime payload — reaches the
 sandbox through the narrow read-only surface: paths under the fixed
-system prefixes (`/usr`, `/lib`, `/opt`, …) ride the wholesale
-read-only system binds; every other absolute path the argv names is
-bound read-only at its own path. Host `/`, a container socket, and
-the owner's home are never bind sources; nothing packaged is bound
-writable. Writable locations inside the sandbox are only `/workspace`
-(role-dependent), `/taisan/out`, `HOME` (tmpfs), and `TMPDIR`
-(`/tmp`). See [examples/managed-worker](examples/managed-worker/README.md)
+system prefixes (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`) ride the
+wholesale read-only system binds; every other absolute path the argv
+names is bound read-only at its own path. `/etc` and `/opt` are
+deliberately not bound — they are host configuration and third-party
+install trees, not the runtime. A Worker package installed outside
+the bound prefixes therefore exposes only the paths its argv names:
+the argv[0] executable and every absolute-path argv element bind at
+their own path, but sibling dependencies the argv does not name stay
+invisible. Packages that need a directory of dependencies must live
+under a bound prefix (as in the example layout), name each required
+absolute path in argv, or ship a self-contained executable. Host `/`,
+a container socket, and the owner's home are never bind sources;
+nothing packaged is bound writable. Writable locations inside the
+sandbox are only `/workspace` (role-dependent), `/taisan/out`, `HOME`
+(tmpfs), and `TMPDIR` (`/tmp`). See
+[examples/managed-worker](examples/managed-worker/README.md)
 for a concrete packaged layout.
 
 ## Evidence boundary

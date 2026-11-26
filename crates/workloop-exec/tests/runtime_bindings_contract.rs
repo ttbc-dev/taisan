@@ -216,8 +216,18 @@ fn a_refusal_leaves_no_staged_credential() {
     let boundary = RuntimeBoundary::new(cfg);
     let err = boundary.ensure().unwrap_err();
     assert!(err.starts_with("provider_config."), "{err}");
-    assert!(!dir.join("runtime/runtime-auth").exists());
-    assert!(!dir.join("runtime/runtime-auth.tmp").exists());
+    let leftovers: Vec<_> = std::fs::read_dir(dir.join("runtime"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("runtime-auth"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        leftovers.is_empty(),
+        "no staged credential survives a refusal"
+    );
     unsafe { std::env::remove_var("TAISAN_BINDINGS_DUMMY_TOKEN") };
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -245,27 +255,49 @@ fn generated_argv_matches_the_fixed_mount_surface() {
     for flag in ["--unshare-net", "--unshare-pid", "--unshare-ipc"] {
         assert!(joined.contains(flag), "namespace flag missing: {joined}");
     }
-    // Every supervisor-owned grant binds read-only at its fixed path.
-    for mount in [
+    // Every supervisor-owned grant binds read-only at its fixed path —
+    // paired flag+dest on the same bind, never a global flag presence
+    // an unrelated ro-bind could satisfy while a grant mounts writable.
+    let binds: Vec<&[String]> = argv
+        .windows(3)
+        .filter(|w| w[0] == "--bind" || w[0] == "--ro-bind")
+        .collect();
+    for dest in [
         "/taisan/runtime-auth",
         "/taisan/provider-config",
         "/taisan/proxy.sock",
         "/taisan/gitconfig",
     ] {
-        assert!(joined.contains("--ro-bind\n"), "{joined}");
-        assert!(joined.contains(mount), "missing mount {mount}:\n{joined}");
-    }
-    // The staged credential, contract document, and proxy socket each
-    // bind their host source read-only at the fixed sandbox spelling.
-    for (source, dest) in [
-        ("runtime-auth", "/taisan/runtime-auth"),
-        (bindings.to_str().unwrap(), "/taisan/provider-config"),
-    ] {
+        let mounts: Vec<&&[String]> = binds.iter().filter(|w| w[2] == dest).collect();
+        assert!(!mounts.is_empty(), "missing mount {dest}:\n{joined}");
         assert!(
-            joined.contains(source) && joined.contains(dest),
-            "bind {source} -> {dest} missing:\n{joined}"
+            mounts.iter().all(|w| w[0] == "--ro-bind"),
+            "{dest} must bind read-only:\n{joined}"
         );
     }
+    // The staged credential, contract document, and proxy socket each
+    // bind their own host source read-only at the fixed sandbox
+    // spelling — the source is paired with the flag and dest on the
+    // same bind, not merely present somewhere in argv.
+    let bind_at = |dest: &str| {
+        binds
+            .iter()
+            .find(|w| w[2] == dest)
+            .unwrap_or_else(|| panic!("missing bind for {dest}:\n{joined}"))
+    };
+    let auth = bind_at("/taisan/runtime-auth");
+    assert_eq!(auth[0], "--ro-bind");
+    assert!(
+        auth[1].starts_with(dir.join("runtime").to_str().unwrap())
+            && auth[1].contains("runtime-auth"),
+        "the staged credential source must be the staged file: {auth:?}"
+    );
+    let provider = bind_at("/taisan/provider-config");
+    assert_eq!(provider[0], "--ro-bind");
+    assert_eq!(provider[1], bindings.to_str().unwrap());
+    let sock = bind_at("/taisan/proxy.sock");
+    assert_eq!(sock[0], "--ro-bind");
+    assert!(sock[1].ends_with("worker.sock"), "{sock:?}");
     // The relay is the sandbox init serving the proxy to the worker
     // tree — argv leads with it.
     assert!(joined.contains("__sandbox-relay"), "{joined}");

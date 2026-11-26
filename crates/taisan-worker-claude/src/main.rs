@@ -511,6 +511,15 @@ fn runtime_environment(cfg: &Config, provider: &ProviderConfig) -> Vec<(String, 
         env.push(("ANTHROPIC_BASE_URL".into(), endpoint.to_string()));
     }
     if let Some(proxy) = provider.proxy_endpoint.as_deref() {
+        // The adapter owns the runtime child's proxy endpoint: the
+        // contract's `proxy_endpoint` member replaces the supervisor's
+        // relay URL outright — one pair, not a duplicate that leaves
+        // the winner to env ordering. Under containment only loopback
+        // and the bound supervisor socket are reachable, so the
+        // override can route inside the sandbox but can never widen
+        // egress past the supervisor's CONNECT allowlist
+        // (docs/runtime-bindings.md).
+        env.retain(|(k, _)| !k.eq_ignore_ascii_case("https_proxy"));
         env.push(("HTTPS_PROXY".into(), proxy.to_string()));
         env.push(("https_proxy".into(), proxy.to_string()));
     }
