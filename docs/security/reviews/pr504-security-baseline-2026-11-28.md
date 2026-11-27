@@ -33,7 +33,10 @@
 
 ## Residual risk
 
-Tracked code defects recorded in `audit-v0.3.md` (F2–F12) remain open by
-design — they are follow-up issues, not this PR's regressions. One
-inconclusive review candidate was withheld by the reviewer without an
-inline anchor; nothing actionable was received.
+The code defects the audit still records as defects (F2–F6, F8–F10)
+remain open by design — they are follow-up issues, not this PR's
+regressions. F1, F7, and F11 were reclassified into `audit-v0.3.md`'s
+Accepted risks, and F12 is correct as written (a future-edit hardening
+note), so none of those carry an open defect to track. One inconclusive
+review candidate was withheld by the reviewer without an inline anchor;
+nothing actionable was received.
