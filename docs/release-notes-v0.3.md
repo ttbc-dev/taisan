@@ -243,9 +243,36 @@ homebrew-core deferred until notability) and **cargo-binstall**
 metadata (`cargo binstall` fetches the prebuilt binary). crates.io is
 not a channel: taisan is a CLI tool, not a library. The dist
 workflow itself is #441's lane ([distribution](distribution.md)).
-**TODO at release:** record the packaged-artifact checksums
-cargo-dist produces here; the source-build path above remains
-supported independently.
+**Recorded at release (2026-11-27, tag `v0.3.0` → `2d7da0c`):**
+every archive below is published on the GitHub release with a
+companion `<name>.sha256`, and the unified `sha256.sum` lists all
+of them:
+
+| artifact | sha256 |
+|---|---|
+| `workloop-cli-aarch64-apple-darwin.tar.xz` | `ae503b4e3f9f1915c1eee56e4973f678bdf6aaa3b3309843f9215cfa520e9c85` |
+| `workloop-cli-x86_64-apple-darwin.tar.xz` | `9a56f7cc94bdf364e65fd0837d7275fd0290164c7b9dc2ba7f571d4cb1750dcf` |
+| `workloop-cli-aarch64-unknown-linux-gnu.tar.xz` | `765be9d6b1a6ee8bc2748b1bad180e401698ce535dc3b474a1d3d39ef9ffa68a` |
+| `workloop-cli-x86_64-unknown-linux-gnu.tar.xz` | `5b1c754d6cf74a88fe712dc535844b515743e1800d220a70827788bec54f3d9d` |
+| `workloop-tui-aarch64-apple-darwin.tar.xz` | `a387cb99ae3f92a643786099f8e23e3a15b6e729ac08f47be07303b19538e993` |
+| `workloop-tui-x86_64-apple-darwin.tar.xz` | `18f7c535ba514a281c92f8eef80458365efa3693e9c56eb552db376849a6881f` |
+| `workloop-tui-aarch64-unknown-linux-gnu.tar.xz` | `bf1e95212cef63ee798b1877f33c322c5fceb16dfe7898aefb1abfaffc51be72` |
+| `workloop-tui-x86_64-unknown-linux-gnu.tar.xz` | `f624024ae9b6c9d76fee647bdf6789265ef7fef4682e2178636e8d24a692cd89` |
+| `workloop-selector-aarch64-apple-darwin.tar.xz` | `184e942f2e3beaf149ecc9a09a371f5b9bd075b8213dc7318bffe054983fa7b8` |
+| `workloop-selector-x86_64-apple-darwin.tar.xz` | `e182893855c0431c656680e5a5ab3bbe2727faa5c5773defeb736d8aad54ea6e` |
+| `workloop-selector-aarch64-unknown-linux-gnu.tar.xz` | `3116fede992b0f0e661d0327516e2d0dce7fbb6064b9bb96ef90c79a7e6db762` |
+| `workloop-selector-x86_64-unknown-linux-gnu.tar.xz` | `99dd8d021e11ef2071ea39c5c6eca6830c869dd6e70062ff2da4620303fd00a2` |
+| `taisan-worker-claude-aarch64-apple-darwin.tar.xz` | `0e9e75f243a6e5b8861a311f0b2c4ade7a0d55a575b77fc0f949256f262bcac9` |
+| `taisan-worker-claude-x86_64-apple-darwin.tar.xz` | `2dcfa8c038cc7c05f35132036822aa45906fb23763b27fc3293c90f027b0feb3` |
+| `taisan-worker-claude-aarch64-unknown-linux-gnu.tar.xz` | `f278d618905ff63ac8f9254bd78e1b0b6d8ab338188394f184c5666e08ea0c35` |
+| `taisan-worker-claude-x86_64-unknown-linux-gnu.tar.xz` | `bf927d43b1c483e2cc0055d1ed2a6c57d5f61fe2dd21cbd4a2d12123d9818e7e` |
+| `workloop-fixture-worker-aarch64-apple-darwin.tar.xz` | `563182b40658fdb66e070c28f0852efbe3c0819bab8246047abf034bd8f9a32f` |
+| `workloop-fixture-worker-x86_64-apple-darwin.tar.xz` | `4531202b1b20f18c6b1f7ff4e5a3a38552b781cde452b3166e1b3cbc89f4c1cb` |
+| `workloop-fixture-worker-aarch64-unknown-linux-gnu.tar.xz` | `cf4aad3707deca8ae462bd62605072662d09560e99ea5a705ef12e1ab0193625` |
+| `workloop-fixture-worker-x86_64-unknown-linux-gnu.tar.xz` | `a66010af9c27315072b2b74190c220a64dbb7f36fd7ed38253f524e88dbf887b` |
+| `source.tar.gz` | `e2dc46dd10a7675036c71f50ddc28203681d243e1eae72f7769effa6957fc276` |
+
+The source-build path above remains supported independently.
 
 ## Known limitations
 
