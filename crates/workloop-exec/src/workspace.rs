@@ -1088,6 +1088,19 @@ fn build_staging(
     seed_residue_excludes(&staging.join(".git")).map_err(PreparationError::Io)?;
     match predecessor {
         None => {
+            // Trust boundary: `source.path` is the operator-configured
+            // local mirror (the dispatch profile's `source_path`), never
+            // a worker workspace, so fetching from it is inside the
+            // trust boundary. `git fetch <path>` spawns `git-upload-pack`
+            // in that source; git strips `GIT_CONFIG_PARAMETERS` (the
+            // `-c` scope) and `GIT_CONFIG_COUNT` (the environment scope)
+            // from the spawned server's environment, so
+            // `GIT_CONFIG_ARGS`/`git_env` cannot unset its repo-local
+            // config. What the server does read is the trusted source's
+            // own configuration, exec-capable keys included; that is
+            // trusted input because the mirror is installation-owned,
+            // and the untrusted worker workspace is never a fetch
+            // source.
             let src = source.path.to_string_lossy().into_owned();
             git(
                 staging,
@@ -1110,6 +1123,15 @@ fn build_staging(
             }
         }
         Some((artifact_id, handoff_repo)) => {
+            // Trust boundary: the handoff repository is
+            // installation-owned and holds only verified imported
+            // objects, so it is inside the trust boundary just like the
+            // operator-configured source mirror. `git fetch <path>`
+            // still spawns `git-upload-pack` in it and that server keeps
+            // its own repo-local config, because git strips the client
+            // `-c`/environment config from the spawned server; that
+            // config is installation-owned, and the untrusted workspace
+            // is never a fetch source.
             let src = handoff_repo.to_string_lossy().into_owned();
             let reference = handoff::artifact_ref(artifact_id);
             git(
