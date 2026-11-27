@@ -287,8 +287,9 @@ Under a profile with `sandbox_primitive: None` (the registry's
 prepare is accepted and the credential is staged — but it is never
 delivered through the contract's read-only mount, and the secret file
 sits at a predictable host path the same-UID worker can read anyway.
-Worse, in uncontained mode the worker shares the host filesystem: it can
-read *every* request's staged `runtime-auth`, the endpoint's own
+Under the accepted-risk uncontained deployment the exposure compounds:
+the worker shares the host filesystem — it can read *every* request's
+staged `runtime-auth`, the endpoint's own
 `endpoint_credential_file`/`coordinator_credential_file` (mode 0600 is
 no barrier to the same UID), and forge `stop-intent`/`binding` records —
 the sealed digest is an unkeyed self-check, recomputable by the writer.
@@ -298,10 +299,19 @@ exists exactly to prevent this overstated claim — `runtime_auth_delivery`
 should sit on the contained side, or prepare should refuse
 `runtime_auth_mount` when the gate is `Uncontained`.
 
-**Scenario:** an operator configures `fixture-worker-v0.1` on a real
-endpoint; a worker harvests the session credentials, impersonates the
-coordinator (`coordinator_handshake` from `channel.rs:119`), and issues
-arbitrary operations to its own endpoint.
+**Scenario:** an operator runs an uncontained profile
+(`fixture-worker-v0.1`) and a coordinator — trusting the declared
+`runtime_auth_delivery` — prepares with `runtime_auth_mount: true`.
+Prepare succeeds, the credential is staged, and start passes the
+`has_credential` gate, but the uncontained launch arm mounts nothing:
+the contract §7 read-only delivery never happens, the secret sits at a
+predictable host path, and nothing reports the degrade. The endpoint
+advertised a delivery channel it did not provide. The further
+escalation — a same-UID Worker reading the staged secret and the
+endpoint's own session credentials, then impersonating the coordinator
+(`coordinator_handshake` from `channel.rs:119`) — rides on the
+same-UID / fixture-profile deployments already listed in Accepted
+risks; the capability misdeclaration above does not.
 
 **Direction:** move `runtime_auth_delivery` into the contained
 capability set or refuse the mount under uncontained launch.

@@ -9,12 +9,15 @@ what depth, and where the results are recorded. It complements `SECURITY.md`
 | Layer | Coverage | Enforcement |
 | --- | --- | --- |
 | `rust.yml` CI | `cargo fmt --check`, `cargo build --workspace`, `cargo test --workspace` (including the `workloop-executor` contract suite under bwrap), `cargo clippy --workspace --all-targets -- -D warnings` | every push and PR |
-| Dependency scanning | none — no `cargo audit`, Dependabot, or lockfile vetting is wired | gap |
-| Secret scanning | none — no Gitleaks/TruffleHog on commits | gap |
+| Dependency scanning | Dependabot version updates weekly for `cargo` and `github-actions` (`.github/dependabot.yml`, 7-day cooldown) + Dependabot security updates (repo setting); no `cargo audit`/`cargo deny` lockfile vetting | weekly + advisory-driven |
+| Secret scanning | GitHub secret scanning with push protection (repo setting); no committed in-CI scanner (Gitleaks/TruffleHog) | every push |
 
-The two gaps mean credential-adjacent changes and dependency updates lean
-entirely on the review layers below. If a scanner lands later, this table is
-where it is announced — the trigger tiers stay unchanged.
+The remaining gaps mean credential-adjacent changes still lean on the
+review layers below — Dependabot covers scheduled and advisory bumps,
+but nothing runs `cargo audit`-style vetting of the lockfile in CI, and
+the two GitHub-side scanners are repo settings, not committed
+configuration. If a scanner lands in the tree later, this table is where
+it is announced — the trigger tiers stay unchanged.
 
 ## Review layers
 

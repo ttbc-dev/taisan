@@ -74,8 +74,13 @@ CLI:
 - **Staged inputs** — coordinator-supplied request/workspace items. Their
   digests and paths are checked, but their *content* drives a Worker.
 - **`credential_ref` values** — a reference may be a mispasted secret; parse
-  and provider refusals never echo it
-  (`crates/workloop-core/src/credential.rs`).
+  refusals never echo it, and provider-resolution refusals are held to the
+  same rule: name only the provider rule that failed
+  (`crates/workloop-core/src/credential.rs`,
+  `crates/workloop-exec/src/credentials.rs`,
+  `crates/workloop-github/src/credential.rs`).
+  `docs/security/audit-v0.3.md` F10 records residual echoes of slot fields
+  on provider paths as a defect against this rule, tracked for follow-up.
 
 ## Invariants
 
@@ -88,8 +93,12 @@ is right.
 - `credential_ref` names a provider slot (`env:`/`file:`/`command:`), never
   a value. Refusals never echo the reference.
 - Resolved credentials never appear in argv, env, request bodies, receipts,
-  evidence, logs, or error messages. `ResolvedCredential` has no `Display`
-  and a redacted `Debug`; `ExecutorService` has no `Debug` at all.
+  evidence, logs, or error messages. `ResolvedCredential` is unformattable
+  or redacted at each boundary: `workloop-exec`'s has no `Display` and a
+  redacted `Debug`; `workloop-github`'s `Display`/`Debug` render
+  `<redacted>`; `ExecutorService` has no `Debug` at all (audit v0.3 F2
+  records `CoordinatorEndpoint` deriving `Debug` over raw credentials —
+  a tracked defect).
 - `file:` providers require an absolute path resolving to a regular file
   owned by the effective user with `mode & 0o077 == 0`, checked after
   symlink resolution (`crates/workloop-exec/src/credentials.rs`,
@@ -140,7 +149,8 @@ is right.
 - Declared capabilities are honest: contained capabilities are only
   advertised when the configured profile carries a sandbox primitive;
   a `read_only` workspace grant without enforceable containment refuses at
-  prepare.
+  prepare (audit v0.3 F9 records `runtime_auth_delivery` declared
+  unconditionally — a tracked defect against this honesty rule).
 - Errors name typed classes (`credential.missing`/`unresolvable`,
   `capability_missing`, `incarnation_mismatch`, …) and never carry secret
   material.
