@@ -7136,6 +7136,10 @@ mod tests {
         let launch = "bwrap --ro-bind /r/runtime-auth.p9.i1.0 /taisan/runtime-auth -- sh";
         let rebuilt = "bwrap --ro-bind /r/runtime-auth.p9.i1.4 /taisan/runtime-auth -- sh";
         assert_eq!(normalize_signature(launch), normalize_signature(rebuilt));
+        // A restarted supervisor stages under a new owner tag *and*
+        // seq; re-binding the orphan still finds the launch signature.
+        let restarted = "bwrap --ro-bind /r/runtime-auth.p77.i9.2 /taisan/runtime-auth -- sh";
+        assert_eq!(normalize_signature(launch), normalize_signature(restarted));
         // Whitespace is normalized as part of the same pass.
         assert_eq!(normalize_signature("a  b\tc"), "a b c");
     }
