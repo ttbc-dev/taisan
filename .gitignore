@@ -1,1 +1,23 @@
 /target
+
+.DS_Store
+
+# Credentials and secrets — the workspace handles app tokens and
+# reference-based credentials (crates/workloop-core/src/credential.rs,
+# scripts/s1/mint-app-token.py); never commit them.
+.env
+.env.*
+*.pem
+*.key
+*.token
+*-credentials.json
+secrets/
+
+# Agent-local state
+.claude/settings.local.json
+.mcp.json
+opencode.json
+.worktrees/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+graft/
