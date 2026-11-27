@@ -109,7 +109,7 @@ fn source_repo(root: &Path) -> (RepositoryRef, PathBuf, String) {
 
 fn config(repository: &RepositoryRef) -> WorkloopConfig {
     WorkloopConfig {
-        placement: workloop_core::placement::PlacementPolicy::default(),
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repository.clone(),

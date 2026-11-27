@@ -61,7 +61,7 @@ fn role_binding(role: ActorRole, slug: &str, credential_ref: &str) -> RoleBindin
 
 fn config_with(repository: &RepositoryRef, actors: Vec<RoleBinding>) -> WorkloopConfig {
     WorkloopConfig {
-        placement: workloop_core::placement::PlacementPolicy::default(),
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repository.clone(),

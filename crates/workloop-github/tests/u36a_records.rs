@@ -73,7 +73,7 @@ fn writer() -> HostActorRef {
 
 fn config(adapter: &str) -> WorkloopConfig {
     WorkloopConfig {
-        placement: workloop_core::placement::PlacementPolicy::default(),
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted(adapter),
             repository: repo(),

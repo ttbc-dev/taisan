@@ -87,7 +87,7 @@ fn config(issue_read: bool) -> WorkloopConfig {
         capabilities.push(HostCapability::IssueRead);
     }
     WorkloopConfig {
-        placement: workloop_core::placement::PlacementPolicy::default(),
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo("repo-a"),

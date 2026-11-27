@@ -222,12 +222,12 @@ pub struct Installation {
     /// Executor placement (`docs/remote-executor.md` §2.2, #379):
     /// per-role `local`/`remote` targets, the separate verification
     /// placement, and the one static endpoint descriptor. Held as raw
-    /// JSON like `selector`: the shape is parsed and validated at the
-    /// `executor_placement`/`workloop_config` boundary — a structurally
-    /// malformed block is a bounded config error for the run path,
-    /// never a load failure that blocks every other command. Absent
-    /// means the v0.3 all-local placement — no new mandatory
-    /// configuration.
+    /// JSON like `selector`: `executor_placement` parses and validates
+    /// the shape and the outcome rides `WorkloopConfig` as a `Result`,
+    /// so a structurally malformed block is a bounded config error at
+    /// the dispatch boundary — never a load or `workloop_config`
+    /// failure that blocks every other command. Absent means the
+    /// v0.3 all-local placement — no new mandatory configuration.
     #[serde(default)]
     pub placement: Option<serde_json::Value>,
 }
@@ -1016,9 +1016,10 @@ impl Installation {
     /// through a known provider shape, and a `remote` target requires
     /// both the endpoint descriptor and `worker_dispatch` — the
     /// complete bound-request transport is the only remote dispatch
-    /// path. Validation happens at this boundary, never at file load:
-    /// a malformed section fails the run path with a bounded error,
-    /// not every command.
+    /// path. Validation happens here, never at file load or
+    /// `workloop_config` resolution: a malformed section's bounded
+    /// error rides the config to the dispatch boundary — admission
+    /// refuses to bind under it — instead of failing every command.
     pub fn executor_placement(&self) -> Result<PlacementPolicy, String> {
         let Some(raw) = &self.placement else {
             return Ok(PlacementPolicy::default());
@@ -1167,7 +1168,11 @@ impl Installation {
     /// The installation file is external input: every identity string,
     /// role name, and capability name is validated at this boundary —
     /// an unparseable value is a hard error, never a silently degraded
-    /// or mis-bound configuration.
+    /// or mis-bound configuration. The `placement` section is the one
+    /// deliberate exception: its validation *outcome* rides
+    /// `WorkloopConfig.placement` as a `Result`, so a malformed block
+    /// gates the dispatch paths that consume it instead of failing
+    /// config resolution for every command.
     pub fn workloop_config(&self) -> Result<WorkloopConfig, String> {
         let host = self.host_instance_id()?;
         let repository_id = RepositoryId::new(self.repository.clone())
@@ -1262,7 +1267,7 @@ impl Installation {
             }),
             budget: self.budget.clone().unwrap_or_default(),
             policy: self.policy.clone().unwrap_or_default(),
-            placement: self.executor_placement()?,
+            placement: self.executor_placement(),
         })
     }
 

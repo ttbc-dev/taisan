@@ -1,14 +1,15 @@
 //! The executor-placement configuration contract (#379,
 //! `docs/remote-executor.md` §2.2): the section is owned by
 //! `workloop-config`, carries an explicit `schema_version`, and is
-//! fail-closed at the `executor_placement`/`workloop_config` boundary —
-//! an unknown version, unknown key, or malformed endpoint is a hard
-//! configuration error, never a silent default. An absent section is
-//! the only exception: it resolves to the implicit all-local v0.3
-//! policy, so a local-only installation needs zero new fields. The
-//! block rides the installation record as raw JSON, so a malformed
-//! section fails the run path only — never `load`, `submit`, or any
-//! other command.
+//! fail-closed at the `executor_placement` boundary — an unknown
+//! version, unknown key, or malformed endpoint is a hard configuration
+//! error, never a silent default. An absent section is the only
+//! exception: it resolves to the implicit all-local v0.3 policy, so a
+//! local-only installation needs zero new fields. The block rides the
+//! installation record as raw JSON and its validation outcome rides
+//! `WorkloopConfig.placement` as a `Result`, so a malformed section
+//! fails the run path only — never `load`, `submit`, or any other
+//! command.
 
 use workloop_config::Installation;
 use workloop_core::domain::InvocationRole;
@@ -308,8 +309,8 @@ fn all_remote_binds_every_role_to_the_one_endpoint() {
     }
 }
 
-/// `workloop_config` carries the validated policy — the same surface
-/// admission stamps bindings from.
+/// `workloop_config` carries the validation outcome — the same
+/// surface admission stamps bindings from.
 #[test]
 fn workloop_config_wires_the_validated_policy() {
     let inst = installation(serde_json::json!({
@@ -322,12 +323,21 @@ fn workloop_config_wires_the_validated_policy() {
     }));
     let policy = inst.executor_placement().unwrap();
     let config = inst.workloop_config().unwrap();
-    assert_eq!(config.placement, policy);
+    assert_eq!(config.placement, Ok(policy));
+}
 
-    // The same malformed section fails `workloop_config` — the run
-    // path — without ever reaching load-time validation.
+/// The malformed section's bounded error rides the config instead of
+/// failing it: `workloop_config` resolves for submit/status/inspect
+/// and every other command, and only the dispatch paths that consume
+/// `config.placement` fail closed.
+#[test]
+fn malformed_placement_defers_to_the_dispatch_boundary() {
     let bad = installation(serde_json::json!({
         "placement": { "schema_version": PLACEMENT_SCHEMA_VERSION + 5 }
     }));
-    assert!(bad.workloop_config().is_err());
+    let config = bad.workloop_config().unwrap();
+    let err = config
+        .placement
+        .expect_err("the section's bounded error rides the config");
+    assert!(err.contains("unsupported"), "unexpected error: {err}");
 }

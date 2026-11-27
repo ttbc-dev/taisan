@@ -310,7 +310,7 @@ fn host() -> HostInstanceId {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
-        placement: workloop_core::placement::PlacementPolicy::default(),
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: RepositoryRef::new(host(), RepositoryId::trusted("repo")),

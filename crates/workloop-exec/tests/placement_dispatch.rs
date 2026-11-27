@@ -88,7 +88,7 @@ fn remote_coding_policy() -> PlacementPolicy {
 
 fn config(placement: PlacementPolicy) -> WorkloopConfig {
     WorkloopConfig {
-        placement,
+        placement: Ok(placement),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),
@@ -658,6 +658,14 @@ fn remote_unavailable_inside_the_driver_is_the_bound_refusal() {
             .unwrap()
             .is_none()
     );
+    // The bound-request body was already durable when the verdict
+    // landed — the refused request's immutable record stays readable.
+    assert!(
+        store
+            .transact(|tx| tx.worker_request_body(&rid))
+            .unwrap()
+            .is_some()
+    );
 }
 
 /// A coordinator-side `Fault` inside the driver is not a verdict: the
@@ -909,4 +917,213 @@ fn work_detail_explains_executor_role_liveness_and_refusal() {
     assert!(!serialized.contains("TAISAN_COORDINATOR_KEY"));
     assert!(!serialized.contains("endpoint_credential_ref"));
     assert!(!serialized.contains("coordinator_credential_ref"));
+}
+
+/// The validation outcome rides `WorkloopConfig.placement` as a
+/// `Result` (#379): a malformed section fails only the dispatch
+/// boundary — submit resolves the same config fine and admission
+/// holds the Execution for operator repair instead of minting a
+/// request under an unvalidated policy.
+#[test]
+fn an_invalid_placement_resolution_pauses_admission_for_repair() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut cfg = config(remote_coding_policy());
+    cfg.placement =
+        Err("installation placement.schema_version: unsupported 9 — this build reads 1".into());
+
+    // Submit — a store-backed command that never dispatches —
+    // resolves the same config and accepts the Work.
+    let d = handle_command(
+        &store,
+        &cfg,
+        &CommandRequest {
+            actor: Actor {
+                kind: ActorKind::Human,
+                external_id: "op".into(),
+            },
+            origin: Origin("cli".into()),
+            idempotency_key: "bad-placement".into(),
+            body: CommandBody::Submit {
+                intent: "intent-bad-placement".into(),
+                sources: vec![],
+                constraints: vec![],
+                verification_argv: vec![],
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    let (w, e) = match d {
+        CommandDecision::Accepted {
+            work_id, effect, ..
+        } => {
+            let eid = match effect {
+                CommandEffect::WorkCreated { execution_id } => execution_id,
+                other => panic!("unexpected effect {other:?}"),
+            };
+            (work_id.unwrap(), eid)
+        }
+        other => panic!("submit rejected: {other:?}"),
+    };
+
+    // The dispatch boundary fails closed: no request binds, and the
+    // Execution pauses for operator repair under the bounded error.
+    let admitted = store
+        .transact(|tx| admit_queued(tx, &cfg, &e, NOW))
+        .unwrap();
+    assert!(
+        admitted.is_none(),
+        "nothing binds under an unvalidated policy"
+    );
+    assert!(pending_ids(&store).is_empty());
+    let execution = store
+        .transact(|tx| tx.execution(&e))
+        .unwrap()
+        .expect("execution");
+    assert_eq!(execution.state, ExecutionState::Paused);
+    assert!(
+        execution
+            .pause_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("placement")),
+        "the pause names the bounded error: {:?}",
+        execution.pause_reason
+    );
+    assert_eq!(
+        execution.repair_prerequisites,
+        vec![RepairPrerequisite::OperatorDecision]
+    );
+
+    // The repaired policy admits the same Execution — the hold was
+    // scoped to the invalid resolution, never the Work.
+    cfg.placement = Ok(remote_coding_policy());
+    let version = store
+        .transact(|tx| tx.work(&w))
+        .unwrap()
+        .map(|w| w.version)
+        .expect("work exists");
+    let d = handle_command(
+        &store,
+        &cfg,
+        &CommandRequest {
+            actor: Actor {
+                kind: ActorKind::Human,
+                external_id: "op".into(),
+            },
+            origin: Origin("cli".into()),
+            idempotency_key: "resume-bad-placement".into(),
+            body: CommandBody::Resume {
+                work_id: w.clone(),
+                expected_work_version: version,
+                execution_id: e.clone(),
+            },
+        },
+        NOW + 1,
+    )
+    .unwrap();
+    assert!(
+        matches!(d, CommandDecision::Accepted { .. }),
+        "resume: {d:?}"
+    );
+    let admitted = store
+        .transact(|tx| admit_queued(tx, &cfg, &e, NOW + 1))
+        .unwrap();
+    assert!(admitted.is_some(), "the repaired policy admits");
+    let binding = request_of(&store, &format!("{}:inv:0", e.0))
+        .placement
+        .expect("binding");
+    assert_eq!(binding.target, PlacementTarget::Remote);
+}
+
+/// The remote run's bound-request body is durable before the port is
+/// crossed (#379): `worker_request_body` decides v2-ness for report
+/// and assessment reads, so the remote path carries the same durable
+/// body row the local consume commit writes.
+#[test]
+fn remote_dispatch_persists_the_worker_request_body() {
+    let root = tmp_root("body-row");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _b, _n) = git_source(&root);
+    let cfg = config(remote_coding_policy());
+    let (_w, _e, rid) = admit(&store, "body-row", &cfg);
+    let port = std::sync::Arc::new(ScriptedRemoteDispatch {
+        calls: AtomicUsize::new(0),
+        last_body: Mutex::new(None),
+        outcome: Mutex::new(Scripted::Commit),
+    });
+    let sup = supervisor_v2(&root, &state_root, &src, cfg).with_remote_dispatch(port.clone());
+
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let body = store
+        .transact(|tx| tx.worker_request_body(&rid))
+        .unwrap()
+        .expect("the remote dispatch recorded the bound-request body");
+    assert!(body.verifies());
+    assert_eq!(
+        String::from_utf8_lossy(&body.canonical_body),
+        port.last_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the port saw a body"),
+        "the durable row is exactly what the port received"
+    );
+}
+
+/// A faulted remote dispatch resumes under the recorded body: the
+/// durable row supplies both the bytes and the Invocation identity,
+/// so a later pass never rebuilds under a second identity.
+#[test]
+fn a_faulted_remote_dispatch_resumes_under_the_recorded_body() {
+    let root = tmp_root("body-resume");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _b, _n) = git_source(&root);
+    let cfg = config(remote_coding_policy());
+    let (_w, _e, rid) = admit(&store, "body-resume", &cfg);
+    let port = std::sync::Arc::new(ScriptedRemoteDispatch {
+        calls: AtomicUsize::new(0),
+        last_body: Mutex::new(None),
+        outcome: Mutex::new(Scripted::Fault("store write lost")),
+    });
+    let sup = supervisor_v2(&root, &state_root, &src, cfg).with_remote_dispatch(port.clone());
+
+    assert!(sup.consume_requests(&store, NOW).is_err());
+    let recorded = store
+        .transact(|tx| tx.worker_request_body(&rid))
+        .unwrap()
+        .expect("the body row is durable across the fault");
+    assert!(
+        pending_ids(&store).contains(&rid),
+        "a faulted dispatch leaves the request pending"
+    );
+
+    *port.outcome.lock().unwrap() = Scripted::Commit;
+    sup.consume_requests(&store, NOW + 60).unwrap();
+
+    assert_eq!(port.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        port.last_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("replayed body"),
+        String::from_utf8_lossy(&recorded.canonical_body),
+        "the resume replayed the recorded bytes"
+    );
+    let invocation = store
+        .transact(|tx| tx.invocation_for_request(&rid))
+        .unwrap()
+        .expect("the resumed commit recorded the Invocation");
+    let wire = workloop_core::worker_v2::WorkerRequestV2::parse(&recorded.canonical_body)
+        .expect("recorded body parses");
+    assert_eq!(
+        invocation.id.0, wire.invocation_id,
+        "the resume bound the Invocation identity the body was built under"
+    );
+    assert!(!pending_ids(&store).contains(&rid));
 }

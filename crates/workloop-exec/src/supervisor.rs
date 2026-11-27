@@ -2894,28 +2894,53 @@ impl<P: ProcessControlPort> Supervisor<P> {
 
         // The remote run only ever carries the complete bound-request
         // transport: the same immutable body a local v2 launch
-        // materializes, durable before any remote operation exists.
-        let body = match crate::request_v2::build_request_body(
-            store,
-            dispatch,
-            request,
-            &invocation_id.0,
-            now_unix_seconds,
-        ) {
-            Ok(body) => body,
-            Err(crate::request_v2::BuildError::Refusal(refusal)) => {
-                return self.refuse_dispatch(
-                    store,
-                    request,
-                    &invocation_id.0,
-                    refusal,
-                    now_unix_seconds,
-                );
-            }
-            Err(crate::request_v2::BuildError::Fault(detail)) => {
-                return Err(ExecError::Fault(detail));
-            }
-        };
+        // materializes, durable before any remote operation exists so
+        // report and assessment reads resolve it whichever side of the
+        // port the launch ran on. A recorded row is the launch record —
+        // a pass resuming a faulted dispatch replays its bytes and the
+        // Invocation identity it carries, never a rebuild from live
+        // state under a second identity.
+        let (invocation_id, body) =
+            match store.transact(|tx| tx.worker_request_body(&request.request_id))? {
+                Some(body) => {
+                    let invocation_id = WorkerRequestV2::parse(&body.canonical_body)
+                        .map(|wire| InvocationId(wire.invocation_id))
+                        .map_err(|e| {
+                            ExecError::Fault(format!(
+                                "recorded worker request body for {} does not parse: {e}",
+                                request.request_id
+                            ))
+                        })?;
+                    (invocation_id, body)
+                }
+                None => {
+                    let body = match crate::request_v2::build_request_body(
+                        store,
+                        dispatch,
+                        request,
+                        &invocation_id.0,
+                        now_unix_seconds,
+                    ) {
+                        Ok(body) => body,
+                        Err(crate::request_v2::BuildError::Refusal(refusal)) => {
+                            return self.refuse_dispatch(
+                                store,
+                                request,
+                                &invocation_id.0,
+                                refusal,
+                                now_unix_seconds,
+                            );
+                        }
+                        Err(crate::request_v2::BuildError::Fault(detail)) => {
+                            return Err(ExecError::Fault(detail));
+                        }
+                    };
+                    store.transact(|tx| {
+                        tx.apply(&Effect::InsertWorkerRequestBody { body: body.clone() })
+                    })?;
+                    (invocation_id, body)
+                }
+            };
 
         let launch = crate::remote_dispatch::RemoteLaunch {
             dispatch,
@@ -6673,7 +6698,7 @@ mod tests {
             PathBuf::from("/unused"),
             vec![],
             workloop_core::work::WorkloopConfig {
-                placement: workloop_core::placement::PlacementPolicy::default(),
+                placement: Ok(workloop_core::placement::PlacementPolicy::default()),
 
                 host: workloop_core::work::HostTemplate {
                     adapter: workloop_core::identity::AdapterId::trusted("fixture"),
@@ -6789,7 +6814,7 @@ mod tests {
 
     fn scripted_config() -> workloop_core::work::WorkloopConfig {
         workloop_core::work::WorkloopConfig {
-            placement: workloop_core::placement::PlacementPolicy::default(),
+            placement: Ok(workloop_core::placement::PlacementPolicy::default()),
 
             host: workloop_core::work::HostTemplate {
                 adapter: workloop_core::identity::AdapterId::trusted("fixture"),

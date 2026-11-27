@@ -138,7 +138,7 @@ fn config_full(
     actors: Vec<RoleBinding>,
 ) -> WorkloopConfig {
     WorkloopConfig {
-        placement: workloop_core::placement::PlacementPolicy::default(),
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted(adapter_id),
             repository: repository.clone(),
