@@ -36,35 +36,6 @@ fn usage_exit() -> ! {
     std::process::exit(2);
 }
 
-/// The contract worker only ever runs under an in-process supervisor:
-/// once its launching process is gone — the test binary was killed,
-/// timed out, or crashed — nothing remains to stop it, and a leaked
-/// worker keeps the caller's inherited output pipes open, which is
-/// what wedged a remote verify run for ~24h. The unbounded modes
-/// therefore exit as soon as their parent changes — an orphan has no
-/// supervisor left to stop it.
-fn exit_when_orphaned() {
-    let parent = parent_pid();
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(Duration::from_millis(250));
-            let now = parent_pid();
-            // `now == 1` covers the spawn/death race: reparented to init
-            // before the original parent could be recorded.
-            if now != parent || now == 1 {
-                std::process::exit(0);
-            }
-        }
-    });
-}
-
-fn parent_pid() -> i32 {
-    unsafe extern "C" {
-        fn getppid() -> i32;
-    }
-    unsafe { getppid() }
-}
-
 fn workspace() -> PathBuf {
     std::env::current_dir().expect("contract worker has a cwd")
 }
@@ -151,7 +122,7 @@ fn heartbeat_forever(ws: &Path, interval: Duration) -> ! {
         report(serde_json::json!({"evidence": "denied-host-write"}));
         std::process::exit(3);
     };
-    exit_when_orphaned();
+    workloop_orphan_guard::exit_when_orphaned(workloop_orphan_guard::Guardian::Parent);
     loop {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
@@ -432,6 +403,12 @@ fn git_commit_produced(ws: &Path) {
 /// the commit the Worker just made. An unreadable or non-JSON request
 /// is a worker-side failure — exit non-zero, never a silent pass.
 fn run_request(args: &Args, ws: &Path) {
+    // Arm the parent-death watchdog before touching the request: a hang
+    // without a bounded wait must not outlive a launcher that dies while
+    // the request is read or the report is written.
+    if args.mode == "hang" {
+        workloop_orphan_guard::exit_when_orphaned(workloop_orphan_guard::Guardian::Parent);
+    }
     let request_path = args.request.clone().unwrap_or_else(|| {
         eprintln!("run requires --request");
         std::process::exit(2);
@@ -591,7 +568,6 @@ fn run_request(args: &Args, ws: &Path) {
     // `hang` is the only behavior left: the report is already on disk
     // — the stop paths collect it after the proven stop.
     if args.mode == "hang" {
-        exit_when_orphaned();
         loop {
             std::thread::sleep(Duration::from_secs(3600));
         }
@@ -644,9 +620,10 @@ fn main() {
                 "worker": "contract-v1",
             }));
         }
-        // Never exits on its own — the suite's stop-proof target.
+        // Waits without a bound — the suite's stop-proof target — but
+        // exits if the launching process dies.
         "hang" => {
-            exit_when_orphaned();
+            workloop_orphan_guard::exit_when_orphaned(workloop_orphan_guard::Guardian::Parent);
             loop {
                 std::thread::park();
             }
@@ -668,7 +645,7 @@ fn main() {
                 report(serde_json::json!({"evidence": "denied-host-write"}));
                 std::process::exit(3);
             };
-            exit_when_orphaned();
+            workloop_orphan_guard::exit_when_orphaned(workloop_orphan_guard::Guardian::Parent);
             loop {
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)

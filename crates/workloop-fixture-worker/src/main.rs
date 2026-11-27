@@ -332,6 +332,12 @@ fn git_commit_produced(ws: &Path) {
 /// unreadable or non-JSON request is a worker-side failure — exit
 /// non-zero, never a silent pass.
 fn run_request(args: &Args, ws: &Path) {
+    // The hang behavior waits without a bound; arm the parent-death
+    // watchdog before touching the request so a launcher that dies while
+    // the request is read or the report is written is still observed.
+    if args.mode == "hang" {
+        workloop_orphan_guard::exit_when_orphaned(workloop_orphan_guard::Guardian::Parent);
+    }
     let request_path = args.request.clone().unwrap_or_else(|| {
         eprintln!("run requires --request");
         std::process::exit(2);
@@ -511,7 +517,6 @@ fn run_request(args: &Args, ws: &Path) {
     // `hang` is the only behavior left: the report is already on disk
     // — the stop paths collect it after the proven stop.
     if behavior == "hang" {
-        exit_when_orphaned();
         loop {
             std::thread::sleep(Duration::from_secs(3600));
         }
@@ -551,10 +556,11 @@ fn main() {
         "exit-no-artifact" => {
             println!("{}", serde_json::json!({"evidence": "exit-no-artifact"}));
         }
-        // Never exits on its own; the stop target. Default signal
-        // disposition — SIGTERM/SIGKILL end it.
+        // Waits without a bound — the stop target — but exits if the
+        // launching process dies. Default signal disposition:
+        // SIGTERM/SIGKILL end it.
         "hang" => {
-            exit_when_orphaned();
+            workloop_orphan_guard::exit_when_orphaned(workloop_orphan_guard::Guardian::Parent);
             loop {
                 std::thread::sleep(Duration::from_secs(3600));
             }
@@ -594,7 +600,7 @@ fn main() {
                 .expect("spawn short-lived child");
             // Deliberately never wait: the child stays a zombie of this
             // process while it hangs.
-            exit_when_orphaned();
+            workloop_orphan_guard::exit_when_orphaned(workloop_orphan_guard::Guardian::Parent);
             loop {
                 std::thread::sleep(Duration::from_secs(3600));
             }
@@ -603,7 +609,7 @@ fn main() {
         // also recreates it — documenting why rename is not a fence.
         "path-reopen" | "makedirs-writer" => {
             let recreate = args.mode == "makedirs-writer";
-            exit_when_orphaned();
+            workloop_orphan_guard::exit_when_orphaned(workloop_orphan_guard::Guardian::Parent);
             loop {
                 let path = ws.join("heartbeat.log");
                 if recreate {
@@ -619,8 +625,11 @@ fn main() {
                 std::thread::sleep(args.interval);
             }
         }
-        // Internal modes used by the parent modes above.
+        // Internal modes used by the parent modes above. It deliberately
+        // outlives its fixture leader, so it watches the harness above
+        // that leader rather than its direct parent.
         "escaped-writer" => {
+            workloop_orphan_guard::exit_when_orphaned(workloop_orphan_guard::Guardian::Grandparent);
             let path = ws.join(&args.file);
             loop {
                 if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -657,36 +666,6 @@ fn main() {
             std::process::exit(2);
         }
     }
-}
-
-/// The fixture only ever runs under an in-process supervisor: once its
-/// launching process is gone — the test binary was killed, timed out,
-/// or crashed — nothing remains to stop it, and a leaked worker keeps
-/// the caller's inherited output pipes open, which is what wedged a
-/// remote verify run for ~24h. The unbounded modes therefore exit as
-/// soon as their parent changes — an orphan has no supervisor left to
-/// stop it. `escaped-writer` is the deliberate exception: surviving
-/// its leader's exit is the scenario it exists to prove.
-fn exit_when_orphaned() {
-    let parent = parent_pid();
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(Duration::from_millis(250));
-            let now = parent_pid();
-            // `now == 1` covers the spawn/death race: reparented to init
-            // before the original parent could be recorded.
-            if now != parent || now == 1 {
-                std::process::exit(0);
-            }
-        }
-    });
-}
-
-fn parent_pid() -> i32 {
-    unsafe extern "C" {
-        fn getppid() -> i32;
-    }
-    unsafe { getppid() }
 }
 
 fn libc_setsid() {
