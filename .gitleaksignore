@@ -1,0 +1,10 @@
+# Fingerprints suppressed for the gitleaks history scan (issue #490).
+# All five are `generic-api-key` hits on hex identifiers in fixtures —
+# selector candidate keys and actor IDs in test data and doc examples —
+# not credentials. Each fingerprint binds one finding at one commit so
+# future matches still surface.
+c1355b0cd2c8a2ae23f8761158c38f715fe2976e:crates/workloop-exec/tests/request_v2_dispatch.rs:generic-api-key:4302
+7b3c24c2c3f55d0885bbb9d86dbb37a9f18e0940:docs/examples/selector-protocol/grouped-response.json:generic-api-key:10
+17a67c0d8e111df6408d32bd8c41619c29068c7e:docs/skill-walkthrough.md:generic-api-key:607
+17a67c0d8e111df6408d32bd8c41619c29068c7e:docs/skill-walkthrough.md:generic-api-key:636
+17a67c0d8e111df6408d32bd8c41619c29068c7e:docs/skill-walkthrough.md:generic-api-key:668

@@ -1,0 +1,47 @@
+name: Gitleaks
+
+# Secret scan over full git history on pull requests and pushes to main
+# (issue #490).
+#
+# gitleaks/gitleaks-action is deliberately not used: this repository is
+# owned by an organization account, and the action refuses to run on
+# org-owned repos without a GITLEAKS_LICENSE secret (it exits before the
+# scan). The digest-pinned official image runs the same gitleaks engine
+# directly — no token, no license, nothing leaves the runner.
+#
+# The history scan flags five pre-existing fixture strings (hex
+# identifiers in tests and doc examples, not credentials); those exact
+# fingerprints are suppressed by .gitleaksignore at the repo root so the
+# job stays a meaningful signal. Revisit that file before treating it as
+# a settled disposition — see the issue-490 notes.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Jobs grant their own GITHUB_TOKEN permissions; the default is none.
+permissions: {}
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # gitleaks scans committed objects; the PR merge ref plus a
+          # full clone covers both the incoming diff and every reachable
+          # commit.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The image is pinned by multi-arch index digest — the container
+      # analog of the commit-SHA pins enforced on `uses:` refs.
+      - name: Scan history for secrets
+        run: >-
+          docker run --rm
+          -v "$GITHUB_WORKSPACE:/repo:ro"
+          zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
+          git /repo --redact

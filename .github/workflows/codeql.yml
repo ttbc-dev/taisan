@@ -1,0 +1,85 @@
+name: CodeQL
+
+# Semantic scanning layer (issue #490). `actions` analyses the workflow
+# files themselves; `rust` analyses the workspace source. Rust support
+# and build-less database creation are GA since CodeQL CLI 2.23.3
+# (2025-10-14), so `build-mode: none` covers both languages without a
+# cargo build. The nightly run matters because CodeQL's query packs and
+# bundled databases change independently of this repository — a
+# scheduled run finds what a new query would have flagged in code that
+# has not been touched.
+#
+# Semgrep is deliberately not shipped as a second SAST layer: CodeQL's
+# security-extended suite is the deeper analyzer for this codebase,
+# Semgrep's Rust coverage is thinner, and `semgrep ci` would add a
+# SEMGREP_APP_TOKEN service dependency plus a second triage surface for
+# marginal incremental coverage. Revisit if fast PR-time pattern rules
+# become a requirement.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly, off the hour: GitHub queues a large number of jobs
+    # scheduled on round times, which delays them.
+    - cron: '41 5 * * *'
+
+# Jobs grant their own GITHUB_TOKEN permissions; the default is none.
+permissions: {}
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+
+    # Pull requests from forks get a read-only GITHUB_TOKEN, so the
+    # SARIF upload (security-events: write) cannot succeed — skip rather
+    # than fail noisily. Pushes to main and the nightly schedule still
+    # scan everything that lands.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
+    permissions:
+      contents: read
+      # Uploading the SARIF results is what needs this.
+      security-events: write
+      # CodeQL reads workflow run status to attribute alerts to runs.
+      actions: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # `actions` covers the workflows; dropping it would narrow
+        # coverage for a repository that pins every action by SHA.
+        # `rust` is GA and build-less since 2025-10-14 (see header).
+        language: [rust, actions]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # build-less Rust extraction still shells out to cargo for
+      # workspace/dependency resolution; pin the same toolchain source
+      # as rust.yml so the scan does not drift with the runner image.
+      - name: Install Rust toolchain
+        if: matrix.language == 'rust'
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
+        with:
+          languages: ${{ matrix.language }}
+          # Neither language needs a build; the analysis reads the
+          # source.
+          build-mode: none
+          # Wider than the `default` suite. The extra dataflow queries
+          # are worth the additional findings to triage for a tool that
+          # bridges credentials into agent execution environments.
+          queries: security-extended
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
+        with:
+          category: /language:${{ matrix.language }}
