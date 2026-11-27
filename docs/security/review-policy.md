@@ -8,7 +8,7 @@ what depth, and where the results are recorded. It complements `SECURITY.md`
 
 | Layer | Coverage | Enforcement |
 | --- | --- | --- |
-| `rust.yml` CI | `cargo fmt --check`, `cargo build --workspace`, `cargo test --workspace` (including the `workloop-executor` contract suite under bwrap), `cargo clippy --workspace --all-targets -- -D warnings` | every push and PR |
+| `rust.yml` CI | `cargo fmt --check`, `cargo build --workspace`, `cargo test --workspace` (including the `workloop-executor` contract suite under bwrap), `cargo clippy --workspace --all-targets -- -D warnings` | every PR and every push to `main` |
 | Dependency scanning | Dependabot version updates weekly for `cargo` and `github-actions` (`.github/dependabot.yml`, 7-day cooldown) + Dependabot security updates (repo setting); no `cargo audit`/`cargo deny` lockfile vetting | weekly + advisory-driven |
 | Secret scanning | GitHub secret scanning with push protection (repo setting); no committed in-CI scanner (Gitleaks/TruffleHog) | every push |
 
@@ -52,8 +52,13 @@ touches a trust-boundary surface:
   resolution and the `gh`/`git` transports that carry it.
 - `docs/executor-transport-contract.md` §2–§8,
   `docs/installation-config.md`, `docs/worker-protocol.md`,
-  `docs/remote-executor-endpoint.md` — normative security text; a wording
+  `docs/remote-executor-endpoint.md`, `docs/identity-storage.md`,
+  `docs/u3.6e-authorization.md` — normative security text; a wording
   change that weakens a guarantee needs the same scrutiny as a code change.
+- `AGENTS.md` — the Trust boundary, Invariants, and Out-of-scope sections:
+  the canonical claimed-invariant list `audit-checklist.md` Step 1 loads
+  before any code pass. A wording change that weakens a guarantee or moves
+  an actor across the trusted/untrusted line needs the same scrutiny.
 - Any change that adds a mount destination, an env passthrough name, a new
   `out/` whitelist member, a new frame format, or a new file read/write
   path over Worker-visible or credential-adjacent trees.

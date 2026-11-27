@@ -192,7 +192,7 @@ staging TTL) and release the credential there; `clear_torn_prepare`
 (`runner.rs:~1327`) should also clear `runtime-auth` for parity.
 **Coverage:** none.
 
-### F6 — MEDIUM: one corrupt binding record silently disables all deadline enforcement
+### F6 — MEDIUM: one corrupt binding record silently disables the deadline sweep
 
 `crates/workloop-executor/src/runner.rs:1051-1054`:
 
@@ -205,8 +205,11 @@ let Ok(requests) = self.state.requests() else {
 `state.requests()` propagates `StateError::Corrupt` on the first
 unreadable or seal-failed `binding.json`. The sweep then returns early —
 every 200 ms tick and every command's leading sweep — with no error
-surfaced. One corrupt record turns deadline enforcement off endpoint-wide
-and silently.
+surfaced. One corrupt record turns the autonomous deadline sweep off
+endpoint-wide and silently. The per-request path still enforces —
+`Runner::observe` calls `enforce_deadline` directly on the record it
+inspects (`runner.rs:975`, `:1001`) — so enforcement survives only where
+observe traffic arrives; nothing about the dead sweep is logged.
 
 The asymmetry is the tell: `op_start` treats the same enumeration error
 as a fail-closed refusal and documents why (`service.rs:804-827`); the
@@ -214,8 +217,9 @@ sweep fails *open* on the same input for the security mechanism that
 bounds authorized runtime.
 
 **Scenario:** a torn write or bit-rot corrupts `requests/<a>/binding.json`.
-A worker on request `<b>` runs past its authorized deadline indefinitely;
-nothing is logged.
+A worker on request `<b>` runs past its authorized deadline until the
+coordinator next observes `<b>` — autonomous enforcement is dead, and
+nothing is logged about the sweep's failure.
 
 **Direction:** sweep per-record (`requests()` yielding
 `Result<record, Corrupt>` items, skip-and-report), or at minimum surface
