@@ -37,20 +37,10 @@ pub enum Guardian {
 /// exits immediately.
 pub fn exit_when_orphaned(guardian: Guardian) {
     let this_parent = parent_pid();
-    let guardian = match guardian {
-        Guardian::Parent => {
-            // A fixture launched directly by init has no harness above it.
-            // Treating pid 1 as "alive" would also let a spawn/death race
-            // (already reparented to init) leak forever.
-            (!(0..=1).contains(&this_parent))
-                .then(|| identity(this_parent))
-                .flatten()
-        }
-        Guardian::Grandparent => parent_of(this_parent)
-            .and_then(identity)
-            .or_else(|| identity(this_parent)),
+    let Some(guardian_pid) = resolve_guardian(guardian, this_parent, parent_of) else {
+        std::process::exit(0);
     };
-    let Some(guardian) = guardian else {
+    let Some(guardian) = identity(guardian_pid) else {
         std::process::exit(0);
     };
     std::thread::spawn(move || {
@@ -61,6 +51,23 @@ pub fn exit_when_orphaned(guardian: Guardian) {
             std::thread::sleep(POLL_INTERVAL);
         }
     });
+}
+
+fn resolve_guardian<F>(guardian: Guardian, this_parent: i32, parent_of: F) -> Option<i32>
+where
+    F: FnOnce(i32) -> Option<i32>,
+{
+    if !is_supervisor_pid(this_parent) {
+        return None;
+    }
+    match guardian {
+        Guardian::Parent => Some(this_parent),
+        Guardian::Grandparent => parent_of(this_parent).filter(|pid| is_supervisor_pid(*pid)),
+    }
+}
+
+fn is_supervisor_pid(pid: i32) -> bool {
+    pid > 1
 }
 
 #[derive(Clone, Copy)]
@@ -147,4 +154,69 @@ fn process_exists(pid: i32) -> bool {
         fn kill(pid: i32, sig: i32) -> i32;
     }
     pid > 0 && unsafe { kill(pid, 0) } == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parent_guardian_is_the_direct_parent() {
+        assert_eq!(
+            resolve_guardian(Guardian::Parent, 42, |_| unreachable!()),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn parent_guardian_rejects_init_and_unset_parent() {
+        assert_eq!(
+            resolve_guardian(Guardian::Parent, 1, |_| unreachable!()),
+            None
+        );
+        assert_eq!(
+            resolve_guardian(Guardian::Parent, 0, |_| unreachable!()),
+            None
+        );
+    }
+
+    #[test]
+    fn grandparent_guardian_is_the_harness_above_the_leader() {
+        assert_eq!(
+            resolve_guardian(Guardian::Grandparent, 42, |pid| {
+                assert_eq!(pid, 42);
+                Some(7)
+            }),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn grandparent_guardian_rejects_reparented_init_child() {
+        assert_eq!(
+            resolve_guardian(Guardian::Grandparent, 1, |_| unreachable!()),
+            None
+        );
+        assert_eq!(
+            resolve_guardian(Guardian::Grandparent, 0, |_| unreachable!()),
+            None
+        );
+    }
+
+    #[test]
+    fn grandparent_guardian_rejects_init_as_the_harness() {
+        assert_eq!(
+            resolve_guardian(Guardian::Grandparent, 42, |_| Some(1)),
+            None
+        );
+        assert_eq!(
+            resolve_guardian(Guardian::Grandparent, 42, |_| Some(0)),
+            None
+        );
+    }
+
+    #[test]
+    fn grandparent_guardian_does_not_fall_back_to_the_leader() {
+        assert_eq!(resolve_guardian(Guardian::Grandparent, 42, |_| None), None);
+    }
 }
