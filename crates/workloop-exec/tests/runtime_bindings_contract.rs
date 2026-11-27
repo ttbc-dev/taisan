@@ -564,8 +564,12 @@ fn packaged_runtime_files_stay_under_the_narrow_read_only_binds() {
 }
 
 /// Sources the contract never admits refuse the launch rather than
-/// render: an argv-named host socket and the owner's home directory
-/// itself are denied by `plan_denial` before the outer argv is built.
+/// render: an argv-named host socket is denied by `plan_denial`
+/// before the outer argv is built, and the owner's home directory
+/// itself is never a bind source — `plan_denial` refuses the
+/// spelling when it reaches the plan, while a home that covers a
+/// fixed mount (`/tmp`, `/run`, …) or does not exist is filtered
+/// out of the plan first. Either way the home is never bound.
 #[test]
 fn forbidden_bind_sources_refuse_the_launch() {
     let dir = tmp("forbidden");
@@ -582,13 +586,48 @@ fn forbidden_bind_sources_refuse_the_launch() {
     let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
         return;
     };
+    let home = PathBuf::from(home);
     let inner = vec![
         "/pkg/bin/managed-worker".to_string(),
-        PathBuf::from(home).to_string_lossy().into_owned(),
+        home.to_string_lossy().into_owned(),
     ];
-    let err = contained_launch(&dir, RuntimeBoundary::new(boundary_config(&dir)), &inner)
-        .expect_err("the owner's home refuses as a bind source");
-    assert!(err.contains("owner's home"), "{err}");
+    match contained_launch(&dir, RuntimeBoundary::new(boundary_config(&dir)), &inner) {
+        Err(err) => assert!(err.contains("owner's home"), "{err}"),
+        // The spelling never reached the plan — `extra_binds` drops a
+        // home that covers a fixed mount (HOME=/tmp is a contemplated
+        // environment) or that does not exist. The contract outcome
+        // still holds: the rendered argv binds no source at or above
+        // the home.
+        Ok((argv, _)) => {
+            let joined = argv.join("\n");
+            // The oracle covers the env-HOME spelling the argv names;
+            // the account-database home is never an argv element here
+            // (its refusal is proven by the containment unit tests).
+            let sources: Vec<&str> = argv
+                .windows(3)
+                .filter(|w| w[0] == "--bind" || w[0] == "--ro-bind")
+                .map(|w| w[1].as_str())
+                .collect();
+            assert!(
+                !sources
+                    .iter()
+                    .any(|s| bind_source_is_home_or_ancestor(s, &home)),
+                "the owner's home must never be a bind source:\n{joined}"
+            );
+        }
+    }
+    // The filtering half is proven deterministically — the ambient
+    // `match` only reaches its `Ok` branch when this environment's
+    // HOME happens to cover a mount or not exist, which CI never
+    // does. A covered-mount spelling is dropped before the plan for
+    // every environment, on any host where it exists.
+    let covered = vec!["/pkg/bin/managed-worker".to_string(), "/tmp".to_string()];
+    assert!(
+        !containment::extra_binds(&covered, None)
+            .iter()
+            .any(|p| p == Path::new("/tmp")),
+        "a covered-mount argv element is filtered before the plan"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
