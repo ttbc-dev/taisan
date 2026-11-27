@@ -1947,8 +1947,12 @@ fn a_failed_version_command_cannot_satisfy_the_pin() {
     use std::os::unix::fs::PermissionsExt;
     let setup = clean_setup("runtime-exit-fail", 1_763_000_000);
     let script = setup.dir.join("version-fail.sh");
-    std::fs::write(&script, "#!/bin/sh\necho 9.9.9\nexit 1\n").unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Write-then-rename: executing a file whose inode was just opened
+    // for writing fails ETXTBUSY on Linux; the renamed inode never was.
+    let script_tmp = setup.dir.join("version-fail.sh.tmp");
+    std::fs::write(&script_tmp, "#!/bin/sh\necho 9.9.9\nexit 1\n").unwrap();
+    std::fs::set_permissions(&script_tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(&script_tmp, &script).unwrap();
     let mut text = std::fs::read_to_string(&setup.config).unwrap();
     text.push_str(&format!(
         "\n[worker]\nargv = [\"{}\"]\nruntime_version = \">=9.0.0\"\n\

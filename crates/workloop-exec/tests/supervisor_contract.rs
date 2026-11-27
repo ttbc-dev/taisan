@@ -1739,8 +1739,11 @@ fn invariant_check_runs_against_a_snapshot_never_the_producing_workspace() {
     // `describe` is delegated to the fixture worker so the adapter
     // declaration the probe records is the same one every other
     // contract test binds; every other launch records its cwd.
+    // Write-then-rename: executing a file whose inode was just opened
+    // for writing fails ETXTBUSY on Linux; the renamed inode never was.
+    let script_tmp = root.join("cwd-writer.sh.tmp");
     std::fs::write(
-        &script,
+        &script_tmp,
         format!(
             "#!/bin/sh\nif [ \"$1\" = \"describe\" ]; then\n    exec \"{}\" describe\nfi\nprintf '%s\\n' \"$PWD\" >> whoami.txt\nprintf '{{\"status\":\"done\"}}\\n' > artifact.json\n",
             fixture_bin()
@@ -1749,8 +1752,9 @@ fn invariant_check_runs_against_a_snapshot_never_the_producing_workspace() {
     .unwrap();
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&script_tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+    std::fs::rename(&script_tmp, &script).unwrap();
     let (work, eid) = submit_and_admit(&store, "k-ic-snap");
     let sup = fixture_sup(
         PosixProcessControl,

@@ -58,12 +58,16 @@ fn tmp_root(tag: &str) -> PathBuf {
 /// the optional workspace actions, and exits with `exit`.
 fn fake_runtime(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
-    std::fs::write(&path, body).unwrap();
+    // Write-then-rename: executing a file whose inode was just opened
+    // for writing fails ETXTBUSY on Linux; the renamed inode never was.
+    let tmp = dir.join(format!("{name}.tmp"));
+    std::fs::write(&tmp, body).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+    std::fs::rename(&tmp, &path).unwrap();
     path
 }
 
