@@ -22,8 +22,11 @@ fn gh_backend_derives_issue_identity_from_the_issue_number() {
     std::fs::create_dir_all(&bin).unwrap();
     let count_file = dir.join("gh-calls");
     let gh = bin.join("gh");
+    // Write-then-rename: executing a file whose inode was just opened
+    // for writing fails ETXTBUSY on Linux; the renamed inode never was.
+    let gh_tmp = bin.join("gh.tmp");
     std::fs::write(
-        &gh,
+        &gh_tmp,
         format!(
             "#!/bin/sh\nn=$(cat {} 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > {}\nif [ $n -eq 1 ]; then\necho '[{{\"number\":42,\"title\":\"fix the thing\",\"state\":\"open\",\"created_at\":\"2024-01-01T00:00:00Z\",\"updated_at\":\"2024-01-02T00:00:00Z\",\"labels\":[{{\"name\":\"intake\"}}],\"node_id\":\"I_kwDO_notused\",\"id\":777}}]'\nelse\necho '[]'\nfi\n",
             count_file.display(),
@@ -34,8 +37,9 @@ fn gh_backend_derives_issue_identity_from_the_issue_number() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&gh_tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+    std::fs::rename(&gh_tmp, &gh).unwrap();
     let path = format!(
         "{}:{}",
         bin.display(),
@@ -83,12 +87,16 @@ fn gh_backend_serves_only_declared_github_endpoints() {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let gh = bin.join("gh");
-    std::fs::write(&gh, "#!/bin/sh\necho '[]'\n").unwrap();
+    // Write-then-rename: executing a file whose inode was just opened
+    // for writing fails ETXTBUSY on Linux; the renamed inode never was.
+    let gh_tmp = bin.join("gh.tmp");
+    std::fs::write(&gh_tmp, "#!/bin/sh\necho '[]'\n").unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&gh_tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
+    std::fs::rename(&gh_tmp, &gh).unwrap();
     let path = format!(
         "{}:{}",
         bin.display(),
@@ -185,12 +193,16 @@ fn gh_backend_maps_known_issue_states_and_fails_malformed_on_others() {
             issue["state"] = serde_json::Value::String(state.to_string());
         }
         let payload = serde_json::to_string(&vec![issue]).unwrap();
-        std::fs::write(&gh, format!("#!/bin/sh\necho '{payload}'\n")).unwrap();
+        // Write-then-rename: executing a file whose inode was just opened
+        // for writing fails ETXTBUSY on Linux; the renamed inode never was.
+        let gh_tmp = bin.join("gh.tmp");
+        std::fs::write(&gh_tmp, format!("#!/bin/sh\necho '{payload}'\n")).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&gh_tmp, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        std::fs::rename(&gh_tmp, &gh).unwrap();
         let path = format!(
             "{}:{}",
             bin.display(),
