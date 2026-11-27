@@ -139,9 +139,18 @@ restore the `LOCAL MODIFICATION` header, re-apply the permissions
 patch (read at workflow level, `contents: write`/`id-token: write`/
 `attestations: write` on `host` only), the `Attest release artifacts`
 step on `host` (the generated `github-attestations` step reappears
-under `build-local-artifacts` unless the phase stays `host`; either
-way it must be re-pinned to a full SHA and its `subject-path` kept at
-`artifacts/*` so it matches the released file set), the env-var tag
+under `build-local-artifacts` if the phase is not kept at `host` —
+move it to `host` rather than leaving it there: `build-local-artifacts`
+has no `artifacts/` dir (its outputs live under `target/distrib/`)
+and inherits workflow-level `contents: read`, so it can neither find
+the released set nor hold `id-token: write`/`attestations: write`.
+On `host`, place it after `Download GitHub Artifacts` populates
+`artifacts/` and after `Cleanup` removes the granular
+`*-dist-manifest.json` files from it — placing it earlier attests
+internal manifests the release never uploads — and before `Create
+GitHub Release`; set `subject-path` to `artifacts/*` — the same set
+`gh release create` uploads — and re-pin the `uses:` ref to a full
+SHA), the env-var tag
 hardening, the `github-actions[bot]` commit identity, the SHA-pinned
 `uses:` refs (dist emits movable `@vN` tags; each pin's `# vX.Y.Z`
 comment records the version it replaces), the verified cargo-dist
