@@ -87,31 +87,44 @@ const EVIDENCE_RETRY_SECONDS: i64 = 300;
 /// wedged sandbox answers `Bounded` and fails the battery.
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Whether a host directory would be exposed inside the sandbox by a
-/// fixed system bind: strictly beneath an existing `SYSTEM_BINDS`
-/// member (a root that *is* a bound prefix needs no mask — it is the
-/// runtime surface, not installation state). The root must exist on
-/// the host, otherwise it is absent inside the bind and masking a
-/// path that does not exist could fail the mount outright.
-fn system_bind_covers(root: &Path) -> bool {
-    system_bind_covers_among(root, SYSTEM_BINDS)
-}
-
-/// `system_bind_covers` against an explicit bind set — the production
-/// value is `SYSTEM_BINDS`; tests substitute a synthetic layout.
-fn system_bind_covers_among(root: &Path, binds: &[&str]) -> bool {
+/// The sandbox spellings at which a mask root's tmpfs must render —
+/// one per existing system-bind member whose canonical target the
+/// root's canonical path resolves under. Every member is bound as its
+/// own mount of that target: on a merged-`/usr` host `/lib` mounts the
+/// contents of `/usr/lib` as a separate mount, so a root beneath the
+/// shared target is reachable at `/usr/lib/<root>` and `/lib/<root>`
+/// and is shadowed at both. A member whose target *is* the root (or is
+/// not an ancestor) contributes nothing — the bound prefix itself is
+/// the runtime surface, and a tmpfs at a destination nothing created
+/// would fail the whole mount setup. An absent root is absent inside
+/// every bound ancestor too, so it emits nothing.
+fn mask_root_dests_among(root: &Path, binds: &[&str]) -> Vec<PathBuf> {
     if !root.exists() {
-        return false;
+        return Vec::new();
     }
     let resolved = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    binds
-        .iter()
-        .filter(|d| Path::new(d).exists())
-        .map(Path::new)
-        .any(|bound| {
-            let bound = bound.canonicalize().unwrap_or_else(|_| bound.to_path_buf());
-            resolved != bound && resolved.starts_with(&bound)
-        })
+    let mut dests = Vec::new();
+    for member in binds.iter().map(Path::new).filter(|b| b.exists()) {
+        let target = member
+            .canonicalize()
+            .unwrap_or_else(|_| member.to_path_buf());
+        let Ok(rel) = resolved.strip_prefix(&target) else {
+            continue;
+        };
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let dest = member.join(rel);
+        if !dests.contains(&dest) {
+            dests.push(dest);
+        }
+    }
+    dests
+}
+
+/// The production [`mask_root_dests_among`], against `SYSTEM_BINDS`.
+fn mask_root_dests(root: &Path) -> Vec<PathBuf> {
+    mask_root_dests_among(root, SYSTEM_BINDS)
 }
 
 /// What one contained launch binds into the sandbox. Every field is a
@@ -422,19 +435,19 @@ fn masked_file_dests_among(plan: &MountPlan, file: &Path, binds: &[&str]) -> Vec
             }
         }
     }
-    // A mask root's tmpfs renders at the root's resolved spelling —
-    // inside the one member mount that spelling lives in — and
-    // shadows the whole root there. A sibling member mounting the
-    // same host tree under a different spelling is not shadowed, so
-    // only a dest that is itself beneath an emitted tmpfs spelling
-    // is already invisible; every other bound spelling of the file
-    // still needs the `/dev/null` shadow.
-    let tmpfs_spellings: Vec<PathBuf> = plan
-        .mask_roots
-        .iter()
-        .filter(|root| system_bind_covers_among(root, binds))
-        .map(|root| root.canonicalize().unwrap_or_else(|_| root.clone()))
-        .collect();
+    // A mask root's tmpfs renders at every bound spelling the root is
+    // reachable under — one per system-bind member that mounts the
+    // root's shared target. A dest beneath any of those spellings is
+    // already invisible; every other bound spelling of the file still
+    // needs the `/dev/null` shadow.
+    let mut tmpfs_spellings: Vec<PathBuf> = Vec::new();
+    for root in &plan.mask_roots {
+        for dest in mask_root_dests_among(root, binds) {
+            if !tmpfs_spellings.contains(&dest) {
+                tmpfs_spellings.push(dest);
+            }
+        }
+    }
     for member in binds.iter().map(Path::new).filter(|b| b.exists()) {
         let target = member
             .canonicalize()
@@ -617,9 +630,8 @@ pub fn bwrap_args(
     // plan legitimately names under the root is re-mounted by its own
     // bind — the mask never subtracts a declared mount.
     for root in &plan.mask_roots {
-        if system_bind_covers(root) {
-            let resolved = root.canonicalize().unwrap_or_else(|_| root.clone());
-            args.extend(["--tmpfs".to_string(), s(&resolved)]);
+        for dest in mask_root_dests(root) {
+            args.extend(["--tmpfs".to_string(), s(&dest)]);
         }
     }
     args.extend(
@@ -1839,6 +1851,65 @@ mod tests {
         );
         let text = args.join(" ");
         assert!(!text.contains("uncovered-root"), "{text}");
+    }
+
+    /// On a merged-`/usr` layout a mask root beneath the shared target
+    /// is reachable under every bound spelling of that target, so the
+    /// tmpfs renders at each one — not only at the resolved spelling.
+    /// The synthetic tree stands in for the fixed `SYSTEM_BINDS` list,
+    /// which the test host's layout may not merge.
+    #[test]
+    fn a_merged_usr_mask_root_is_shadowed_at_every_bound_spelling() {
+        let root = tmp("merged-usr-mask-root");
+        let usr = root.join("usr");
+        std::fs::create_dir_all(usr.join("lib/state")).unwrap();
+        std::fs::create_dir_all(usr.join("bin")).unwrap();
+        std::os::unix::fs::symlink("usr/lib", root.join("lib")).unwrap();
+        std::os::unix::fs::symlink("usr/bin", root.join("bin")).unwrap();
+        let binds: Vec<String> = [
+            root.join("usr"),
+            root.join("bin"),
+            root.join("lib"),
+            // A member absent on the host is never bound — it must
+            // contribute no mask destination.
+            root.join("missing"),
+        ]
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+        let binds: Vec<&str> = binds.iter().map(String::as_str).collect();
+        let mask_root = usr.join("lib/state");
+        let masked_file = mask_root.join("secret");
+        std::fs::write(&masked_file, b"sentinel").unwrap();
+        let dests = mask_root_dests_among(&mask_root, &binds);
+        // /usr's mount exposes `lib/state`; /lib's mount exposes
+        // `state` — both spellings shadowed, /bin's mount does not
+        // hold the root, and the unbound member emits nothing.
+        assert_eq!(
+            dests,
+            vec![usr.join("lib/state"), root.join("lib/state")],
+            "every bound spelling of the mask root gets a tmpfs"
+        );
+        // The same root spelled through the alias yields the same
+        // destination set — a property of the target, not the spelling.
+        assert_eq!(
+            mask_root_dests_among(&root.join("lib/state"), &binds),
+            dests
+        );
+        // A root equal to a bound target is the runtime surface, and an
+        // absent root is absent inside every bind — neither emits.
+        assert!(mask_root_dests_among(&root.join("usr"), &binds).is_empty());
+        assert!(mask_root_dests_among(&usr.join("missing"), &binds).is_empty());
+        // A file beneath the root is already invisible under every
+        // emitted tmpfs spelling; no `/dev/null` shadow destination is
+        // left that nothing created.
+        let mut plan = plan_fixture();
+        plan.mask_roots = vec![mask_root.clone()];
+        assert!(
+            masked_file_dests_among(&plan, &masked_file, &binds).is_empty(),
+            "the tmpfs masks the file at every bound spelling"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
