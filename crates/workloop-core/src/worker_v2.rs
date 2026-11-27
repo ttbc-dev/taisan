@@ -25,6 +25,13 @@ pub const WORKER_REPORT_V2_FORMAT: &str = "taisan.worker.report/2";
 /// The only declaration format this contract reads or writes.
 pub const WORKER_DECLARATION_V1_FORMAT: &str = "taisan.worker.declaration/1";
 
+/// The fixed capability identifier reported when a declaration offers a
+/// resume mode other than the only supported value, `unsupported`. It is
+/// a stable machine identifier: the adapter-controlled declaration value
+/// is deliberately omitted so it can never enter the refusal code or
+/// grow the diagnostic without bound, and never echoes control bytes.
+pub const RESUME_UNSUPPORTED_CAPABILITY: &str = "resume:unsupported";
+
 /// Digest domain tags (`docs/v0.3.md` §3.1 / OD-3).
 const REQUEST_DIGEST_TAG: &str = "worker-request-v2";
 const REPORT_DIGEST_TAG: &str = "worker-report-v2";
@@ -1462,8 +1469,11 @@ impl WorkerDeclarationV1 {
             }
         }
         if self.resume != "unsupported" {
+            // The declared value is adapter-controlled prose, so it is
+            // omitted entirely: the identifier below is fixed and the
+            // refusal stays fail-closed for every nonconforming value.
             return Err(NegotiationRefusal::CapabilityMissing {
-                capability: format!("resume:unsupported (declared {:?})", self.resume),
+                capability: RESUME_UNSUPPORTED_CAPABILITY.to_string(),
             });
         }
         Ok(())
@@ -2788,9 +2798,51 @@ mod tests {
         d.resume = "session".into();
         match d.negotiate_v2(&request) {
             Err(NegotiationRefusal::CapabilityMissing { capability }) => {
-                assert!(capability.contains("resume"), "{capability}")
+                assert_eq!(capability, RESUME_UNSUPPORTED_CAPABILITY);
             }
             other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_resume_values_share_a_fixed_bounded_identifier() {
+        let request = WorkerRequestV2::parse(DOC_REQUEST.as_bytes()).unwrap();
+        let cases = [
+            String::new(),
+            "session".to_string(),
+            "unsupported ".to_string(),
+            "unsupported\n".to_string(),
+            "session\u{0}\r\n\u{1b}[31mred".to_string(),
+            "résumé".to_string(),
+            "x".repeat(64 * 1024),
+        ];
+        for resume in cases {
+            let mut d = declaration();
+            d.resume = resume.clone();
+            let refusal = d
+                .negotiate_v2(&request)
+                .expect_err("every nonconforming resume value must be refused");
+            match &refusal {
+                NegotiationRefusal::CapabilityMissing { capability } => {
+                    assert_eq!(capability, RESUME_UNSUPPORTED_CAPABILITY);
+                    assert_eq!(capability, "resume:unsupported");
+                }
+                other => panic!("expected capability_missing for {resume:?}, got {other:?}"),
+            }
+            let rendered = refusal.to_string();
+            assert_eq!(rendered, "capability.missing: resume:unsupported");
+            assert!(
+                rendered.len() <= 128,
+                "diagnostic grew to {} bytes",
+                rendered.len()
+            );
+            assert!(!rendered.contains('\u{0}') && !rendered.contains('\u{1b}'));
+            if !resume.is_empty() {
+                assert!(
+                    !rendered.contains(&resume),
+                    "diagnostic echoed the declared value"
+                );
+            }
         }
     }
 

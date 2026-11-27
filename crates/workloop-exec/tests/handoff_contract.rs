@@ -1629,14 +1629,20 @@ fn fake_sandbox_scripts(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
         );
         text
     };
-    std::fs::write(&bwrap, script(&bwrap_log, true)).unwrap();
-    std::fs::write(&relay, script(&relay_log, false)).unwrap();
+    // Write-then-rename: executing a file whose inode was just opened
+    // for writing fails ETXTBUSY on Linux; the renamed inode never was.
+    let bwrap_tmp = dir.join("fake-bwrap.tmp");
+    let relay_tmp = dir.join("fake-relay.tmp");
+    std::fs::write(&bwrap_tmp, script(&bwrap_log, true)).unwrap();
+    std::fs::write(&relay_tmp, script(&relay_log, false)).unwrap();
     {
         use std::os::unix::fs::PermissionsExt;
-        for f in [&bwrap, &relay] {
+        for f in [&bwrap_tmp, &relay_tmp] {
             std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
+    std::fs::rename(&bwrap_tmp, &bwrap).unwrap();
+    std::fs::rename(&relay_tmp, &relay).unwrap();
     (bwrap, relay, bwrap_log, relay_log)
 }
 
