@@ -60,4 +60,5 @@ dependencies relative to its executable works unchanged:
 
 Nothing under the package root is writable: the worker must not write
 to its own install tree. Host `/`, container sockets, and the owner's
-home are never bind sources.
+home directory itself (or an ancestor of it) are never bind sources —
+paths strictly beneath the home may still be bound.

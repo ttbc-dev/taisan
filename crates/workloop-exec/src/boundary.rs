@@ -139,10 +139,12 @@ enum BoundaryState {
 pub struct RuntimeBoundary {
     config: BoundaryConfig,
     /// This instance's staging-name owner tag —
-    /// `runtime-auth.<pid>.<instance>.<seq>` — so every file it stages
-    /// is attributable to exactly one owner: two boundaries sharing
-    /// the staging dir can never stage or drop the same name, and the
-    /// tag identifies the owning process to anyone reading the dir.
+    /// `runtime-auth.p<pid>.i<instance>.<seq>` — so every file it
+    /// stages is attributable to exactly one owner: two boundaries
+    /// sharing the staging dir can never stage or drop the same name,
+    /// and the tag identifies the owning process to anyone reading
+    /// the dir. The `p`/`i` prefixes also keep the tagged shape out
+    /// of any purely numeric name an operator might use.
     owner_tag: String,
     state: Mutex<BoundaryState>,
 }
@@ -153,7 +155,7 @@ impl RuntimeBoundary {
         Self {
             config,
             owner_tag: format!(
-                "{}.{}",
+                "p{}.i{}",
                 std::process::id(),
                 INSTANCE.fetch_add(1, Ordering::Relaxed)
             ),
@@ -274,7 +276,7 @@ impl RuntimeBoundary {
     }
 
     /// The staging name one grant is published at —
-    /// `runtime-auth.<pid>.<instance>.<seq>` — carrying this
+    /// `runtime-auth.p<pid>.i<instance>.<seq>` — carrying this
     /// boundary's owner tag so the file is attributable to exactly
     /// one owner: no other instance can ever stage a name this
     /// boundary tracks, and the tag names the process a reader of
@@ -304,7 +306,7 @@ impl RuntimeBoundary {
         // A staging name that exists after the sweep is not ours to
         // overwrite — it is a configured input the sweep deliberately
         // kept, or a live owner's file. Owner tags are only *usually*
-        // unique (two pid namespaces can mint the same `<pid>.<instance>`
+        // unique (two pid namespaces can mint the same `p<pid>.i<instance>`
         // tag), so existence is not proof a name is foreign: publish is
         // no-clobber (`write_staged_credential` links rather than
         // renames over an existing name) and an occupied name — whether
@@ -502,10 +504,14 @@ impl Drop for RuntimeBoundary {
 
 /// Whether a `runtime_dir` entry name is one of the boundary's
 /// staging shapes — the owner-tagged
-/// `runtime-auth.<pid>.<instance>.<seq>` and its `.tmp` sibling, or
+/// `runtime-auth.p<pid>.i<instance>.<seq>` and its `.tmp` sibling, or
 /// the pre-owner-tag `runtime-auth` / `runtime-auth.<seq>` shapes an
-/// older supervisor may have left. Any other `runtime-auth*` name is
-/// operator content the sweep must never treat as stale staging.
+/// older supervisor may have left. The `p`/`i` prefixes are
+/// load-bearing: a purely numeric three-part name — a versioned
+/// operator file like `runtime-auth.1.2.3` — can never match the
+/// tagged shape, so it is operator content the sweep must never
+/// treat as stale staging, like any other `runtime-auth*` name that
+/// is not one of these shapes.
 fn is_staging_name(name: &str) -> bool {
     let base = name.strip_suffix(".tmp").unwrap_or(name);
     if base == "runtime-auth" {
@@ -515,11 +521,19 @@ fn is_staging_name(name: &str) -> bool {
         return false;
     };
     let all_digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    let prefixed = |prefix: u8, part: &str| {
+        part.len() > 1 && part.as_bytes()[0] == prefix && all_digits(&part[1..])
+    };
     match rest.split('.').count() {
         // runtime-auth.<seq> — the pre-owner-tag per-grant shape.
         1 => all_digits(rest),
-        // runtime-auth.<pid>.<instance>.<seq> — owner-tagged.
-        3 => rest.split('.').all(all_digits),
+        // runtime-auth.p<pid>.i<instance>.<seq> — owner-tagged.
+        3 => {
+            let mut parts = rest.split('.');
+            parts.next().is_some_and(|p| prefixed(b'p', p))
+                && parts.next().is_some_and(|i| prefixed(b'i', i))
+                && parts.next().is_some_and(all_digits)
+        }
         _ => false,
     }
 }
@@ -1048,7 +1062,7 @@ mod tests {
         std::fs::create_dir_all(&runtime).unwrap();
         // An unlocked owner-tagged file is residue: a live owner
         // holds its flock, so unlocked means its owner is gone.
-        let dead = runtime.join("runtime-auth.1.2.3");
+        let dead = runtime.join("runtime-auth.p1.i2.3");
         std::fs::write(&dead, "stale-secret").unwrap();
         // An orphaned tmp sibling and an unattributed legacy name are
         // the same stale secret material.
@@ -1059,7 +1073,7 @@ mod tests {
         // A file held under an exclusive lock stands in for a live
         // neighbour's grant — the test claims it the way a staging
         // boundary does.
-        let claimed = runtime.join("runtime-auth.4.5.6");
+        let claimed = runtime.join("runtime-auth.p4.i5.6");
         let _claimed_lock = claim(std::fs::File::create(&claimed).unwrap());
         std::fs::write(&claimed, "live-secret").unwrap();
 
@@ -1084,10 +1098,15 @@ mod tests {
         std::fs::write(&malformed, "operator").unwrap();
         let two_part = runtime.join("runtime-auth.1.2");
         std::fs::write(&two_part, "operator").unwrap();
+        // A three-part purely numeric name — an operator's versioned
+        // file — is not the tagged shape either: the `p`/`i` prefixes
+        // keep ordinary names out of the sweep.
+        let versioned = runtime.join("runtime-auth.1.2.3");
+        std::fs::write(&versioned, "operator").unwrap();
         let boundary = RuntimeBoundary::new(config(&dir));
         boundary.ensure().unwrap();
         assert!(
-            malformed.exists() && two_part.exists(),
+            malformed.exists() && two_part.exists() && versioned.exists(),
             "non-staging-shape names are never swept"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1129,10 +1148,11 @@ mod tests {
     }
 
     /// Owner tags are only *usually* unique: two pid namespaces mint
-    /// the same `<pid>.<instance>` tag, so a name collision is a real
-    /// case, not a bug precondition. Publish must still be no-clobber —
-    /// the contender loses a seq, never the holder's file — and neither
-    /// boundary's Drop unlinks a name the other published.
+    /// the same `p<pid>.i<instance>` tag, so a name collision is a
+    /// real case, not a bug precondition. Publish must still be
+    /// no-clobber — the contender loses a seq, never the holder's
+    /// file — and neither boundary's Drop unlinks a name the other
+    /// published.
     #[test]
     fn a_same_owner_tag_contender_never_clobbers_the_holders_grant() {
         let dir = tmp("tagcollision");
@@ -1144,7 +1164,7 @@ mod tests {
         // Force the tag two pid namespaces could both mint.
         let holder = RuntimeBoundary {
             config: cfg.clone(),
-            owner_tag: "9.9".into(),
+            owner_tag: "p9.i9".into(),
             state: Mutex::new(BoundaryState::Unresolved),
         };
         let held = holder
@@ -1154,16 +1174,16 @@ mod tests {
             .expect("holder staged");
         assert_eq!(
             held.file_name().unwrap().to_string_lossy(),
-            "runtime-auth.9.9.0"
+            "runtime-auth.p9.i9.0"
         );
         let contender = RuntimeBoundary {
             config: cfg,
-            owner_tag: "9.9".into(),
+            owner_tag: "p9.i9".into(),
             state: Mutex::new(BoundaryState::Unresolved),
         };
         // The contender sweeps first: the holder's file is claimed, so
         // it stays — then the contender publishes the next seq rather
-        // than clobbering `runtime-auth.9.9.0`.
+        // than clobbering `runtime-auth.p9.i9.0`.
         let published = contender
             .ensure()
             .unwrap()
@@ -1171,7 +1191,7 @@ mod tests {
             .expect("contender staged");
         assert_eq!(
             published.file_name().unwrap().to_string_lossy(),
-            "runtime-auth.9.9.1",
+            "runtime-auth.p9.i9.1",
             "an occupied same-tag name costs a seq, never the holder's file"
         );
         assert!(held.exists() && published.exists());

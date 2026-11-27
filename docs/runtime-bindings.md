@@ -70,7 +70,7 @@ staged fresh at every contained launch and `describe` probe: the
 latest provider value is what the next Invocation observes. Each
 grant stages its own `0600` supervisor-owned file under a unique
 per-grant name carrying the staging boundary's owner tag —
-`runtime-auth.<pid>.<instance>.<seq>` — bound read-only at
+`runtime-auth.p<pid>.i<instance>.<seq>` — bound read-only at
 `/taisan/runtime-auth` — a later grant can never rewrite the path a
 pending launch is about to bind, and a refused re-resolve never
 unlinks it. Retention is bounded: only the newest staged grants are
