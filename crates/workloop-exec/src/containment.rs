@@ -1983,14 +1983,17 @@ mod tests {
         plan.extra_binds = vec![home.clone()];
         let reason = plan_denial(&plan).expect("the home directory refuses");
         assert!(reason.contains("owner's home"), "{reason}");
+        // The guard decides on the resolved spelling, never on the
+        // filesystem: a never-created name strictly beneath the home
+        // exercises the same admission without writing into the
+        // operator's account directory — nothing here can panic on a
+        // read-only home or leak a probe file.
         let beneath = home.join(format!("workloop-home-bind-{}", std::process::id()));
-        std::fs::write(&beneath, "x").unwrap();
-        plan.extra_binds = vec![beneath.clone()];
+        plan.extra_binds = vec![beneath];
         assert!(
             plan_denial(&plan).is_none(),
-            "a path beneath the home still binds only the named file"
+            "a path beneath the home still binds only the named path"
         );
-        let _ = std::fs::remove_file(&beneath);
     }
 
     /// The home guard must not lapse with the environment spelling:

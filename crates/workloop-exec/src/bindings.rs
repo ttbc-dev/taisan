@@ -47,12 +47,13 @@ const MAX_FIELD_CHARS: usize = 1024;
 /// Fixed members:
 ///
 /// - `format_version` — required; exactly [`BINDINGS_FORMAT_VERSION`].
-/// - `model` — required; a non-empty bounded string naming the model
-///   the worker runs.
-/// - `endpoint` — optional; a non-empty bounded string naming the
-///   provider endpoint the runtime calls.
-/// - `proxy_endpoint` — optional; a non-empty bounded string naming a
-///   proxy endpoint the adapter may additionally honor. Worker-owned
+/// - `model` — required; a bounded string that is not empty or
+///   all-whitespace, naming the model the worker runs.
+/// - `endpoint` — optional; a bounded string that is not empty or
+///   all-whitespace, naming the provider endpoint the runtime calls.
+/// - `proxy_endpoint` — optional; a bounded string that is not empty
+///   or all-whitespace, naming a proxy endpoint the adapter may
+///   additionally honor. Worker-owned
 ///   override: the adapter may replace the supervisor-delivered
 ///   `HTTPS_PROXY` pair for the runtime child with this endpoint
 ///   (`docs/runtime-bindings.md`); under containment the override can
@@ -195,8 +196,10 @@ fn document_contains(document: &serde_json::Value, needle: &[u8]) -> bool {
 
 /// One fixed member's shape rule: absent-or-null is allowed only for
 /// optional members; a present member must be a non-empty bounded
-/// string. The member name is part of the contract — the refusal may
-/// name it; the value never enters the diagnostic.
+/// string, and an all-whitespace value names nothing — it is empty
+/// for the contract's purpose and is refused the same way. The member
+/// name is part of the contract — the refusal may name it; the value
+/// never enters the diagnostic.
 fn validate_member(
     object: &serde_json::Map<String, serde_json::Value>,
     member: &'static str,
@@ -208,7 +211,7 @@ fn validate_member(
         }
         None | Some(serde_json::Value::Null) => Ok(()),
         Some(serde_json::Value::String(value)) => {
-            if value.is_empty() {
+            if value.trim().is_empty() {
                 return Err(invalid(format!("'{member}' must not be empty")));
             }
             if value.chars().count() > MAX_FIELD_CHARS {
@@ -373,6 +376,23 @@ mod tests {
             let err = validate(&path, None).unwrap_err();
             assert!(err.starts_with("provider_config."), "{err}");
             assert!(err.contains(expect), "{err} expected {expect}");
+            assert!(err.len() < 240, "diagnostics stay bounded: {err}");
+        }
+        // An all-whitespace member names nothing — it is empty for
+        // the contract's purpose and refuses the same way, for the
+        // required and the optional members alike. The refusal class
+        // itself is pinned: `contract_invalid`, not the generic
+        // `provider_config.` prefix the loop above shares with
+        // version refusals.
+        for content in [
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"   \"}",
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\",\"endpoint\":\" \\t \"}",
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\",\"proxy_endpoint\":\"\\n\"}",
+        ] {
+            let path = write(&dir, "blank.json", content);
+            let err = validate(&path, None).unwrap_err();
+            assert!(err.starts_with("provider_config.contract_invalid"), "{err}");
+            assert!(err.contains("must not be empty"), "{err}");
             assert!(err.len() < 240, "diagnostics stay bounded: {err}");
         }
         let _ = std::fs::remove_dir_all(&dir);

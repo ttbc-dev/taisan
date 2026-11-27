@@ -32,9 +32,9 @@ The provider configuration is exactly one regular file — a bounded
 | Member | Required | Rule |
 | --- | --- | --- |
 | `format_version` | yes | Exactly `"taisan.worker.bindings/1"`. Any other value, or absence, is a version refusal — never a tolerant parse |
-| `model` | yes | Non-empty bounded string (≤ 1024 chars) naming the model the Worker runs |
-| `endpoint` | no | Non-empty bounded string naming the provider endpoint the runtime calls |
-| `proxy_endpoint` | no | Non-empty bounded string naming a proxy endpoint the adapter may additionally honor. Worker-owned override: the adapter may replace the supervisor-delivered `HTTPS_PROXY` pair for the runtime child with this endpoint. Under containment only loopback and the bound supervisor socket are reachable, so the override can route inside the sandbox but can never widen egress past the supervisor's CONNECT allowlist — and an endpoint that is not reachable inside the sandbox simply fails the child's egress |
+| `model` | yes | Non-empty bounded string (≤ 1024 chars) naming the model the Worker runs; an all-whitespace value names nothing and refuses like the empty string |
+| `endpoint` | no | Non-empty bounded string, not all-whitespace, naming the provider endpoint the runtime calls |
+| `proxy_endpoint` | no | Non-empty bounded string, not all-whitespace, naming a proxy endpoint the adapter may additionally honor. Worker-owned override: the adapter may replace the supervisor-delivered `HTTPS_PROXY` pair for the runtime child with this endpoint. Under containment only loopback and the bound supervisor socket are reachable, so the override can route inside the sandbox but can never widen egress past the supervisor's CONNECT allowlist — and an endpoint that is not reachable inside the sandbox simply fails the child's egress |
 | extension members | no | Adapter-owned; Core neither names nor interprets them. They never loosen the required bindings |
 
 The document is non-secret by construction: it is validated *after*
@@ -51,7 +51,7 @@ the failed rule, never the document's content:
 | Diagnostic | Cause |
 | --- | --- |
 | `provider_config.unreadable` | Path absent or not readable — also the bounded identity digest's verdict for an oversized source, which it refuses unread before validation runs |
-| `provider_config.contract_invalid` | Not a regular file, over the size bound at validation, not a JSON object, a repeated member name anywhere in the document, or a fixed member violates its shape rule (missing `model`, empty/over-long/wrong-typed value) |
+| `provider_config.contract_invalid` | Not a regular file, over the size bound at validation, not a JSON object, a repeated member name anywhere in the document, or a fixed member violates its shape rule (missing `model`, empty or all-whitespace/over-long/wrong-typed value) |
 | `provider_config.contract_version` | `format_version` absent or not exactly `taisan.worker.bindings/1` |
 | `provider_config.contains_credential` | The resolved credential value — as a consumer reads it, trimmed and JSON-decoded — appears anywhere in the document |
 
