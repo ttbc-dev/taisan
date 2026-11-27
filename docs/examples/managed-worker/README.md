@@ -35,11 +35,12 @@ installation record then names the executable and the bindings:
 ```
 
 `worker-bindings.json` beside this README is the `taisan.worker.bindings/1`
-contract document the record's `worker_provider_config` points at:
-`model`, `endpoint`, no credential. The supervisor validates it before
-every dispatch and binds it read-only at `/taisan/provider-config`;
-the staged credential reaches the Worker only at
-`/taisan/runtime-auth`.
+contract document the operator installs at the path the record's
+`worker_provider_config` names — in this example
+`/home/operator/.config/taisan/worker-bindings.json`: `model`,
+`endpoint`, no credential. The supervisor validates it before every
+dispatch and binds it read-only at `/taisan/provider-config`; the
+staged credential reaches the Worker only at `/taisan/runtime-auth`.
 
 ## What the Worker sees
 

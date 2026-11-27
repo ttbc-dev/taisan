@@ -65,6 +65,17 @@ const DEFAULT_RUNTIME: &str = "claude";
 const DEFAULT_PRODUCT: &str = "claude-code";
 const SANDBOX_RUNTIME_AUTH: &str = "/taisan/runtime-auth";
 const SANDBOX_PROVIDER_CONFIG: &str = "/taisan/provider-config";
+/// The only provider-contract format this adapter consumes — the
+/// versioned mount (`docs/runtime-bindings.md`) the supervisor
+/// validates before every dispatch.
+const PROVIDER_CONTRACT_FORMAT: &str = "taisan.worker.bindings/1";
+/// Bound on the contract document's bytes — a provider configuration
+/// is a settings file, not a payload, so a larger source is not a
+/// contract document at all.
+const MAX_PROVIDER_CONTRACT_BYTES: u64 = 64 * 1024;
+/// Bound on each fixed member's string length — mirrors the
+/// contract's per-field bound (`docs/runtime-bindings.md`).
+const MAX_PROVIDER_FIELD_CHARS: usize = 1024;
 /// Bytes the request body itself may occupy — requests are small;
 /// a corrupt giant file fails fast instead of being parsed.
 const MAX_REQUEST_BYTES: u64 = 16 * 1024 * 1024;
@@ -314,6 +325,8 @@ fn probe_runtime_version(cfg: &Config) -> Result<String, String> {
 #[derive(serde::Deserialize, Default)]
 struct ProviderConfig {
     #[serde(default)]
+    format_version: Option<String>,
+    #[serde(default)]
     model: Option<String>,
     #[serde(default)]
     endpoint: Option<String>,
@@ -386,7 +399,7 @@ fn run_invocation(cfg: &Config, request_path: &Path, out_dir: &Path) -> Result<i
         }
     };
 
-    let provider = load_provider_config(cfg);
+    let provider = load_provider_config(cfg)?;
     let runtime_env = runtime_environment(cfg, &provider);
     let mcp_path = out_dir.join("taisan-empty-mcp.json");
     fs::write(&mcp_path, b"{\"mcpServers\":{}}\n").map_err(|e| format!("mcp config: {e}"))?;
@@ -486,11 +499,73 @@ fn workspace_dir() -> PathBuf {
     env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn load_provider_config(cfg: &Config) -> ProviderConfig {
-    let Ok(bytes) = fs::read(&cfg.provider_config) else {
-        return ProviderConfig::default();
+/// The provider binding is optional: an absent path means nothing was
+/// staged and the default config applies. A *present* document is the
+/// versioned contract mount — it must parse, stay inside the contract
+/// bound, and carry the exact `format_version`, so the supervisor and
+/// the adapter can never silently disagree on which contract the
+/// mount carries (docs/runtime-bindings.md). There is no tolerant
+/// parse and no fallback to defaults: an invalid present document
+/// refuses the launch.
+fn load_provider_config(cfg: &Config) -> Result<ProviderConfig, String> {
+    // The contract is exactly one document: a directory, a link, or
+    // any other non-regular source is refused at the stat — before the
+    // open — so a fifo-shaped source is rejected instead of parking
+    // the open on a writer. (A swap between the stat and the open is
+    // the supervisor-side O_NOFOLLOW/O_NONBLOCK read's job to refuse;
+    // this path is operator-staged configuration.)
+    let metadata = match std::fs::symlink_metadata(&cfg.provider_config) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProviderConfig::default());
+        }
+        Err(e) => return Err(format!("provider_config.unreadable: {e}")),
     };
-    serde_json::from_slice(&bytes).unwrap_or_default()
+    if !metadata.is_file() {
+        return Err("provider_config.contract_invalid: not a regular file".into());
+    }
+    let file = fs::File::open(&cfg.provider_config)
+        .map_err(|e| format!("provider_config.unreadable: {e}"))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_PROVIDER_CONTRACT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("provider_config.unreadable: {e}"))?;
+    if bytes.len() as u64 > MAX_PROVIDER_CONTRACT_BYTES {
+        return Err("provider_config.contract_invalid: exceeds the contract size bound".into());
+    }
+    let provider: ProviderConfig = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("provider_config.contract_invalid: {e}"))?;
+    if provider.format_version.as_deref() != Some(PROVIDER_CONTRACT_FORMAT) {
+        return Err(format!(
+            "provider_config.contract_version: format_version must be \
+             '{PROVIDER_CONTRACT_FORMAT}'"
+        ));
+    }
+    // The fixed members the adapter consumes obey the contract's shape
+    // rules: `model` is required, every present member is a non-empty
+    // bounded string. Extension members stay adapter-owned — neither
+    // required nor interpreted here.
+    if provider.model.is_none() {
+        return Err("provider_config.contract_invalid: 'model' is required".into());
+    }
+    for (member, value) in [
+        ("model", provider.model.as_deref()),
+        ("endpoint", provider.endpoint.as_deref()),
+        ("proxy_endpoint", provider.proxy_endpoint.as_deref()),
+    ] {
+        let Some(value) = value else { continue };
+        if value.trim().is_empty() {
+            return Err(format!(
+                "provider_config.contract_invalid: '{member}' must not be empty"
+            ));
+        }
+        if value.chars().count() > MAX_PROVIDER_FIELD_CHARS {
+            return Err(format!(
+                "provider_config.contract_invalid: '{member}' exceeds the field bound"
+            ));
+        }
+    }
+    Ok(provider)
 }
 
 /// The environment the runtime child sees. The runtime credential is

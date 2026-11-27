@@ -15,6 +15,9 @@ const bindings = fs.existsSync("/taisan/provider-config")
 if (bindings && bindings.format_version !== "taisan.worker.bindings/1") {
   throw new Error("unsupported provider-config contract");
 }
+// Only the contract version is checked here; the member shape rules
+// (required `model`, bounded non-empty strings) are the supervisor's
+// validation surface — docs/runtime-bindings.md.
 const credential = fs.existsSync("/taisan/runtime-auth")
   ? fs.readFileSync("/taisan/runtime-auth", "utf8")
   : null;
