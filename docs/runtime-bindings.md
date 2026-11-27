@@ -148,9 +148,13 @@ and any own-path source that is not a regular file or directory — a
 host socket, device, or fifo grants an IPC endpoint, never file
 content — including a directory source directly holding such an
 entry, so an argv-named container-runtime socket cannot be mounted.
-Nothing packaged is bound writable. Writable locations inside the
-sandbox are only `/workspace` (role-dependent), `/taisan/out`, `HOME`
-(tmpfs), and `TMPDIR` (`/tmp`). See
+Nothing packaged is bound writable. The only writable host paths are
+`/workspace` (role-dependent) and `/taisan/out`; every other writable
+location inside the sandbox is ephemeral — the tmpfs the sandbox root
+is assembled on (which carries only the generated mount points) and
+the fresh filesystems the isolation profile mounts for the child:
+`HOME` (tmpfs `/home`), `TMPDIR` (tmpfs `/tmp`), `/run` (tmpfs), and
+`/dev` (devtmpfs). See
 [examples/managed-worker](examples/managed-worker/README.md)
 for a concrete packaged layout.
 

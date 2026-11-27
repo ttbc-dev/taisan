@@ -1056,6 +1056,15 @@ mod tests {
         let runtime = dir.join("runtime");
         std::fs::create_dir_all(&runtime).unwrap();
         std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // A privileged runner ignores the mode bits — probe for that
+        // and skip rather than panic the whole binary on a guarantee
+        // this environment lacks.
+        if std::fs::write(runtime.join(".perm-probe"), b"x").is_ok() {
+            let _ = std::fs::remove_file(runtime.join(".perm-probe"));
+            std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
         // SAFETY: test-only env mutation; the name is unique to this
         // test — parallel env-driven tests must never share a variable.
         unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_TOKEN10", "sekrit10") };

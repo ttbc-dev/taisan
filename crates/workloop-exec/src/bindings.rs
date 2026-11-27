@@ -68,12 +68,20 @@ pub fn validate(path: &Path, credential_bytes: Option<&[u8]>) -> Result<(), Stri
     if metadata.len() > MAX_CONTRACT_BYTES {
         return Err(invalid("exceeds the contract size bound"));
     }
-    let bytes = std::fs::read(path).map_err(|e| format!("provider_config.unreadable: {e}"))?;
-    // The metadata check and the read race: a file that grew between
-    // them is still refused, never parsed past the bound.
-    if bytes.len() as u64 > MAX_CONTRACT_BYTES {
-        return Err(invalid("exceeds the contract size bound"));
-    }
+    // The stat and the read race, so the opened descriptor — not the
+    // path — carries the guarantee: O_NOFOLLOW refuses a link swapped
+    // in after the stat, O_NONBLOCK keeps a swapped-in fifo from
+    // blocking the open, and read_contract re-proves regular-file on
+    // the opened inode and caps the read at the contract bound.
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|e| format!("provider_config.unreadable: {e}"))?
+    };
+    let bytes = read_contract(file)?;
     let document = parse_contract(&bytes)?;
     let object = document
         .as_object()
@@ -117,6 +125,34 @@ pub fn validate(path: &Path, credential_bytes: Option<&[u8]>) -> Result<(), Stri
         }
     }
     Ok(())
+}
+
+/// Read the contract document through an already-open descriptor.
+/// The fstat re-proves regular-file on the inode actually opened and
+/// the read is capped at the contract bound, so a link or special
+/// file swapped in after the caller's stat, or a file that grew, is
+/// refused instead of buffered without limit.
+fn read_contract(file: std::fs::File) -> Result<Vec<u8>, String> {
+    if !file
+        .metadata()
+        .map_err(|e| format!("provider_config.unreadable: {e}"))?
+        .is_file()
+    {
+        return Err(invalid(
+            "not a regular file — the contract is exactly one document",
+        ));
+    }
+    let mut bytes = Vec::new();
+    {
+        use std::io::Read;
+        file.take(MAX_CONTRACT_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("provider_config.unreadable: {e}"))?;
+    }
+    if bytes.len() as u64 > MAX_CONTRACT_BYTES {
+        return Err(invalid("exceeds the contract size bound"));
+    }
+    Ok(bytes)
 }
 
 /// The credential as a consumer reads it: adapters trim the staged
@@ -349,6 +385,68 @@ mod tests {
         let err = validate(&missing, None).unwrap_err();
         assert!(err.starts_with("provider_config.unreadable"), "{err}");
         let err = validate(&dir, None).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bound is a property of the read, not only of the stat: a
+    /// document already over the bound is refused unread, and a link
+    /// path is refused without its target ever opening. These two
+    /// cases refuse at the path-level checks; the descriptor-level
+    /// guarantees are pinned by
+    /// `the_opened_descriptor_is_rechecked_before_reading`.
+    #[test]
+    fn oversized_and_linked_paths_refuse() {
+        let dir = tmp("bounds");
+        let fat = dir.join("fat.json");
+        let mut content = String::from(
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\",\"pad\":\"",
+        );
+        content.push_str(&"x".repeat(MAX_CONTRACT_BYTES as usize));
+        content.push_str("\"}");
+        std::fs::write(&fat, content).unwrap();
+        let err = validate(&fat, None).unwrap_err();
+        assert!(err.contains("exceeds the contract size bound"), "{err}");
+        let target = write(&dir, "target.json", VALID);
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = validate(&link, None).unwrap_err();
+        assert!(err.contains("not a regular file"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The descriptor-level guarantees hold even when no path-level
+    /// check ran first: an opened file whose content sits past the
+    /// bound is refused by the capped read, and an opened special file
+    /// (a fifo) is refused by the fstat — never read.
+    #[test]
+    fn the_opened_descriptor_is_rechecked_before_reading() {
+        let dir = tmp("fdchecks");
+        let fat = dir.join("fat.json");
+        let mut content = String::from(
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\",\"pad\":\"",
+        );
+        content.push_str(&"x".repeat(MAX_CONTRACT_BYTES as usize));
+        content.push_str("\"}");
+        std::fs::write(&fat, content).unwrap();
+        let file = std::fs::File::open(&fat).unwrap();
+        let err = read_contract(file).unwrap_err();
+        assert!(err.contains("exceeds the contract size bound"), "{err}");
+        let fifo = dir.join("pipe");
+        let c_path = {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap()
+        };
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)
+                .unwrap()
+        };
+        let err = read_contract(file).unwrap_err();
         assert!(err.contains("not a regular file"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
