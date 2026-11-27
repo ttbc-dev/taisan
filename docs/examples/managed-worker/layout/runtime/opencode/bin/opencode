@@ -1,0 +1,7 @@
+#!/bin/sh
+# Placeholder for the OpenCode runtime payload the packaged Worker
+# spawns. In a real install this is the runtime's own executable,
+# delivered read-only under the package root like every other runtime
+# file.
+echo "example runtime payload" >&2
+exit 1

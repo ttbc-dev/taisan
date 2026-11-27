@@ -2035,6 +2035,94 @@ fn contained_verification_never_binds_a_path_the_submission_argv_names() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A supervisor-produced bind tree is trusted content: the bare
+/// repository is mounted read-only without the declared-source tree
+/// certification, so a fifo planted inside it — or a repository
+/// larger than the scan's entry bound — cannot refuse the
+/// verification. Declared sources keep the guard: the next test
+/// proves a cache holding the same special file still refuses.
+#[test]
+fn contained_verification_admits_the_supervisor_produced_tree() {
+    let root = tmp_root("verify-suptree");
+    let (store, mut layout, scratch, aid) = acknowledged(&root, "vc-suptree");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let port = workloop_exec::scripted::ScriptedProcessControl::new();
+    let (_bwrap, _relay, _bwrap_log, _relay_log) =
+        install_sandbox(&mut layout, &root, port, vec![], vec![]);
+    let st = std::process::Command::new("mkfifo")
+        .arg(layout.repository.join("planted.fifo"))
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let marker = root.join("proof-marker.txt");
+    let argv = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!("echo verified > '{}'", marker.display()),
+    ];
+    let res = handoff::verify(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[0]",
+        &argv,
+        &scratch,
+        &[],
+        &Ok(None),
+        &mut || 0,
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Pass, "{}", res.output);
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap().trim(),
+        "verified",
+        "the declared argv ran to completion"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The exemption is scoped to supervisor-produced trees: a declared
+/// cache directory holding a fifo is still refused — the declared
+/// spelling could name a host IPC endpoint, so the deep
+/// certification still guards it.
+#[test]
+fn contained_verification_still_refuses_a_declared_cache_holding_a_special_file() {
+    let root = tmp_root("verify-cache-fifo");
+    let (store, mut layout, scratch, aid) = acknowledged(&root, "vc-cachefifo");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let port = workloop_exec::scripted::ScriptedProcessControl::new();
+    let (_bwrap, _relay, bwrap_log, _relay_log) =
+        install_sandbox(&mut layout, &root, port, vec![], vec![]);
+    let st = std::process::Command::new("mkfifo")
+        .arg(root.join("deps-cache/daemon.fifo"))
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let res = handoff::verify(
+        &store,
+        &layout,
+        &aid,
+        "verification_argv[0]",
+        &["/bin/sh".into(), "-c".into(), "true".into()],
+        &scratch,
+        &[],
+        &Ok(None),
+        &mut || 0,
+    )
+    .unwrap();
+    assert_eq!(res.result, VerificationOutcome::Inconclusive);
+    assert!(
+        res.output.contains("holding a socket, device, or fifo"),
+        "{}",
+        res.output
+    );
+    assert!(
+        !bwrap_log.exists(),
+        "the sandbox never launched on a refused cache"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn contained_verification_refuses_a_model_api_egress_host() {
     let root = tmp_root("verify-denied");

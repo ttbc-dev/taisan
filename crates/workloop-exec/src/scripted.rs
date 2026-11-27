@@ -630,7 +630,7 @@ impl ProcessControlPort for ScriptedProcessControl {
         if let Some(reason) = s.scan_errors.pop_front() {
             return Err(reason);
         }
-        let expected = crate::supervisor::normalize_lstart(command);
+        let expected = crate::supervisor::normalize_signature(command);
         // The model's process table is system-wide like the real one:
         // every live process whose command matches is a candidate,
         // parentage irrelevant — a reparented orphan still matches.
@@ -638,7 +638,9 @@ impl ProcessControlPort for ScriptedProcessControl {
         // read, and an uninspectable row still counts as live.
         Ok(s.procs
             .iter()
-            .filter(|(_, p)| p.alive && crate::supervisor::normalize_lstart(&p.command) == expected)
+            .filter(|(_, p)| {
+                p.alive && crate::supervisor::normalize_signature(&p.command) == expected
+            })
             .map(|(pid, p)| ProcessMatch {
                 identity: ProcessIdentity {
                     pid: *pid,

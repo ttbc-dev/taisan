@@ -165,7 +165,7 @@ transport.
 | `--runtime <argv0>` | `claude` | The runtime executable to spawn |
 | `--runtime-arg <arg>` | — | Extra leading runtime argv (repeatable; e.g. a wrapper's flags) |
 | `--runtime-auth <path>` | `/taisan/runtime-auth` | File containing the runtime credential |
-| `--provider-config <path>` | `/taisan/provider-config` | Supervisor-validated JSON provider config |
+| `--provider-config <path>` | `/taisan/provider-config` | Supervisor-validated `taisan.worker.bindings/1` provider config |
 
 ### Declaration
 
@@ -267,9 +267,11 @@ entirely: the Worker has no GitHub mutation authority, no inherited
 credential helper, and no publication credential by construction.
 
 `--provider-config` points at the supervisor-validated, read-only
-provider JSON; the adapter reads `model`, `endpoint` (→
-`ANTHROPIC_BASE_URL`), and `proxy_endpoint` (→ `HTTPS_PROXY`). The
-credential can never be embedded in provider config.
+`taisan.worker.bindings/1` provider document
+([runtime-bindings.md](runtime-bindings.md)); the adapter reads
+`model`, `endpoint` (→ `ANTHROPIC_BASE_URL`), and `proxy_endpoint` (→
+`HTTPS_PROXY`). The credential can never be embedded in provider
+config.
 
 ### What the Worker can never do
 
@@ -305,8 +307,9 @@ max_turns = 200
 ```
 
 `worker_credential_ref` resolves to the staged runtime credential
-(never a value in the record); `worker_provider_config` is the staged
-provider JSON; `worker_model_api_hosts` allowlists the model API
+(never a value in the record); `worker_provider_config` is the
+`taisan.worker.bindings/1` contract document;
+`worker_model_api_hosts` allowlists the model API
 egress the supervisor's CONNECT proxy serves. On the production
 profile (`taisan-reference-v0.1`, Linux + `bwrap`) the workspace,
 request, input, runtime-auth, provider-config, and proxy mount points

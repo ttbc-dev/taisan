@@ -152,16 +152,20 @@ pub struct Installation {
     pub worker_isolation_profile: Option<String>,
     /// The single runtime credential the contained Worker may receive,
     /// as an `env:`/`file:`/`command:` provider reference — never a
-    /// secret value (`docs/v0.3.md` §14.3). Resolved once at the
-    /// supervisor boundary and delivered only through the approved
+    /// secret value (`docs/v0.3.md` §14.3). Resolved and staged fresh
+    /// at the supervisor boundary on every contained launch and
+    /// `describe` probe — the next Invocation observes the latest
+    /// provider value — and delivered only through the approved
     /// `/taisan/runtime-auth` path; absent means the Worker gets no
     /// runtime credential.
     #[serde(default)]
     pub worker_credential_ref: Option<String>,
-    /// Absolute path to a non-secret provider configuration file or
-    /// directory, bound read-only at `/taisan/provider-config`. It
-    /// must not contain the resolved credential value; the supervisor
-    /// validates before mounting.
+    /// Absolute path to a non-secret provider configuration file —
+    /// exactly one regular file satisfying the
+    /// `taisan.worker.bindings/1` contract — bound read-only at
+    /// `/taisan/provider-config`. It must not contain the resolved
+    /// credential value; the supervisor validates before every
+    /// dispatch.
     #[serde(default)]
     pub worker_provider_config: Option<String>,
     /// Bare host names the Worker CONNECT proxy may reach on port 443

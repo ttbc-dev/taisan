@@ -149,7 +149,8 @@ pub struct MountPlan {
     /// SSH socket, or keyring.
     pub runtime_auth: Option<PathBuf>,
     /// The validated non-secret provider configuration →
-    /// `/taisan/provider-config`, read-only. A file or directory.
+    /// `/taisan/provider-config`, read-only. Exactly one regular file
+    /// — the `taisan.worker.bindings/1` contract document.
     pub provider_config: Option<PathBuf>,
     /// The CONNECT proxy's Unix socket → `/taisan/proxy.sock`,
     /// read-only. Present only when the launch's egress allowlist is
@@ -183,6 +184,24 @@ pub struct MountPlan {
     /// another artifact's refs because it names exactly one
     /// worktree's metadata directory.
     pub extra_rw_binds: Vec<PathBuf>,
+    /// Host trees the supervisor itself produced or manages, bound
+    /// read-only at their own path — the verification worktree and
+    /// the installation bare repository. Unlike `extra_binds` no
+    /// declared text (argv, profile, config) reaches their spelling
+    /// and their content comes from git operations that cannot
+    /// materialize a special file, so `plan_denial` does not run the
+    /// deep tree certification on them: a repository with vendored
+    /// dependencies or many loose objects would exceed the scan's
+    /// entry bound and refuse a verification nobody asked the scan to
+    /// protect. Only `handoff::run_verification` populates this
+    /// field — a declared path spelled here would bypass the
+    /// certification, so nothing from argv, profile, or config may
+    /// reach it; a single resolved file (the relay executable) is
+    /// declared-class and stays in `extra_binds` where the launch
+    /// plans keep it. The host-root, owner-home, sandbox-shadow, and
+    /// top-level file/directory checks still apply — a supervised
+    /// bind that is itself a special file is never mounted.
+    pub supervised_binds: Vec<PathBuf>,
     /// The resolved host path of the worker executable, bound
     /// read-only at its own absolute path. `None` for sandboxes whose
     /// inner argv is not a single resolved executable (verification
@@ -375,17 +394,20 @@ pub fn ca_trust_binds(profile: &IsolationProfile) -> Vec<PathBuf> {
 /// The sandbox spellings at which a `masked_files` entry stays
 /// visible — the destinations its `/dev/null` shadow must cover. An
 /// own-path plan bind mounts host content at its own spelling, so a
-/// covered file is reachable inside at that path. A symlinked bind or
-/// ancestor exposes the same file under a second spelling, so the
-/// literal path and its canonical form are both checked, and coverage
-/// through a resolved bind renders the mask under the spelling the
-/// plan named. A path beneath an emitted mask-root tmpfs is already
-/// invisible — only an own-path bind re-mounting over the tmpfs can
-/// make it reachable again, and that coverage is collected first.
-/// Nothing else creates the path inside the sandbox: an entry no
-/// mount covers is already invisible and must not be masked — a
-/// `--ro-bind` destination nothing created would fail the whole mount
-/// setup.
+/// covered file is reachable inside at that path; the supervisor's
+/// own produced trees (`supervised_binds` — the verification
+/// worktree, the installation repository) count the same way, since
+/// they re-mount host content over any mask-root tmpfs that covers
+/// their spelling. A symlinked bind or ancestor exposes the same
+/// file under a second spelling, so the literal path and its
+/// canonical form are both checked, and coverage through a resolved
+/// bind renders the mask under the spelling the plan named. A path
+/// beneath an emitted mask-root tmpfs is already invisible — only an
+/// own-path bind re-mounting over the tmpfs can make it reachable
+/// again, and that coverage is collected first. Nothing else creates
+/// the path inside the sandbox: an entry no mount covers is already
+/// invisible and must not be masked — a `--ro-bind` destination
+/// nothing created would fail the whole mount setup.
 fn masked_file_dests(plan: &MountPlan, file: &Path) -> Vec<PathBuf> {
     masked_file_dests_among(plan, file, SYSTEM_BINDS)
 }
@@ -416,6 +438,7 @@ fn masked_file_dests_among(plan: &MountPlan, file: &Path, binds: &[&str]) -> Vec
         .chain(plan.ca_bundles.iter())
         .chain(plan.extra_binds.iter())
         .chain(plan.extra_rw_binds.iter())
+        .chain(plan.supervised_binds.iter())
         .chain(plan.worker.iter())
     {
         let bind_resolved = bind.canonicalize().unwrap_or_else(|_| bind.clone());
@@ -473,12 +496,38 @@ fn masked_file_dests_among(plan: &MountPlan, file: &Path, binds: &[&str]) -> Vec
 }
 
 /// Refuse a mount plan whose binds would cover or enter the
-/// supervisor-owned sandbox surface. Every bind the plan mounts at
-/// its own spelling is checked — caches, argv-derived binds, the
-/// writable metadata binds, the toolchain's own-path bind, and the
-/// worker — and a fixed-destination source (toolchain, provider
-/// config) must not resolve to the host root, which would mount the
-/// whole host filesystem read-only inside the sandbox.
+/// supervisor-owned sandbox surface, or whose sources the contract
+/// never admits. Every bind the plan mounts at its own spelling is
+/// checked — caches, argv-derived binds, the writable metadata
+/// binds, the toolchain's own-path bind, and the worker — and a
+/// fixed-destination source (toolchain, provider config) must not
+/// resolve to the host root, which would mount the whole host
+/// filesystem read-only inside the sandbox. Two more source rules
+/// close the contract's "host `/`, a container socket, and the
+/// owner's home are never bind sources" guarantee
+/// (`docs/runtime-bindings.md`): no bind source resolves to the
+/// owner's home directory or an ancestor of it — a workspace-class
+/// bind of `$HOME` would expose the whole tree, while a path
+/// strictly beneath it mounts only the named path under the tmpfs
+/// `/home` — and no own-path source is a socket, device, fifo, or
+/// other special file, which would grant a host IPC endpoint rather
+/// than file content (the fixed-destination `/taisan/proxy.sock`
+/// bind is a socket by contract and exempt). The deep tree
+/// certification — a directory source holding such an entry anywhere
+/// in its tree is refused too, since the bind would carry the
+/// endpoint in with it, as is a directory the bounded tree scan
+/// cannot fully certify — runs only on declared sources: binds
+/// spelled from worker argv, profile, or installation config.
+/// `supervised_binds` (trees the supervisor produced itself) are
+/// exempt from it: no declared text reaches their spelling, their
+/// content is supervisor/git-produced, and a repository larger than
+/// the scan's entry bound must not fail verification — they still
+/// take the root, home, shadow, and top-level type checks. The
+/// sealed/covered
+/// destination check applies only to binds spelled at their own
+/// path: a fixed-destination source like the workspace mounts under
+/// `/workspace` whatever its host spelling, so a host path beneath
+/// the sandbox spelling is admissible there.
 /// `Some(reason)` is a typed boundary refusal;
 /// `None` admits the plan. Callers check before rendering argv: a
 /// refused plan never reaches `bwrap`.
@@ -499,21 +548,108 @@ pub fn plan_denial(plan: &MountPlan) -> Option<String> {
             ));
         }
     }
-    let own_path_binds = plan
-        .toolchain
-        .iter()
-        .chain(plan.caches.iter())
-        .chain(plan.ca_bundles.iter())
-        .chain(plan.extra_binds.iter())
-        .chain(plan.extra_rw_binds.iter())
-        .chain(plan.worker.iter());
-    for bind in own_path_binds {
+    // Declared own-path sources — spelled by worker argv, profile,
+    // or installation config — get the deep tree certification;
+    // supervisor-produced trees (`supervised_binds`) skip it: their
+    // spelling names no declared text and their content is
+    // supervisor/git-produced, so scanning them only refuses trees
+    // nobody needed certified.
+    let declared_binds = || {
+        plan.toolchain
+            .iter()
+            .chain(plan.caches.iter())
+            .chain(plan.ca_bundles.iter())
+            .chain(plan.extra_binds.iter())
+            .chain(plan.extra_rw_binds.iter())
+            .chain(plan.worker.iter())
+    };
+    let own_path_binds = || declared_binds().chain(plan.supervised_binds.iter());
+    // The owner's home directories, canonicalized once: a bind
+    // spelled at the home directory itself — or an ancestor of it —
+    // would expose the whole tree, so the comparison is made on the
+    // resolved spelling and cannot be dodged by a symlinked path.
+    let owner_homes = owner_home_dirs();
+    let all_sources = [
+        plan.workspace.as_ref().map(|(path, _)| path),
+        plan.request.as_ref(),
+        plan.input.as_ref(),
+        plan.out.as_ref(),
+        plan.gitconfig.as_ref(),
+        plan.runtime_auth.as_ref(),
+        plan.provider_config.as_ref(),
+        plan.proxy_sock.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(own_path_binds());
+    for bind in all_sources {
+        let resolved = bind.canonicalize().unwrap_or_else(|_| bind.clone());
+        if resolved.parent().is_none() {
+            return Some(format!(
+                "mount plan bind '{}' resolves to the host root — \
+                 the host root is never a bind source",
+                bind.display()
+            ));
+        }
+        if owner_homes.iter().any(|home| home.starts_with(&resolved)) {
+            return Some(format!(
+                "mount plan bind '{}' resolves to the owner's home — \
+                 the home directory and its ancestors are never bind sources",
+                bind.display()
+            ));
+        }
+    }
+    for (bind, declared) in declared_binds()
+        .map(|bind| (bind, true))
+        .chain(plan.supervised_binds.iter().map(|bind| (bind, false)))
+    {
         let resolved = bind.canonicalize().unwrap_or_else(|_| bind.clone());
         if shadows_sandbox_mount(bind) || shadows_sandbox_mount(&resolved) {
             return Some(format!(
                 "mount plan bind '{}' covers a supervisor-owned sandbox path",
                 bind.display()
             ));
+        }
+        let Ok(metadata) = std::fs::metadata(&resolved) else {
+            continue;
+        };
+        if !metadata.is_file() && !metadata.is_dir() {
+            return Some(format!(
+                "mount plan bind '{}' is not a regular file or directory — \
+                 host sockets, devices, and fifos are never bind sources",
+                bind.display()
+            ));
+        }
+        // A directory bind carries its whole tree with it: a special
+        // file anywhere beneath the source mounts the endpoint inside
+        // the sandbox, so the bounded walk descends every member
+        // directory rather than stopping at the top level. It fails
+        // closed — a directory that cannot be read, an entry whose
+        // type cannot be determined, or a tree past the entry bound
+        // is refused rather than admitted uncertified — and a
+        // symlinked entry is left to resolve inside the sandbox where
+        // its target is the sandbox's own tree. Only declared sources
+        // are walked: a supervisor-produced tree is trusted content
+        // the scan cannot refuse on size alone.
+        if declared && metadata.is_dir() {
+            match scan_dir_bind_tree(&resolved) {
+                DirBindScan::Clean => {}
+                DirBindScan::SpecialEntry => {
+                    return Some(format!(
+                        "mount plan bind '{}' is a directory holding a socket, device, or fifo — \
+                         the bind would expose a host IPC endpoint inside the sandbox",
+                        bind.display()
+                    ));
+                }
+                DirBindScan::Uncertifiable => {
+                    return Some(format!(
+                        "mount plan bind '{}' is a directory that cannot be proven free of a \
+                         socket, device, or fifo — the bind would expose a host IPC endpoint \
+                         inside the sandbox",
+                        bind.display()
+                    ));
+                }
+            }
         }
     }
     // A `masked_files` entry that stays visible must also stay
@@ -565,6 +701,144 @@ pub fn plan_denial(plan: &MountPlan) -> Option<String> {
             ));
         }
     }
+    None
+}
+
+/// How many entries a bind-source directory scan visits before it
+/// stops certifying: the walk covers real directory trees — runtime
+/// packages, toolchains, caches — while staying bounded per plan. A
+/// tree the scan cannot fully certify inside the bound is refused
+/// rather than admitted uninspected.
+const MAX_BIND_TREE_SCAN_ENTRIES: usize = 65_536;
+
+/// The verdict of a bounded walk over a bind-source directory tree.
+enum DirBindScan {
+    /// Every visited entry is a regular file, directory, or symlink.
+    Clean,
+    /// A socket, device, fifo, or other special file lives in the
+    /// tree — a live host IPC endpoint the mount would carry inside.
+    SpecialEntry,
+    /// The tree could not be fully certified — a read failed, an
+    /// entry's type was undeterminable, or the entry bound ran out.
+    Uncertifiable,
+}
+
+/// Walk a bind-source directory tree and report whether it is free
+/// of special files. A directory bind mounts every entry beneath the
+/// source — nesting is no hiding place — so the walk descends real
+/// directories until it proves the tree clean, finds an endpoint, or
+/// runs out of certifiable room. Member links are never followed: a
+/// symlink resolves inside the sandbox against the sandbox's own
+/// tree. The scan fails closed — any doubt is `Uncertifiable`, which
+/// the caller refuses like a found endpoint.
+fn scan_dir_bind_tree(root: &Path) -> DirBindScan {
+    scan_dir_bind_tree_bounded(root, MAX_BIND_TREE_SCAN_ENTRIES)
+}
+
+/// The bounded walk behind `scan_dir_bind_tree`, with the entry cap
+/// passed in so a test can reach the exhaustion branch without
+/// building a 65k-entry tree.
+fn scan_dir_bind_tree_bounded(root: &Path, max_entries: usize) -> DirBindScan {
+    let mut remaining = max_entries;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return DirBindScan::Uncertifiable;
+        };
+        for entry in entries {
+            if remaining == 0 {
+                return DirBindScan::Uncertifiable;
+            }
+            remaining -= 1;
+            let Ok(entry) = entry else {
+                return DirBindScan::Uncertifiable;
+            };
+            let Ok(kind) = entry.file_type() else {
+                return DirBindScan::Uncertifiable;
+            };
+            if kind.is_file() || kind.is_symlink() {
+                continue;
+            }
+            if !kind.is_dir() {
+                return DirBindScan::SpecialEntry;
+            }
+            pending.push(entry.path());
+        }
+    }
+    DirBindScan::Clean
+}
+
+/// The launching uid's home directories: `$HOME` when it names a
+/// usable path, plus the account-database entry — the environment
+/// spelling can be missing in a system-service context or point at
+/// an unrelated directory, and only the passwd entry keeps the
+/// contract's home guarantee from silently lapsing in both cases.
+/// Canonicalized so a symlinked home spelling cannot dodge the
+/// comparison. A home that does not exist cannot be exposed, so a
+/// spelling that fails to resolve simply drops out.
+fn owner_home_dirs() -> Vec<PathBuf> {
+    owner_home_dirs_from(std::env::var_os("HOME"))
+}
+
+fn owner_home_dirs_from(env_home: Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    if let Some(home) = env_home
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .and_then(|home| home.canonicalize().ok())
+    {
+        homes.push(home);
+    }
+    if let Some(home) = passwd_home_dir().and_then(|home| home.canonicalize().ok())
+        && !homes.contains(&home)
+    {
+        homes.push(home);
+    }
+    homes
+}
+
+/// The account-database home for the effective uid, resolved
+/// independently of the environment.
+#[cfg(unix)]
+fn passwd_home_dir() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    // The buffer holds the entry's strings; an unusually long
+    // record signals ERANGE, so grow it a bounded number of times
+    // rather than letting the guard's spelling silently drop out.
+    for size in [4096usize, 16384, 65536] {
+        let mut buffer = vec![0u8; size];
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::geteuid(),
+                &mut entry,
+                buffer.as_mut_ptr().cast::<libc::c_char>(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE {
+            continue;
+        }
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+        let dir = unsafe { (*result).pw_dir };
+        if dir.is_null() {
+            return None;
+        }
+        let bytes = unsafe { std::ffi::CStr::from_ptr(dir) }.to_bytes();
+        if bytes.is_empty() {
+            return None;
+        }
+        return Some(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())));
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn passwd_home_dir() -> Option<PathBuf> {
     None
 }
 
@@ -715,6 +989,9 @@ pub fn bwrap_args(
         args.extend(["--ro-bind".to_string(), s(bundle), s(bundle)]);
     }
     for extra in &plan.extra_binds {
+        args.extend(["--ro-bind".to_string(), s(extra), s(extra)]);
+    }
+    for extra in &plan.supervised_binds {
         args.extend(["--ro-bind".to_string(), s(extra), s(extra)]);
     }
     for extra in &plan.extra_rw_binds {
@@ -997,6 +1274,7 @@ fn invisible_canary(workspace_root: &Path, plan: &MountPlan) -> PathBuf {
     .chain(plan.ca_bundles.iter().cloned())
     .chain(plan.extra_binds.iter().cloned())
     .chain(plan.extra_rw_binds.iter().cloned())
+    .chain(plan.supervised_binds.iter().cloned())
     .collect();
     let covered = |candidate: &Path| {
         let resolved = candidate
@@ -1076,6 +1354,7 @@ fn run_battery(
         ca_bundles: ca_trust_binds(profile),
         extra_binds: vec![],
         extra_rw_binds: vec![],
+        supervised_binds: vec![],
         worker: worker.map(Path::to_path_buf),
         mask_roots: vec![workspace_root.to_path_buf()],
         masked_files: vec![],
@@ -1507,6 +1786,7 @@ mod tests {
             ca_bundles: vec![],
             extra_binds: vec![PathBuf::from("/opt/worker.py")],
             extra_rw_binds: vec![],
+            supervised_binds: vec![],
             worker: Some(PathBuf::from("/opt/worker")),
             mask_roots: vec![],
             masked_files: vec![],
@@ -1757,6 +2037,51 @@ mod tests {
             mask > own_bind,
             "the mask must shadow the own-path bind: {text}"
         );
+    }
+
+    /// A `file:` credential source beneath a supervisor-produced tree —
+    /// the verification worktree or the installation bare repository —
+    /// is reachable inside the sandbox at its own spelling, so the
+    /// `/dev/null` shadow must cover it there too: the supervised bind
+    /// mounts the tree read-only over any mask-root tmpfs that
+    /// swallowed its spelling.
+    #[test]
+    fn a_masked_file_beneath_a_supervised_bind_is_shadowed() {
+        let dir = tmp("masked-supervised");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("credential-source");
+        std::fs::write(&file, b"sentinel").unwrap();
+        let mut plan = plan_fixture();
+        plan.masked_files = vec![file.clone()];
+        plan.supervised_binds = vec![dir.clone()];
+        let args = bwrap_args(
+            Path::new("/usr/bin/bwrap"),
+            &plan,
+            &["worker".into()],
+            "/workspace",
+        );
+        let text = args.join(" ");
+        let own_bind = text
+            .find(&format!("--ro-bind {0} {0}", dir.display()))
+            .expect("the supervised bind renders at its own spelling");
+        let mask = text
+            .find(&format!("--ro-bind /dev/null {}", file.display()))
+            .expect("a supervised-bind-covered credential is masked");
+        assert!(
+            mask > own_bind,
+            "the mask renders after the supervised bind: {text}"
+        );
+        assert!(
+            plan_denial(&plan).is_none(),
+            "a regular covered file shadows instead of refusing: {text}"
+        );
+        // A covered *directory* named in masked_files cannot take the
+        // shadow — the plan refuses rather than emit a mask that
+        // cannot hold.
+        plan.masked_files = vec![dir.clone()];
+        let reason = plan_denial(&plan).expect("an unshadowable entry refuses");
+        assert!(reason.contains("not a regular file"), "{reason}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// On a merged-`/usr` layout each system-bind member is bound as
@@ -2080,6 +2405,277 @@ mod tests {
         // The fixture plan itself admits.
         plan.extra_rw_binds = vec![];
         assert!(plan_denial(&plan).is_none());
+    }
+
+    /// An own-path source that is not a regular file or directory is
+    /// a host IPC endpoint, never file content: an argv-named
+    /// container-runtime socket under `/run` would otherwise ride the
+    /// tmpfs-covered prefix into the sandbox live.
+    #[test]
+    fn plan_denial_refuses_a_socket_bind_source() {
+        let dir = tmp("sockbind");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("containerd.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let mut plan = plan_fixture();
+        plan.extra_binds = vec![sock];
+        let reason = plan_denial(&plan).expect("a socket source refuses");
+        assert!(
+            reason.contains("not a regular file or directory"),
+            "{reason}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The owner's home is never a bind source: spelled at the home
+    /// directory itself — or an ancestor of it — the bind would
+    /// expose the whole tree. A path strictly beneath it mounts only
+    /// the named path; the tmpfs `/home` keeps the rest invisible.
+    #[test]
+    fn plan_denial_refuses_the_owners_home_as_a_bind_source() {
+        let Some(home) = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+        else {
+            return;
+        };
+        let mut plan = plan_fixture();
+        plan.extra_binds = vec![home.clone()];
+        let reason = plan_denial(&plan).expect("the home directory refuses");
+        assert!(reason.contains("owner's home"), "{reason}");
+        // The guard decides on the resolved spelling, never on the
+        // filesystem: a never-created name strictly beneath the home
+        // exercises the same admission without writing into the
+        // operator's account directory — nothing here can panic on a
+        // read-only home or leak a probe file.
+        let beneath = home.join(format!("workloop-home-bind-{}", std::process::id()));
+        plan.extra_binds = vec![beneath];
+        assert!(
+            plan_denial(&plan).is_none(),
+            "a path beneath the home still binds only the named path"
+        );
+    }
+
+    /// The home guard must not lapse with the environment spelling:
+    /// a missing or misleading `$HOME` still leaves the
+    /// account-database home refused as a bind source.
+    #[test]
+    fn owner_home_dirs_hold_the_passwd_home_past_a_misleading_env() {
+        let Some(passwd_home) = passwd_home_dir().and_then(|home| home.canonicalize().ok()) else {
+            return;
+        };
+        for env_home in [None, Some(std::ffi::OsString::from("/"))] {
+            let homes = owner_home_dirs_from(env_home.clone());
+            assert!(
+                homes.contains(&passwd_home),
+                "env spelling {env_home:?} dropped the passwd home: {homes:?}"
+            );
+            let mut plan = plan_fixture();
+            plan.extra_binds = vec![passwd_home.clone()];
+            let reason = plan_denial(&plan).expect("the passwd home refuses");
+            assert!(reason.contains("owner's home"), "{reason}");
+        }
+    }
+
+    /// A directory bind carries its entries with it: naming the
+    /// socket's parent directory instead of the socket itself must
+    /// not reopen the endpoint — a `/run/containerd`-style spelling
+    /// rides the tmpfs-covered prefix in live either way.
+    #[test]
+    fn plan_denial_refuses_a_directory_bind_holding_a_socket() {
+        let dir = tmp("sockdir");
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("file"), "x").unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(dir.join("daemon.sock")).unwrap();
+        let mut plan = plan_fixture();
+        plan.extra_binds = vec![dir.clone()];
+        let reason = plan_denial(&plan).expect("a socket-holding directory refuses");
+        assert!(reason.contains("directory holding"), "{reason}");
+        plan.extra_binds = vec![dir.join("nested")];
+        assert!(
+            plan_denial(&plan).is_none(),
+            "a directory of regular entries still binds"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The directory guard reaches the whole tree: a socket nested
+    /// beneath a member subdirectory mounts inside the sandbox too,
+    /// so depth is no hiding place for the endpoint.
+    #[test]
+    fn plan_denial_refuses_a_nested_socket_in_a_directory_bind() {
+        let dir = tmp("sockdeep");
+        let nested = dir.join("outer/inner");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.join("outer/file"), "x").unwrap();
+        let sock = nested.join("s");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let mut plan = plan_fixture();
+        plan.extra_binds = vec![dir.clone()];
+        let reason = plan_denial(&plan).expect("a nested socket still refuses");
+        assert!(reason.contains("directory holding"), "{reason}");
+        // Once the endpoint is gone the same tree binds.
+        std::fs::remove_file(&sock).unwrap();
+        drop(_listener);
+        assert!(
+            plan_denial(&plan).is_none(),
+            "a clean nested tree still binds"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory the bounded scan cannot certify is refused rather
+    /// than admitted uninspected: an execute-only member the
+    /// supervisor cannot list may hide the endpoint the guard exists
+    /// to refuse.
+    #[test]
+    fn plan_denial_refuses_a_directory_bind_it_cannot_scan() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp("unlistable");
+        let hidden = dir.join("hidden");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(hidden.join("file"), "x").unwrap();
+        let saved = std::fs::metadata(&hidden).unwrap().permissions();
+        let mut unlistable = saved.clone();
+        unlistable.set_mode(0o111);
+        std::fs::set_permissions(&hidden, unlistable).unwrap();
+        // A privileged runner ignores the mode bits — probe for that
+        // and skip rather than assert a guarantee this environment
+        // lacks.
+        if std::fs::read_dir(&hidden).is_ok() {
+            std::fs::set_permissions(&hidden, saved).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let mut plan = plan_fixture();
+        plan.extra_binds = vec![dir.clone()];
+        let reason = plan_denial(&plan).expect("an unlistable tree refuses");
+        assert!(reason.contains("cannot be proven free"), "{reason}");
+        std::fs::set_permissions(&hidden, saved).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The scan's entry bound fails closed too: a tree it cannot
+    /// finish certifying inside the cap is `Uncertifiable`, refused
+    /// like a found endpoint rather than admitted half-inspected.
+    #[test]
+    fn the_scan_bound_fails_closed_on_an_uncertified_tree() {
+        let dir = tmp("scanbound");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), "x").unwrap();
+        std::fs::write(dir.join("b"), "x").unwrap();
+        assert!(matches!(
+            scan_dir_bind_tree_bounded(&dir, 1),
+            DirBindScan::Uncertifiable
+        ));
+        assert!(matches!(
+            scan_dir_bind_tree_bounded(&dir, 2),
+            DirBindScan::Clean
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A supervisor-produced tree — the verification worktree, the
+    /// installation bare repository — is trusted content the
+    /// certification was never meant to cover: no declared text
+    /// reaches its spelling, so `plan_denial` admits it without the
+    /// bounded walk and a repository larger than the entry bound
+    /// cannot refuse the verification it serves. The same tree
+    /// spelled in `extra_binds` — a declared source — still refuses.
+    #[test]
+    fn plan_denial_skips_the_tree_scan_for_supervised_binds() {
+        let dir = tmp("supbind");
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("file"), "x").unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(dir.join("daemon.sock")).unwrap();
+        let mut plan = plan_fixture();
+        plan.supervised_binds = vec![dir.clone()];
+        assert!(
+            plan_denial(&plan).is_none(),
+            "a supervisor-produced tree is not deep-certified"
+        );
+        plan.supervised_binds = vec![];
+        plan.extra_binds = vec![dir.join("nested"), dir.clone()];
+        let reason = plan_denial(&plan).expect("the declared tree still refuses");
+        assert!(reason.contains("directory holding"), "{reason}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Exempting the walk must not exempt the rest: a supervised
+    /// bind spelled at a covered mount still shadows the sandbox,
+    /// and one that is itself a special file is still a host IPC
+    /// endpoint, never file content.
+    #[test]
+    fn plan_denial_still_guards_a_supervised_binds_spelling() {
+        let mut plan = plan_fixture();
+        plan.supervised_binds = vec![PathBuf::from("/run")];
+        let reason = plan_denial(&plan).expect("a covered-mount spelling refuses");
+        assert!(reason.contains("covers a supervisor-owned"), "{reason}");
+        let dir = tmp("supsock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        plan.supervised_binds = vec![sock];
+        let reason = plan_denial(&plan).expect("a special-file source refuses");
+        assert!(
+            reason.contains("not a regular file or directory"),
+            "{reason}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A supervised bind renders exactly like an argv-derived one —
+    /// read-only at its own host path — so the sandbox sees the
+    /// supervisor's tree where the host keeps it.
+    #[test]
+    fn supervised_binds_render_as_own_path_read_only_binds() {
+        let mut plan = plan_fixture();
+        plan.supervised_binds = vec![PathBuf::from("/host/repo.git"), PathBuf::from("/host/wt")];
+        let argv = bwrap_args(Path::new("/bwrap"), &plan, &["/bin/sh".to_string()], "/tmp");
+        let joined = argv.join(" ");
+        assert!(
+            joined.contains("--ro-bind /host/repo.git /host/repo.git")
+                && joined.contains("--ro-bind /host/wt /host/wt"),
+            "{joined}"
+        );
+    }
+
+    /// The invisibility canary counts a supervised bind like any
+    /// other mount source: a candidate beneath one is visible inside
+    /// the sandbox, so the pick falls through to a path the argv
+    /// provably never mounts.
+    #[test]
+    fn the_canary_never_sits_under_a_supervised_bind() {
+        let mut plan = plan_fixture();
+        let bound = tmp("supcanary");
+        std::fs::create_dir_all(&bound).unwrap();
+        // The coverage check canonicalizes the bound source — spell
+        // it resolved so /var→/private/var cannot split the match.
+        let bound = bound.canonicalize().unwrap();
+        plan.supervised_binds = vec![bound.clone()];
+        let picked = invisible_canary(&bound.join("ws-root"), &plan);
+        assert!(
+            !picked.starts_with(&bound),
+            "the canary is never under a supervised bind: {picked:?}"
+        );
+        let _ = std::fs::remove_dir_all(&bound);
+    }
+
+    /// A fixed-destination source mounts under its sandbox spelling
+    /// whatever its host path, so the sealed/covered destination
+    /// check does not apply to it: a host workspace spelled
+    /// `/workspace` — a container-style checkout — still launches.
+    /// The host root itself stays refused for every source kind.
+    #[test]
+    fn plan_denial_admits_a_workspace_spelled_under_the_sandbox_workspace() {
+        let mut plan = plan_fixture();
+        plan.workspace = Some((PathBuf::from("/workspace"), false));
+        assert!(plan_denial(&plan).is_none());
+        plan.workspace = Some((PathBuf::from("/workspace/repo"), false));
+        assert!(plan_denial(&plan).is_none());
+        plan.workspace = Some((PathBuf::from("/"), false));
+        let reason = plan_denial(&plan).expect("a root workspace refuses");
+        assert!(reason.contains("host root"), "{reason}");
     }
 
     /// A fixed-destination source that resolves to the host root

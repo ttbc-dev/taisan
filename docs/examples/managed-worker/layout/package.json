@@ -1,0 +1,10 @@
+{
+  "name": "taisan-managed-worker-example",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Packaging example for the taisan managed-Worker runtime binding contract",
+  "main": "dist/main.js",
+  "dependencies": {
+    "pkg": "file:node_modules/pkg"
+  }
+}
