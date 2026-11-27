@@ -1684,6 +1684,39 @@ impl ReadView for Tx<'_> {
         )
     }
 
+    fn decided_idempotency_keys(
+        &self,
+        origin: &Origin,
+        actor: &Actor,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<String>, StoreError> {
+        let actor_kind = tag(&actor.kind);
+        // Range-scan the unique (origin, actor_kind, actor_id,
+        // idempotency_key) index instead of materializing the whole
+        // unpruned ledger; `LIMIT` bounds how many keys cross into
+        // Rust. An empty prefix has no meaningful upper bound, and a
+        // non-ASCII prefix cannot be byte-incremented safely.
+        let Some(upper) = prefix_upper_bound(prefix) else {
+            return Ok(Vec::new());
+        };
+        self.query_all(
+            "SELECT idempotency_key FROM commands \
+             WHERE origin=?1 AND actor_kind=?2 AND actor_id=?3 \
+               AND idempotency_key >= ?4 AND idempotency_key < ?5 \
+             ORDER BY idempotency_key LIMIT ?6",
+            params![
+                origin.0,
+                actor_kind,
+                actor.external_id,
+                prefix,
+                upper,
+                limit
+            ],
+            |row| row.get(0),
+        )
+    }
+
     fn command_decision(
         &self,
         command_id: &CommandId,
@@ -2659,6 +2692,25 @@ fn intake_run_from_row(row: &rusqlite::Row<'_>) -> Result<IntakeRun, rusqlite::E
         finished_unix_seconds: row.get(14)?,
         recorded_seq: row.get(15)?,
     })
+}
+
+/// The exclusive upper bound for a `BINARY` range scan over every key
+/// starting with `prefix`. The last ASCII byte below `0x7f` is
+/// incremented so `prefix <= key < upper` selects exactly the keys
+/// sharing the prefix within the index order. An empty or non-ASCII
+/// prefix has no such bound and returns `None`.
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    if prefix.is_empty() || !prefix.is_ascii() {
+        return None;
+    }
+    let mut bytes = prefix.as_bytes().to_vec();
+    while let Some(last) = bytes.pop() {
+        if last < 0x7f {
+            bytes.push(last + 1);
+            return String::from_utf8(bytes).ok();
+        }
+    }
+    None
 }
 
 fn intake_candidate_from_row(row: &rusqlite::Row<'_>) -> Result<IntakeCandidate, rusqlite::Error> {

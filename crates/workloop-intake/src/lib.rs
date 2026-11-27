@@ -169,11 +169,21 @@ pub fn run_intake_with_owner(
 ) -> Result<IntakeReport, IntakeError> {
     let lease = IntakeLease::acquire(store, owner, now_unix_seconds)?;
 
+    // The replay prefix identifies this selector binding's saved
+    // decisions. Preflight asks the ledger only for keys under it, and
+    // only as many as the protocol's candidate bound could use.
+    let replay_prefix = format!(
+        "{}{}:",
+        admission::REPLAY_KEY_PREFIX,
+        params.binding.adapter
+    );
+
     // Preflight in one deferred read: an already-active run refuses
     // the invocation outright (the lease makes this rare — it covers
     // a run left by a dead owner awaiting recovery), the pending
-    // queue's free positions size `max_candidates`, and the live
-    // source owners become the request's exclusions.
+    // queue's free positions size `max_candidates`, the live source
+    // owners become the request's exclusions, and the ledger names
+    // the replay identities whose decision is already saved.
     let preflight = store.transact_deferred(|tx| {
         if let Some(run) = tx.active_intake_run()? {
             return Ok(Preflight::Active(run.run_id));
@@ -184,19 +194,27 @@ pub fn run_intake_with_owner(
             .unwrap_or(DEFAULT_PENDING_QUEUE_LIMIT);
         let occupied = tx.pending_queue_count()?;
         let owned = tx.intake_owned_issues()?;
+        let decided = tx.decided_idempotency_keys(
+            &Origin(admission::SELECTOR_ORIGIN.into()),
+            params.actor,
+            &replay_prefix,
+            protocol::MAX_CANDIDATES,
+        )?;
         Ok(Preflight::Ready {
             limit,
             occupied,
             owned,
+            decided,
         })
     })?;
 
-    let (limit, occupied, mut owned) = match preflight {
+    let (limit, occupied, mut owned, decided) = match preflight {
         Preflight::Ready {
             limit,
             occupied,
             owned,
-        } => (limit, occupied, owned),
+            decided,
+        } => (limit, occupied, owned, decided),
         Preflight::Active(run_id) => return Err(IntakeError::ActiveRun { run_id }),
     };
 
@@ -208,6 +226,27 @@ pub fn run_intake_with_owner(
     owned.dedup();
     let exclusions = owned;
 
+    // A candidate whose saved decision is re-presented is `replayed`
+    // and creates no new pending position, but it still counts
+    // against the adapter's returned-candidate bound. Size the ask
+    // beyond the free positions by the known replay identities this
+    // selector owns, so replays do not consume the budget new
+    // proposals need. The ledger read is already scoped to the
+    // binding's replay prefix and capped at `MAX_CANDIDATES`, so the
+    // count is bounded and an upper bound on the replays a response
+    // can carry.
+    //
+    // Residual limit: `max_candidates` is capped at the protocol's
+    // 32, so once at least `MAX_CANDIDATES` replay identities exist
+    // the ask is saturated and a selector that ranks every replay
+    // ahead of every fresh Issue can fill the response with replays,
+    // leaving no slot for new work regardless of the free count.
+    // Below that bound the ask still leaves room for up to
+    // `MAX_CANDIDATES - known_replays` fresh proposals. Eliminating
+    // the saturation would require the selector protocol to accept
+    // replay identities; raising `pending_queue_limit` helps only
+    // while fewer than `MAX_CANDIDATES` replays exist.
+    let known_replays = decided.len() as u64;
     // The run record copies the *held* lease's owner identity — the
     // storage contract's provenance for "who held this invocation" —
     // not a second, unrelated acquisition identity.
@@ -245,7 +284,9 @@ pub fn run_intake_with_owner(
         );
     }
 
-    let max_candidates = free.min(u64::from(protocol::MAX_CANDIDATES)) as u32;
+    let max_candidates = free
+        .saturating_add(known_replays)
+        .min(u64::from(protocol::MAX_CANDIDATES)) as u32;
     let spec = protocol::RequestSpec {
         request_id: &request_id,
         selector: &params.binding.adapter,
@@ -390,17 +431,15 @@ fn complete_intake(
     let mut defer_rest = false;
     for (index, proposal) in outcome.iter().enumerate() {
         if defer_rest {
-            if !mark_candidate(
-                store,
-                run_id,
-                index as u32,
-                IntakeCandidateStatus::CapacityDeferred,
-                Some("capacity_exhausted".into()),
-                None,
-                None,
-                None,
-            )? {
-                break;
+            // Capacity is exhausted for fresh work, but a candidate
+            // whose decision is already saved is still a replay: the
+            // ledger is authoritative and it holds no new pending
+            // position. Resolve it rather than mislabeling it
+            // `capacity_deferred`, which the contract reserves for a
+            // candidate with no saved decision under its replay key.
+            match resolve_or_defer(store, params, run_id, index as u32, proposal)? {
+                AdmitStep::Continue | AdmitStep::Deferred => {}
+                AdmitStep::Halted => break,
             }
             continue;
         }
@@ -457,6 +496,9 @@ enum Preflight {
         limit: u32,
         occupied: u64,
         owned: Vec<IssueRef>,
+        /// Idempotency keys with a saved selector decision; the
+        /// coordinator filters them to this binding's replay prefix.
+        decided: Vec<String>,
     },
     Active(String),
 }
@@ -710,6 +752,55 @@ fn admit_one(
             );
             Ok(AdmitStep::Halted)
         }
+    }
+}
+
+/// Resolve the unattempted remainder behind a capacity refusal
+/// without submitting. A candidate with a saved decision under its
+/// replay identity is still `replayed` — the ledger is authoritative
+/// and it holds no new pending position — while every other candidate
+/// is `capacity_deferred`, documenting that no decision exists under
+/// its key so a later run decides it fresh. Marking a saved replay
+/// `capacity_deferred` would promise the ledger holds nothing for it,
+/// so replays must never be deferred blindly just because they trail
+/// a fresh proposal that exhausted capacity.
+fn resolve_or_defer(
+    store: &SqliteStore,
+    params: &IntakeParams<'_>,
+    run_id: &str,
+    ordinal: u32,
+    proposal: &Proposal,
+) -> Result<AdmitStep, IntakeError> {
+    let command = admission::submit_command(proposal, params.actor.clone());
+    let digest = payload_digest(
+        &command.origin,
+        &command.actor,
+        &command.idempotency_key,
+        &command.body,
+    );
+    let prior = store.transact_deferred(|tx| {
+        tx.stored_decision(&command.origin, &command.actor, &command.idempotency_key)
+    })?;
+    if let Some((stored_digest, decision)) = prior
+        && stored_digest == digest
+    {
+        return match resolve_decided(store, run_id, ordinal, &decision, true)? {
+            true => Ok(AdmitStep::Continue),
+            false => Ok(AdmitStep::Halted),
+        };
+    }
+    match mark_candidate(
+        store,
+        run_id,
+        ordinal,
+        IntakeCandidateStatus::CapacityDeferred,
+        Some("capacity_exhausted".into()),
+        None,
+        None,
+        None,
+    )? {
+        true => Ok(AdmitStep::Deferred),
+        false => Ok(AdmitStep::Halted),
     }
 }
 

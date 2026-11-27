@@ -722,6 +722,29 @@ pub trait ReadView {
         idempotency_key: &str,
     ) -> Result<Option<(String, CommandDecision)>, StoreError>;
 
+    /// At most `limit` distinct idempotency keys carrying a saved
+    /// decision for `(origin, actor)` that start with `prefix`, in key
+    /// order. Intake uses this to size a selector request beyond the
+    /// known replay identities: re-presenting a saved decision creates
+    /// no new pending position, so a replay must not consume the
+    /// budget that new proposals need.
+    ///
+    /// The prefix and limit keep the read bounded: the commands ledger
+    /// is never pruned, so an unbounded read would grow with every
+    /// admission. Only as many keys as the ask can use are returned.
+    ///
+    /// The default has no durable history to report; the SQLite store
+    /// overrides it with the command ledger.
+    fn decided_idempotency_keys(
+        &self,
+        _origin: &Origin,
+        _actor: &Actor,
+        _prefix: &str,
+        _limit: u32,
+    ) -> Result<Vec<String>, StoreError> {
+        Ok(Vec::new())
+    }
+
     fn command_decision(
         &self,
         command_id: &CommandId,
