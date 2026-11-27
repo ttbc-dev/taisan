@@ -81,8 +81,14 @@ and `build-local-artifacts` stays gated off — nothing is built.
 permissions patch, marked by a `LOCAL MODIFICATION` header: the
 workflow-level `GITHUB_TOKEN` is scoped to `contents: read`, and only
 the `host` job — the single job that writes to GitHub Releases —
-escalates to `contents: write`. `host` runs `dist host --steps=upload
---steps=release` and `gh release create`. `plan` stays read-only even
+escalates to `contents: write` plus `id-token: write` and
+`attestations: write`. `host` runs `dist host --steps=upload
+--steps=release`, signs each release artifact's SLSA provenance
+(`actions/attest-build-provenance` over `artifacts/*`, the same set
+`gh release create` then uploads): `id-token: write` mints the OIDC token the
+Sigstore signature needs, and `attestations: write` persists the signed
+attestation to the repository's attestation store, which is what
+`gh attestation verify` reads (#492). `plan` stays read-only even
 on tag pushes: `dist host --steps=create` under `hosting = "github"`
 makes no GitHub API calls (hosting for GitHub is implemented by the
 CI-side `gh release create`, per cargo-dist 0.34.0's host.rs), so no
@@ -130,7 +136,21 @@ skips `release.yml` entirely, so CI-affecting config changes no longer
 regenerate it. To resync after editing `[workspace.metadata.dist]`,
 temporarily remove `allow-dirty`, run `dist generate --mode=ci`,
 restore the `LOCAL MODIFICATION` header, re-apply the permissions
-patch (read at workflow level, write on `host` only), the env-var tag
+patch (read at workflow level, `contents: write`/`id-token: write`/
+`attestations: write` on `host` only), the `Attest release artifacts`
+step on `host` (the generated `github-attestations` step reappears
+under `build-local-artifacts` if the phase is not kept at `host` —
+move it to `host` rather than leaving it there: `build-local-artifacts`
+has no `artifacts/` dir (its outputs live under `target/distrib/`)
+and inherits workflow-level `contents: read`, so it can neither find
+the released set nor hold `id-token: write`/`attestations: write`.
+On `host`, place it after `Download GitHub Artifacts` populates
+`artifacts/` and after `Cleanup` removes the granular
+`*-dist-manifest.json` files from it — placing it earlier attests
+internal manifests the release never uploads — and before `Create
+GitHub Release`; set `subject-path` to `artifacts/*` — the same set
+`gh release create` uploads — and re-pin the `uses:` ref to a full
+SHA), the env-var tag
 hardening, the `github-actions[bot]` commit identity, the SHA-pinned
 `uses:` refs (dist emits movable `@vN` tags; each pin's `# vX.Y.Z`
 comment records the version it replaces), the verified cargo-dist
