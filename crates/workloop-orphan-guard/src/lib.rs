@@ -32,13 +32,19 @@ pub enum Guardian {
 /// Exit this process as soon as its guardian disappears.
 ///
 /// Called by each unbounded fixture mode at the point it starts waiting.
-/// A guardian that cannot be identified at launch is already gone (or a
-/// direct init child); such a fixture has nothing left to supervise it and
-/// exits immediately.
+/// A guardian that cannot be identified at launch is already gone; such a
+/// fixture has nothing left to supervise it and exits immediately. A
+/// process without an observable guardian inside its PID namespace (the
+/// `--unshare-pid` sandbox init) keeps waiting instead: containment owns
+/// its lifetime, and treating the absent parent as an orphan would end
+/// every contained unbounded run at startup.
 pub fn exit_when_orphaned(guardian: Guardian) {
     let this_parent = parent_pid();
-    let Some(guardian_pid) = resolve_guardian(guardian, this_parent, parent_of) else {
-        std::process::exit(0);
+    let contained = contained_in_namespace();
+    let guardian_pid = match resolve_guardian(guardian, this_parent, parent_of, contained) {
+        Resolution::Watch(pid) => pid,
+        Resolution::Unobservable => return,
+        Resolution::Orphaned => std::process::exit(0),
     };
     let Some(guardian) = identity(guardian_pid) else {
         std::process::exit(0);
@@ -53,21 +59,78 @@ pub fn exit_when_orphaned(guardian: Guardian) {
     });
 }
 
-fn resolve_guardian<F>(guardian: Guardian, this_parent: i32, parent_of: F) -> Option<i32>
+/// What the watchdog can prove about the guardian at launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Resolution {
+    /// Supervise this process; exit when it disappears.
+    Watch(i32),
+    /// No guardian exists inside this PID namespace that the watchdog
+    /// could observe. This is either the namespace init itself (parent
+    /// pid 0) or, for a contained launch, the namespace init/reaper that
+    /// the sandbox ties to the launcher. The process keeps running;
+    /// namespace teardown stops it.
+    Unobservable,
+    /// The guardian is known to be gone: exit now.
+    Orphaned,
+}
+
+fn resolve_guardian<F>(
+    guardian: Guardian,
+    this_parent: i32,
+    parent_of: F,
+    contained: bool,
+) -> Resolution
 where
     F: FnOnce(i32) -> Option<i32>,
 {
-    if !is_supervisor_pid(this_parent) {
-        return None;
-    }
-    match guardian {
-        Guardian::Parent => Some(this_parent),
-        Guardian::Grandparent => parent_of(this_parent).filter(|pid| is_supervisor_pid(*pid)),
+    match this_parent {
+        // `--unshare-pid` makes the sandboxed process the PID-namespace
+        // init, and a PID namespace init has no parent it can observe.
+        0 => Resolution::Unobservable,
+        // Reparenting to pid 1 means the launcher is gone, unless pid 1 is
+        // the init/reaper of a contained namespace that outlives it.
+        1 if contained => Resolution::Unobservable,
+        1 => Resolution::Orphaned,
+        pid if pid > 1 => match guardian {
+            Guardian::Parent => Resolution::Watch(pid),
+            Guardian::Grandparent => match parent_of(pid) {
+                Some(0) => Resolution::Unobservable,
+                Some(1) if contained => Resolution::Unobservable,
+                Some(grandparent) if grandparent > 1 => Resolution::Watch(grandparent),
+                Some(_) | None => Resolution::Orphaned,
+            },
+        },
+        _ => Resolution::Orphaned,
     }
 }
 
-fn is_supervisor_pid(pid: i32) -> bool {
-    pid > 1
+/// Whether this process runs in a non-initial user namespace — the marker
+/// of a bwrap containment launch (the reference profile always passes
+/// `--unshare-user`). It disambiguates pid 1: inside containment it is the
+/// namespace init/reaper; outside it is the host init a launcher's death
+/// reparents us to.
+fn contained_in_namespace() -> bool {
+    std::fs::read_to_string("/proc/self/uid_map")
+        .ok()
+        .is_some_and(|map| !uid_map_is_initial(&map))
+}
+
+fn uid_map_is_initial(map: &str) -> bool {
+    let mut lines = map.lines().filter(|line| !line.trim().is_empty());
+    let Some(line) = lines.next() else {
+        return false;
+    };
+    if lines.next().is_some() {
+        return false;
+    }
+    let mut fields = line.split_whitespace();
+    matches!(
+        (fields.next(), fields.next(), fields.next(), fields.next()),
+        (Some(_), Some(_), Some(count), None)
+            if count
+                .parse::<u64>()
+                .is_ok_and(|count| count == u32::MAX as u64)
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -119,9 +182,12 @@ fn parent_pid() -> i32 {
 }
 
 /// Parent pid from `/proc`, falling back to `ps` where `/proc` is absent.
+///
+/// A parent pid of 0 is preserved: it identifies a PID-namespace init,
+/// which must not be mistaken for an unreadable parent.
 fn parent_of(pid: i32) -> Option<i32> {
     if let Some((_, ppid, _)) = read_stat(pid) {
-        return (ppid > 0).then_some(ppid);
+        return Some(ppid);
     }
     let out = Command::new("ps")
         .args(["-o", "ppid=", "-p", &pid.to_string()])
@@ -130,8 +196,7 @@ fn parent_of(pid: i32) -> Option<i32> {
     if !out.status.success() {
         return None;
     }
-    let ppid: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
-    (ppid > 0).then_some(ppid)
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
 /// `(state, ppid, starttime)` from `/proc/<pid>/stat`.
@@ -163,60 +228,128 @@ mod tests {
     #[test]
     fn parent_guardian_is_the_direct_parent() {
         assert_eq!(
-            resolve_guardian(Guardian::Parent, 42, |_| unreachable!()),
-            Some(42)
+            resolve_guardian(Guardian::Parent, 42, |_| unreachable!(), false),
+            Resolution::Watch(42)
         );
     }
 
     #[test]
-    fn parent_guardian_rejects_init_and_unset_parent() {
+    fn parent_guardian_for_namespace_init_stays_alive() {
         assert_eq!(
-            resolve_guardian(Guardian::Parent, 1, |_| unreachable!()),
-            None
+            resolve_guardian(Guardian::Parent, 0, |_| unreachable!(), false),
+            Resolution::Unobservable
         );
+        // Even outside a user namespace a parent pid of 0 cannot be a
+        // reparent-to-init signal; there is no init to observe.
         assert_eq!(
-            resolve_guardian(Guardian::Parent, 0, |_| unreachable!()),
-            None
+            resolve_guardian(Guardian::Parent, 0, |_| unreachable!(), true),
+            Resolution::Unobservable
+        );
+    }
+
+    #[test]
+    fn parent_guardian_rejects_reparented_init() {
+        assert_eq!(
+            resolve_guardian(Guardian::Parent, 1, |_| unreachable!(), false),
+            Resolution::Orphaned
+        );
+    }
+
+    #[test]
+    fn contained_parent_that_is_namespace_init_stays_alive() {
+        assert_eq!(
+            resolve_guardian(Guardian::Parent, 1, |_| unreachable!(), true),
+            Resolution::Unobservable
         );
     }
 
     #[test]
     fn grandparent_guardian_is_the_harness_above_the_leader() {
         assert_eq!(
-            resolve_guardian(Guardian::Grandparent, 42, |pid| {
-                assert_eq!(pid, 42);
-                Some(7)
-            }),
-            Some(7)
+            resolve_guardian(
+                Guardian::Grandparent,
+                42,
+                |pid| {
+                    assert_eq!(pid, 42);
+                    Some(7)
+                },
+                false,
+            ),
+            Resolution::Watch(7)
+        );
+    }
+
+    #[test]
+    fn grandparent_guardian_for_namespace_init_stays_alive() {
+        assert_eq!(
+            resolve_guardian(Guardian::Grandparent, 0, |_| unreachable!(), false),
+            Resolution::Unobservable
         );
     }
 
     #[test]
     fn grandparent_guardian_rejects_reparented_init_child() {
         assert_eq!(
-            resolve_guardian(Guardian::Grandparent, 1, |_| unreachable!()),
-            None
+            resolve_guardian(Guardian::Grandparent, 1, |_| unreachable!(), false),
+            Resolution::Orphaned
         );
         assert_eq!(
-            resolve_guardian(Guardian::Grandparent, 0, |_| unreachable!()),
-            None
+            resolve_guardian(Guardian::Grandparent, 1, |_| unreachable!(), true),
+            Resolution::Unobservable
         );
     }
 
     #[test]
     fn grandparent_guardian_rejects_init_as_the_harness() {
         assert_eq!(
-            resolve_guardian(Guardian::Grandparent, 42, |_| Some(1)),
-            None
+            resolve_guardian(Guardian::Grandparent, 42, |_| Some(1), false),
+            Resolution::Orphaned
+        );
+    }
+
+    #[test]
+    fn grandparent_guardian_accepts_namespace_init_as_the_harness_when_contained() {
+        assert_eq!(
+            resolve_guardian(Guardian::Grandparent, 42, |_| Some(1), true),
+            Resolution::Unobservable
         );
         assert_eq!(
-            resolve_guardian(Guardian::Grandparent, 42, |_| Some(0)),
-            None
+            resolve_guardian(Guardian::Grandparent, 42, |_| Some(0), true),
+            Resolution::Unobservable
+        );
+    }
+
+    #[test]
+    fn grandparent_guardian_distinguishes_unset_from_init() {
+        assert_eq!(
+            resolve_guardian(Guardian::Grandparent, 42, |_| Some(0), false),
+            Resolution::Unobservable
+        );
+        assert_eq!(
+            resolve_guardian(Guardian::Grandparent, 42, |_| None, false),
+            Resolution::Orphaned
         );
     }
 
     #[test]
     fn grandparent_guardian_does_not_fall_back_to_the_leader() {
-        assert_eq!(resolve_guardian(Guardian::Grandparent, 42, |_| None), None);
+        assert_eq!(
+            resolve_guardian(Guardian::Grandparent, 42, |_| None, false),
+            Resolution::Orphaned
+        );
+    }
+
+    #[test]
+    fn full_uid_map_is_the_initial_namespace() {
+        assert!(uid_map_is_initial("         0          0 4294967295\n"));
+    }
+
+    #[test]
+    fn restricted_uid_map_marks_containment() {
+        assert!(!uid_map_is_initial("         0       1000          1\n"));
+        assert!(!uid_map_is_initial(
+            "         0       1000          1\n         1       1001          1\n"
+        ));
+        assert!(!uid_map_is_initial(""));
     }
 }
