@@ -93,8 +93,13 @@ impl Fixture {
         fs::create_dir_all(&workspace).unwrap();
         for (file, body) in [("gh", FAKE_GH), ("git", FAKE_GIT)] {
             let path = bin.join(file);
-            fs::write(&path, body).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            // Write-then-rename: executing a file whose inode was just
+            // opened for writing fails ETXTBUSY on Linux; the renamed
+            // inode never was.
+            let tmp = bin.join(format!("{file}.tmp"));
+            fs::write(&tmp, body).unwrap();
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::rename(&tmp, &path).unwrap();
         }
         let config = root.join("installation.json");
         fs::write(

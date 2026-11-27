@@ -236,7 +236,7 @@ produce the same destination:
 
 - **Path A (captured below):** `npx skills add <path-to-skill> -a
   <agent> -y --copy` — from this checkout with a local path, or from
-  the registry as `npx skills add shimpeiws/taisan` (the form named in
+  the registry as `npx skills add ttbc-dev/taisan` (the form named in
   the skill's frontmatter).
 - **Path B (offline equivalent):** copy the same shipped file to the
   same destination —
@@ -275,7 +275,7 @@ exit=0
 │
 ●  Skill: taisan
 │
-│  Operate the taisan CLI (execution loop) for an agentic workflow — submit Work, inspect recorded state and Attention, intervene on eligible Executions, judge review findings, and recover lost command responses. Install with `npx skills add shimpeiws/taisan`.
+│  Operate the taisan CLI (execution loop) for an agentic workflow — submit Work, inspect recorded state and Attention, intervene on eligible Executions, judge review findings, and recover lost command responses. Install with `npx skills add ttbc-dev/taisan`.
 
 │
 ◇  Installation Summary ────╮

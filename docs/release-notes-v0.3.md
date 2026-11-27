@@ -1,28 +1,53 @@
-# Draft release notes — taisan (release version pending; 0.3.0 proposed)
+# Release notes — taisan 0.3.0
 
-Status: **draft release materials, pending the frozen candidate**
-(issue #370). The filename follows the v0.3 milestone unit, not a
-decided release version — the owner still chooses between `0.3.0`
-(proposed) and `1.0.0` per
-[release-versioning.md](release-versioning.md) §6, and the final
-title/version line is stamped at that decision. These notes are
-prepared from pre-freeze source materials only. The final candidate
-is not yet frozen — per #370's sequencing it stays blocked on the
-release-acceptance (#365), clean-install reproduction (#367),
-public-content audit (#368), and license (#369) gates — so no commit
-named here is the release candidate, no tag exists, and every TODO
-below is discharged at freeze. The acceptance gate (#365) itself
-consumes two upstream evidence issues: #270, whose manual-acceptance
-runs already produced the owner-side records summarized in
-[release-acceptance-v0.3.md](release-acceptance-v0.3.md) (with the
-residual gaps that record lists), and #271, whose scheduled-pilot
-evidence does not yet exist. Claims marked **TODO** depend either on
-that unproduced #271 evidence or on exact values held in owner-side
-records the freeze will copy over; nothing else in this document
-asserts behavior that is not already verifiable in this repository or
-in the recorded owner-run evidence cited inline. Per `AGENTS.md`,
-private source repositories and the live-run target are described by
-role only; issue/PR numbers and revision SHAs are owner-verifiable
+Status: **release materials on the frozen candidate**
+(issue #370). The owner decided `0.3.0` on 2026-11-26
+([release-versioning.md](release-versioning.md) §7) and the
+candidate is frozen at
+`5f134b964aca05637d4fa1fc8198779dd408913f` — the #398/#399
+credential-mask fix (PR #479) is the last change inside it. The
+candidate was first pinned at
+`00fed690cf2993e220116901f1c2d14584305e18` on 2026-11-26 and
+re-pinned the same day when the owner-directed pre-publication
+repair for #398/#399 merged — per the freeze checklist, a merge
+never silently extends the candidate, so the record and the §4
+gates were re-established on the new SHA.
+No tag exists yet — the tag, the cargo-dist artifacts, and the
+repository visibility flip are the remaining release acts (freeze
+checklist §5–§6). The tag does **not** point at `5f134b96`
+directly: `5f134b96` is the *verified-code* SHA (gates and
+sentinel evidence below), and the tag lands on the commit that
+folds this finalized record into `main` — the merge commit of the
+freeze-record PR (#478). That commit's tree differs from
+`5f134b96` only in release documentation; the freeze checklist
+§5.2 verifies the diff is docs-only before tagging (and offers a
+gate re-run on the tag SHA for an exact-match policy). Tagging
+the bare `5f134b96` would instead ship this file's pre-freeze
+draft — "candidate unconfirmed, #398/#399 unmerged" — inside the
+release source snapshot, which is the inconsistency this split
+avoids.
+The upstream evidence these notes
+depended on is now in hand: the #270 manual real-Worker acceptance
+(runs 1–6, owner-approved at comment `7171973494`), the #271
+scheduled-intake pilot, and the #367 clean-Linux-install reproduction
+are complete and closed; the #368 public-content audit is
+dispositioned by the #438 owner ruling (in-place publication, history
+kept); and the #369 license is applied (MIT OR Apache-2.0). The
+acceptance issue #365 is closed: the owner dispositioned the flagged
+defects in its closing comment (2026-11-25) — recorded in
+release-acceptance §6 — and on 2026-11-26 the owner dispositioned
+#437 to v0.6 and closed the seven dispositioned defect issues under
+the recorded wording (the confirmed-present code states stand and
+are listed below). The
+record's fold-in of the pilot/clean evidence landed via PR #472
+(merged `d87d5dc`); the run records cited here are the retained
+owner-side evidence, not that PR. Per `AGENTS.md`, the live-run
+target is the private isolated repository
+`shimpeiws/coding-worker-smoke` — retained verbatim as an
+owner-only reference (links and `#N` citations resolve only for the
+owner); other private sources are described by role only. Issue/PR
+numbers, revision SHAs, and the owner-side evidence locators cited
+inline (`RUN-RECORD-*.md`, `acceptance-v03-*/`) are owner-verifiable
 evidence locators.
 
 ## What this release is
@@ -72,15 +97,44 @@ plus the owner-run live records summarized in
 9. **Stop/restart recovery** — `taisan run` is a foreground loop;
    durable identities survive restart, retries stay bounded by
    durable counters, and writers not proven absent keep their
-   reservations. The reservation guarantee has an open edge case: a
-   chdir+argv-change escapee can be mis-proved absent, enabling a
-   second writer on resume — recorded as the release-blocking #344
-   absence-proof defect (see known limitations).
+   reservations. The #344 absence-proof defect (a chdir+argv-change
+   escapee mis-proved absent) is fixed on the candidate by PR #428 —
+   launch-group clearance plus bounded `absence_unprovable`
+   escalation; the residual ambiguous-match convergence gap is #313
+   (see known limitations). Restart-clean recovery is evidenced by
+   the pilot's two real restarts (below).
 
-Also shipped and contract-tested: the internal intake scheduler
-(v0.2) and its Selector port (**live-exercised claim: none — see
-known limitations**), the `taisan-tui` console (deferred from release
-requirements), and the agent-agnostic skill at
+10. **Scheduled admission** — exercised live by the authorized #271
+   pilot on the clean #367 install (driver built from `81c62cf`;
+   owner-side records `acceptance-v03-pilot/RUN-RECORD-2026-11-26-PILOT.md`
+   and `acceptance-v03-clean/RUN-RECORD-2026-11-25-CLEAN.md`):
+   **7 Works admitted across six
+   admitting scheduled ticks** — intake-2 accepted two candidates in
+   one run (w-1, w-2); intake-3, -4, -13, -14, -16 one each; the
+   first tick, intake-1, had failed closed
+   `adapter_source_unavailable` (#468) — every
+   dispatch decision made by the scheduler, none by manual `submit`.
+   Two Works ran the full verified path to `succeeded`: **w-6**
+   (issue #74 → PR #77 on the isolated repository) and **w-7**
+   (issue #75 → PR #78) — coding → independent verification pass →
+   invariant check → publish → sealed bound-actor review round →
+   assessment `complete:true` → `succeeded`. The other five reached
+   honest terminals without claiming success (operator cancels after
+   guarded publish refusals and a stuck lane — #469/#470 below).
+   Scheduler scenarios exercised with durable rows: `queue_full`
+   skips (intake-5..9), replayed candidates, selector outage
+   (`exchange_launch` on scheduled and manual intake), a planned
+   SIGINT restart (in-flight `inv-4` re-minted as `inv-5`), an
+   **unplanned guest VM restart** (orphaned `running` `inv-11`
+   re-minted as `inv-12`, `scheduled_startup` intake resumed — also
+   the restart-clean store-recovery evidence), and disable →
+   `scheduled_reenable` (intake-13). `issue_claims` held single
+   ownership of every selected Issue; no Work was dispatched twice.
+
+Also shipped and exercised: the internal intake scheduler (v0.2) and
+its Selector port (live-exercised by the pilot above, at small pilot
+scale — see known limitations), the `taisan-tui` console (deferred
+from release requirements), and the agent-agnostic skill at
 `skills/taisan/SKILL.md` with its [walkthrough](skill-walkthrough.md).
 
 ## Tested Worker / Selector / runtime identities
@@ -92,16 +146,24 @@ is an owner-supplied swap behind the same ports
 | Component | Identity | Evidence class |
 | --- | --- | --- |
 | Worker adapter | `taisan-worker-claude` (`crates/taisan-worker-claude`) — argv-v2 transport driving the **Claude Code CLI** (`claude`) headless as the coding-agent runtime; declaration `runtime.product: "claude-code"` | Owner-run live for `coding`, `fix`, and `invariant_check` Invocations under `taisan-reference-v0.1`; the `review` role is declared and contract-tested — the live review finding was operator-posted, not Worker-produced |
-| Selector adapter | `public-issue-selector` (`crates/workloop-selector`) — stateless stdin/stdout Selector protocol; ambient `gh` auth, declared `--github-endpoint` scope | Contract tests + interchange evidence; scheduled-intake live path unexercised |
+| Selector adapter | `public-issue-selector` (`crates/workloop-selector`) — stateless stdin/stdout Selector protocol; ambient `gh` auth, declared `--github-endpoint` scope | Contract tests + interchange evidence; scheduled-intake live path exercised by the #271 pilot (admission of all 7 Works, `select` driven by scheduled ticks) |
 | Host adapter | in-process `github` driver inside `taisan run` (`workloop-github`), real reads/writes via the `gh` CLI transport | Owner-run live (push, PR open, review reads, capability reports) |
 | Fixture Workers | `workloop-fixture-worker`, `workloop-contract-worker` (independent second implementation of the same wire) | Contract/fixture evidence only — never live claims |
 
-Exact runtime identity: the live runs' `describe` declaration binds
-`adapter_version` and `runtime.version`; the exercised runtime
-required the declared `--runtime-arg --verbose` knob for stream-json
-mode (recorded observation, release-acceptance §7). **TODO:** copy the
-exact `adapter`/`adapter_version`/`runtime.product`/`runtime.version`
-values from the retained owner-run `describe` captures at freeze time.
+Exact runtime identity, from the retained owner-run `describe`
+captures (`describe-run5.json` in `acceptance-v03-run5/`; identical
+values in the pilot install): `adapter: "taisan-worker-claude"`,
+`adapter_version: "0.0.0"` (pre-version-bump retained value — the §4 metadata
+alignment in
+[release-versioning.md](release-versioning.md) was applied at
+freeze, so the released binaries on the `5f134b96` candidate
+self-report `0.3.0`), `runtime.product:
+"claude-code"`, `runtime.version: "2.1.331 (Claude Code)"`,
+`protocol_versions: ["taisan.worker.request/2",
+"taisan.worker.report/2"]`, roles `coding`, `fix`,
+`invariant_check`, `review`. The exercised runtime required the
+declared `--runtime-arg --verbose` knob for stream-json mode
+(recorded observation, release-acceptance §7).
 
 ## Platform and installation requirements
 
@@ -114,8 +176,10 @@ values from the retained owner-run `describe` captures at freeze time.
 - **Rust toolchain** supporting edition 2024 for source builds
   (`cargo build --workspace`; `cargo install --path
   crates/workloop-cli --bin taisan`). The packaged binaries are
-  `taisan`, `taisan-tui`, `public-issue-selector`, and
-  `taisan-worker-claude` ([licensing inventory](licensing-prep.md) §2).
+  `taisan`, `taisan-tui`, `public-issue-selector`,
+  `taisan-worker-claude`, and the fixture Worker
+  `workloop-fixture-worker` ([licensing inventory](licensing-prep.md)
+  §2, [distribution](distribution.md)).
 - **`gh` CLI** for the GitHub host driver and the Selector's live
   source reads — a current release is required: a distribution-default
   `gh` 2.45.0 lacked `gh api --slurp` and broke adapter list calls;
@@ -134,67 +198,194 @@ values from the retained owner-run `describe` captures at freeze time.
 
 ## Verification record
 
-Gates run on `origin/main` HEAD **before** this draft landed (the
-draft adds docs only; the recorded commit is the tested commit):
+Gates re-run on the **frozen candidate** — `origin/main` HEAD at
+the 2026-11-26 re-pin (retrieval `date -u` 2026-11-26T18:46:55Z):
+the #398/#399 credential-mask fix (PR #479) is the last change
+inside the candidate. The first pin
+`00fed690cf2993e220116901f1c2d14584305e18` (merge of PR #477, the
+workspace `0.3.0` version-metadata alignment) passed the same four
+gates earlier the same day — 1866 tests, 0 failures, 6 ignored —
+and was superseded when the pre-publication repair merged; per the
+freeze checklist the record was re-established on the new SHA, not
+inherited.
 
 ```text
-git rev-parse HEAD
-119dcb72ce047bdcc4c44fb4a7915ffe2d7fd6ee
-git log -1 --format='%h %s' 119dcb72ce047bdcc4c44fb4a7915ffe2d7fd6ee
-119dcb7 Merge pull request #435 from shimpeiws/issue-376-agent
+git rev-parse origin/main
+5f134b964aca05637d4fa1fc8198779dd408913f
+git log -1 --format='%H%n%ad%n%s' --date=iso-strict origin/main
+5f134b964aca05637d4fa1fc8198779dd408913f
+2026-11-26T22:16:25+09:00
+Merge pull request #479 from ttbc-dev/issue-398-399-fix
 ```
+
+`5f134b96` is the verified-code SHA these gates ran against. The
+release tag targets the docs-finalized merge commit that lands
+the freeze record (PR #478) — the freeze checklist §5.2 verifies
+the tag tree diffs against `5f134b96` in release documentation
+only before tagging.
 
 | Gate | Result |
 | --- | --- |
 | `cargo fmt --check` | Passed |
 | `cargo build --workspace` | Passed |
-| `cargo test --workspace` | Passed — 1753 tests, 0 failures, 6 ignored (the `u36e_live` cases requiring `TAISAN_U36E_*` credentials and owner authorization; fixture-selector/fixture-worker contract tests ran against `target/debug/` binaries produced by the build gate) |
+| `cargo test --workspace` | Passed — 1871 tests, 0 failures, 6 ignored (the `u36e_live` cases requiring `TAISAN_U36E_*` credentials and owner authorization; fixture-selector/fixture-worker contract tests ran against `target/debug/` binaries produced by the build gate). One pre-existing timing flake — `exchange_deadline_terminates_the_process_group` (`bounded_exchange.rs`, a fixture pgid-write racing the 1200 ms exchange deadline under parallel load, unrelated to the #479 diff) — failed once and passed on rerun; the recorded count is from the clean full-workspace pass. |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Passed |
 
 Build precedes test because contract tests spawn
-`target/debug/workloop-fixture-worker`. **TODO at freeze:** re-run all
-four gates on the recorded candidate commit and replace this table —
-a freeze never inherits a check record from a different commit. The
-supported build/install route is the source-build path above; **TODO:**
-record packaged-artifact checksums here only if binaries are
-distributed (none are planned by this draft; owner decides).
+`target/debug/workloop-fixture-worker`.
+
+**Distribution route (owner-decided 2026-11-25, issue #370):**
+prebuilt binaries via **cargo-dist** on GitHub Releases — matrix
+build, per-artifact checksums, shell/PowerShell installers,
+generated release notes — with the same cargo-dist setup feeding a
+**personal Homebrew tap** (`brew tap` against the owner's tap;
+homebrew-core deferred until notability) and **cargo-binstall**
+metadata (`cargo binstall` fetches the prebuilt binary). crates.io is
+not a channel: taisan is a CLI tool, not a library. The dist
+workflow itself is #441's lane ([distribution](distribution.md)).
+**Recorded at release (2026-11-27, tag `v0.3.0` → `2d7da0c`):**
+every archive below is published on the GitHub release with a
+companion `<name>.sha256`, and the unified `sha256.sum` lists all
+of them:
+
+| artifact | sha256 |
+|---|---|
+| `workloop-cli-aarch64-apple-darwin.tar.xz` | `ae503b4e3f9f1915c1eee56e4973f678bdf6aaa3b3309843f9215cfa520e9c85` |
+| `workloop-cli-x86_64-apple-darwin.tar.xz` | `9a56f7cc94bdf364e65fd0837d7275fd0290164c7b9dc2ba7f571d4cb1750dcf` |
+| `workloop-cli-aarch64-unknown-linux-gnu.tar.xz` | `765be9d6b1a6ee8bc2748b1bad180e401698ce535dc3b474a1d3d39ef9ffa68a` |
+| `workloop-cli-x86_64-unknown-linux-gnu.tar.xz` | `5b1c754d6cf74a88fe712dc535844b515743e1800d220a70827788bec54f3d9d` |
+| `workloop-tui-aarch64-apple-darwin.tar.xz` | `a387cb99ae3f92a643786099f8e23e3a15b6e729ac08f47be07303b19538e993` |
+| `workloop-tui-x86_64-apple-darwin.tar.xz` | `18f7c535ba514a281c92f8eef80458365efa3693e9c56eb552db376849a6881f` |
+| `workloop-tui-aarch64-unknown-linux-gnu.tar.xz` | `bf1e95212cef63ee798b1877f33c322c5fceb16dfe7898aefb1abfaffc51be72` |
+| `workloop-tui-x86_64-unknown-linux-gnu.tar.xz` | `f624024ae9b6c9d76fee647bdf6789265ef7fef4682e2178636e8d24a692cd89` |
+| `workloop-selector-aarch64-apple-darwin.tar.xz` | `184e942f2e3beaf149ecc9a09a371f5b9bd075b8213dc7318bffe054983fa7b8` |
+| `workloop-selector-x86_64-apple-darwin.tar.xz` | `e182893855c0431c656680e5a5ab3bbe2727faa5c5773defeb736d8aad54ea6e` |
+| `workloop-selector-aarch64-unknown-linux-gnu.tar.xz` | `3116fede992b0f0e661d0327516e2d0dce7fbb6064b9bb96ef90c79a7e6db762` |
+| `workloop-selector-x86_64-unknown-linux-gnu.tar.xz` | `99dd8d021e11ef2071ea39c5c6eca6830c869dd6e70062ff2da4620303fd00a2` |
+| `taisan-worker-claude-aarch64-apple-darwin.tar.xz` | `0e9e75f243a6e5b8861a311f0b2c4ade7a0d55a575b77fc0f949256f262bcac9` |
+| `taisan-worker-claude-x86_64-apple-darwin.tar.xz` | `2dcfa8c038cc7c05f35132036822aa45906fb23763b27fc3293c90f027b0feb3` |
+| `taisan-worker-claude-aarch64-unknown-linux-gnu.tar.xz` | `f278d618905ff63ac8f9254bd78e1b0b6d8ab338188394f184c5666e08ea0c35` |
+| `taisan-worker-claude-x86_64-unknown-linux-gnu.tar.xz` | `bf927d43b1c483e2cc0055d1ed2a6c57d5f61fe2dd21cbd4a2d12123d9818e7e` |
+| `workloop-fixture-worker-aarch64-apple-darwin.tar.xz` | `563182b40658fdb66e070c28f0852efbe3c0819bab8246047abf034bd8f9a32f` |
+| `workloop-fixture-worker-x86_64-apple-darwin.tar.xz` | `4531202b1b20f18c6b1f7ff4e5a3a38552b781cde452b3166e1b3cbc89f4c1cb` |
+| `workloop-fixture-worker-aarch64-unknown-linux-gnu.tar.xz` | `cf4aad3707deca8ae462bd62605072662d09560e99ea5a705ef12e1ab0193625` |
+| `workloop-fixture-worker-x86_64-unknown-linux-gnu.tar.xz` | `a66010af9c27315072b2b74190c220a64dbb7f36fd7ed38253f524e88dbf887b` |
+| `source.tar.gz` | `e2dc46dd10a7675036c71f50ddc28203681d243e1eae72f7769effa6957fc276` |
+
+The source-build path above remains supported independently.
 
 ## Known limitations
 
 - **Single Linux host** — no multi-host or distributed execution;
   containment needs bubblewrap namespaces.
-- **No remote execution, no remote review** — designed (#372/#373
-  docs) but not implemented; follow-up, not part of this release.
+- **Remote execution shipped but unexercised** — the remote executor
+  surface (contract #374, wire types/bindings #375, reference
+  endpoint #377, bounded transfer/collection #376) is on the
+  candidate as v0.4 groundwork, with one confirmed defect (#437:
+  zero-byte required artifact reported `Present` where local reports
+  `Missing`) deferred to v0.6 per the owner's 2026-11-26
+  disposition. No end-to-end remote run exists; remote execution and
+  remote review are follow-ups, not part of this release.
 - **No automatic merge or deploy** — publication ends at a reviewed
   change request; merge and deploy remain human acts.
-- **Scheduled intake unexercised live** — the v0.2 scheduler path is
-  fixture/contract-tested only; no scheduled live run exists on the
-  candidate (#271 open). **TODO:** remove this limitation only if the
-  #271 evidence lands before freeze; otherwise it ships as a
-  limitation.
-- **Release-blocking defect dispositions open** — #344 (absence proof
-  edge cases) and #364 (staged runtime-auth cleanup) are assessed
-  gating defects in release-acceptance §6; the freeze dispositions
-  them, this draft does not.
-- **Deferred residuals** — #363 (spent-deadline check order), #422
-  (`gh` version preflight), and the #359 deferred edges are recorded
-  open issues with bounded consequences.
-- **Partial restart/recovery evidence** — the one store-recovery
-  attempt was internally inconsistent; the run-1 publish leg used
-  recorded operator workarounds (the clean path is proven by run 3).
+- **Scheduled intake exercised at pilot scale only** — the #271
+  pilot admitted 7 Works across scheduled ticks with 2 verified
+  `succeeded` completions and 5 honest operator-cancelled terminals;
+  this is a tiny-pilot sample on one installation, not a
+  capacity/robustness claim.
+- **Pilot-discovered defects** — surfaced by the #271 pilot, filed
+  and unfixed at record time; #469 is repaired on the candidate by
+  PR #474 (below), the rest are deferred to v0.6 (milestone 11) per
+  #365's closing comment — issues open:
+  - **#468** — `taisan init` emits the numeric repository id, which
+    the `public-issue-selector` GitHub backend cannot use; scheduled
+    intake fails closed (`adapter_source_unavailable`) on the first
+    tick. Workaround: set the `id` in `config.toml` to the
+    `owner/name` slug by hand (what the pilot did).
+  - **#469** — a `caches/*` entry that is a symlink escaping the
+    sandbox root dangles inside containment: every verification
+    reports `cache_unreadable` and the assessment item stays
+    `inconclusive` with no designed re-drive path (a `waiting/ci`
+    execution can only be cancelled). **Fixed on the candidate by
+    PR #474, issue closed** (symlinked verification-boundary paths
+    refused; the
+    invariant check re-drives on unjudged conclusive evidence).
+  - **#470** — publish branches are named `work/w-N`
+    deterministically, so repeated installs against the same
+    repository collide with earlier `work/w-N` branches: publish
+    refuses `stale_head` (correctly — it never overwrites a foreign
+    head) and the Work needs an operator cancel. 4 of 7 pilot Works
+    hit this (w-1/w-3/w-4/w-5).
+  - **#471** — replayed candidates consume the selector's
+    `max_candidates` budget each tick, so a permanently-replayed
+    issue can starve new proposals. Workaround used in the pilot:
+    raise `pending_queue_limit`.
+- **Earlier flagged defects, dispositioned in #365's closing
+  comment** — recorded 'fixed per §6' there and closed
+  2026-11-26 under that owner disposition (release-acceptance §6);
+  'fixed per §6' was the owner's disposition wording for closing
+  the issues, not a code-state claim. #313 (two
+  unrecorded same-signature processes can hold an unidentified
+  launch unresolved — honest-uncertain wedge, not a false
+  absence) and #400 (v2 `report.json` full-body retention dropped
+  by a merge resolution — bounded evidence survives via the CAS
+  prefix, the full report does not) remain confirmed present on
+  the candidate. #398/#399 (`file:` credential sources readable
+  inside contained verification — same credential-hygiene class
+  #364 gated on) were confirmed present at the §6 re-check,
+  reopened as v0.3 pre-publication fix targets, and are repaired
+  on the candidate — PR #479 merged `5f134b96` 2026-11-26.
+- **Fixed defects worth noting** — #344 (absence proof), #363
+  (spent-deadline ordering), #364 (staged runtime-auth cleanup),
+  #447–#450 (refusal budget burn, judged-role resume, runtime
+  residue, divergent-head republish), #466 (fast-exiting output
+  flood misclassified `success` — fixed by PR #467), #419
+  (`artifact.json` collision — fixed by PR #431), and #398/#399
+  (`file:` credential-source masking inside contained
+  verification — fixed by PR #479) are repaired on
+  the candidate line.
+- **Open operator-facing defects** — recorded in release-acceptance
+  §7 and unfixed; the earlier deferred set stays deferred to v0.6
+  per #365's closing comment — issues open: #453 (cancel does not
+  withdraw pending outbox
+  intents — a cancelled Execution whose intent never reconciles parks
+  permanently at `stopping`; run 4 needed a manual claim/slot
+  release), #454 (capability reports refresh only on
+  unscoped passes — a `run --work`-scoped loop can deadlock
+  publication until one unscoped pass runs), #455 (a leftover remote
+  `work/w-N` head kills a Work's publish path via transport-budget
+  exhaustion), #456 (a Worker report of
+  `unavailable`/`provider_unavailable` at exit 0 is lane-terminal —
+  no bounded re-request).
+- **First-use rough edges, open** — #401 (`check` passes
+  `worker_runtime`/`isolation_primitives` vacuously when `init`
+  scaffolds no `[worker]` section), #402 (containment-probe refusal
+  records only "exited non-zero" — no stderr detail), #403 (no
+  `taisan --version`), #422 (preflight does not probe `gh`
+  version/features — a distribution-default `gh` 2.45.0 broke
+  adapter list calls; the recorded environment ran `gh` 2.105.0).
+- **Deferred residuals** — the #359 retained-body edges (issue
+  closed; deferred edges recorded in §6), plus #353
+  (fixture-worker test orphans), #409 (#405 follow-ups), and
+  #302/#306/#139 — recorded open issues with bounded consequences;
+  see release-acceptance §6 for the complete ledger.
+- **Run-1 publish leg used operator workarounds** — the clean
+  publish path is proven by run 3 on post-#421 code (and twice more
+  by the pilot), not by run 1's H1.
 - **Cost/quality** — nothing in this release claims model cost or
-  quality superiority; the pilot runs were single-operator and small.
-- **License unselected** — redistribution terms are pending the #369
-  owner decision; see [licensing prep](licensing-prep.md).
-- **Publication prerequisites** — public-content/history/metadata
-  audit (#368) and the disclosure review covering
-  `docs/source-workflow-audit.md` and `docs/release-audit.md` gate
-  publication, not these notes.
+  quality superiority; the runs were single-operator and small.
+- **License** — MIT OR Apache-2.0 (owner-selected under #369,
+  applied by PR #464); `assets/taisan-hero.jpg` is excepted.
+- **Publication posture** — the #368 audit is dispositioned by the
+  #438 owner ruling: in-place publication, history kept, private
+  names acceptable to disclose; private-repository references in
+  this tree are marked owner-only rather than removed.
 
 ## Consistency boundary
 
 These notes assert only what README, the v0.3 docs, and the
-walkthrough outline ([release-walkthrough-v0.3.md](release-walkthrough-v0.3.md))
+retained-run walkthrough
+([release-walkthrough-v0.3.md](release-walkthrough-v0.3.md))
 already claim together: no live evidence beyond the cited owner-run
 records, no remote review/execution in this release, no superiority
 inference from a small pilot. A claim that drifts from that boundary

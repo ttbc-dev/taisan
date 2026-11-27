@@ -17,8 +17,9 @@ use workloop_core::command::{
 use workloop_core::domain::*;
 use workloop_core::identity::*;
 use workloop_core::observation::{
-    AssessmentVerdict, BranchState, Completeness, HostActionStatus, IssueState,
-    NormalizedEffectFact, Observation, ObservationFact, ProcessStateFact,
+    ArtifactFact, AssessmentVerdict, BranchState, CapabilityEntry, CapabilityState, Completeness,
+    HostActionStatus, IssueState, NormalizedEffectFact, Observation, ObservationFact,
+    ProcessStateFact,
 };
 use workloop_core::ports::ProcessControlPort;
 use workloop_core::store::{
@@ -1220,6 +1221,148 @@ fn fix_dispatch_binds_the_acknowledged_predecessor_and_failed_evidence() {
         Some(InvocationState::Done),
         "the fix worker resolves Done"
     );
+}
+
+#[test]
+fn conflict_repair_dispatch_binds_the_reported_pair() {
+    let root = tmp_root("conflict-origin");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-conflict-origin", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let lo = layout(&root);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&lo, &src, &artifact_id, &produced);
+    let target_revision = "1".repeat(40);
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        &rid1,
+        InvocationRole::Fix,
+        serde_json::json!({
+            "kind": "conflict_repair",
+            "schema_version": 1,
+            "episode_id": "ep-conflict",
+            "repository": repo(),
+            "change_request": "change-1",
+            "source_revision": CommitRevision::new(repo(), produced.clone()).unwrap(),
+            "target_revision": CommitRevision::new(repo(), target_revision.clone()).unwrap(),
+            "head": CommitRevision::new(repo(), produced.clone()).unwrap(),
+            "base": CommitRevision::new(repo(), target_revision.clone()).unwrap(),
+            "conflicting_paths": ["src/a.rs"],
+        }),
+    );
+
+    // A conflict origin needs neither a review judgment nor failed
+    // evidence: the exact pair is the durable repair basis.
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let wire = WorkerRequestV2::parse(&request_body(&store, &rid1).canonical_body).unwrap();
+    let TaskBody::Fix { origin, .. } = &wire.task else {
+        panic!("expected fix task: {:?}", wire.task)
+    };
+    let FixOrigin::Conflict {
+        change,
+        source_revision,
+        target_revision: target,
+        paths,
+    } = origin.as_ref()
+    else {
+        panic!("expected conflict origin: {origin:?}")
+    };
+    assert_eq!(change, "change-1");
+    assert_eq!(source_revision, &produced);
+    assert_eq!(target, &"1".repeat(40));
+    assert_eq!(paths, &["src/a.rs"]);
+    assert!(
+        invocation_for(&store, &rid1).is_some(),
+        "the conflict repair dispatches instead of refusing evidence_missing"
+    );
+}
+
+fn insert_conflict_request(
+    store: &SqliteStore,
+    work_id: &WorkId,
+    execution_id: &ExecutionId,
+    request_id: &str,
+    head: &str,
+    base: &str,
+) {
+    insert_request(
+        store,
+        work_id,
+        execution_id,
+        request_id,
+        InvocationRole::Fix,
+        serde_json::json!({
+            "kind": "conflict_repair",
+            "schema_version": 1,
+            "episode_id": "ep-conflict",
+            "repository": repo(),
+            "change_request": "change-1",
+            "source_revision": CommitRevision::new(repo(), head.to_string()).unwrap(),
+            "target_revision": CommitRevision::new(repo(), base.to_string()).unwrap(),
+            "head": CommitRevision::new(repo(), head.to_string()).unwrap(),
+            "base": CommitRevision::new(repo(), base.to_string()).unwrap(),
+            "conflicting_paths": ["src/a.rs"],
+        }),
+    );
+}
+
+#[test]
+fn a_conflict_source_head_the_workspace_does_not_contain_is_head_stale() {
+    let root = tmp_root("conflict-moved-head");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-conflict-moved-head", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+    // A source head that is not the produced commit the workspace pins
+    // names code the mounted workspace does not contain.
+    let moved = "a".repeat(40);
+    let target_revision = "1".repeat(40);
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_conflict_request(&store, &w, &e, &rid1, &moved, &target_revision);
+
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let refusals = dispatch_refusals(&store, &w);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].0, "request.head_stale", "{refusals:?}");
+    assert!(invocation_for(&store, &rid1).is_none());
+    assert!(!pending_ids(&store).contains(&rid1));
+}
+
+#[test]
+fn a_conflict_pair_without_exact_commit_ids_is_head_stale() {
+    let root = tmp_root("conflict-nonhex");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, base, produced) = git_source(&root);
+    let (w, e, rid0) = admit(&store, "v2-conflict-nonhex", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "clean-exit", true);
+    let artifact_id = done_writer_with_handoff(&store, &w, &e, &rid0, &base, &produced);
+    publish_predecessor(&layout(&root), &src, &artifact_id, &produced);
+    // The source head matches the workspace, but the target revision is
+    // not an exact commit id: the pair cannot bind a repair.
+    let rid1 = format!("{}:inv:1", e.0);
+    insert_conflict_request(&store, &w, &e, &rid1, &produced, "not-a-commit");
+
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let refusals = dispatch_refusals(&store, &w);
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert_eq!(refusals[0].0, "request.head_stale", "{refusals:?}");
+    assert!(invocation_for(&store, &rid1).is_none());
+    assert!(!pending_ids(&store).contains(&rid1));
 }
 
 #[test]
@@ -4815,6 +4958,7 @@ fn v2_verification_runs_on_the_produced_commit_with_bounded_output() {
         Duration::from_millis(300),
         64 * 1024,
         &[],
+        &Ok(None),
     )
     .unwrap();
     assert_eq!(timed_out.result, VerificationOutcome::Inconclusive);
@@ -6098,6 +6242,1464 @@ fn a_stale_manifest_is_never_present_for_the_new_invocation() {
     assert!(
         !present,
         "a manifest bound to another invocation is stale, never Present"
+    );
+}
+
+/// A tracked workspace-root `artifact.json` is repository content the
+/// shim never rewrites. Under a v2 dispatch that slot must hold the
+/// bound handoff manifest, so the declared required artifact is
+/// unfulfillable by construction: the first finish fails the Execution
+/// with a distinct collision code instead of entering — and eventually
+/// exhausting — bounded artifact recovery.
+#[test]
+fn a_tracked_artifact_json_fails_unfulfillable_on_the_first_finish() {
+    let root = tmp_root("tracked-artifact");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    // The source repository tracks the workspace-root manifest path, so
+    // the prepared workspace inherits it as repository content.
+    std::fs::write(src.join("artifact.json"), "repository content\n").unwrap();
+    git(&src, &["add", "artifact.json"]);
+    git(&src, &["commit", "-m", "track artifact.json"]);
+    let (_w, e, rid) = admit(&store, "v2-tracked-artifact", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "exit-no-artifact", true);
+    sup.consume_requests(&store, NOW).unwrap();
+    drive_to_done(&sup, &store, &rid);
+
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.state,
+        ExecutionState::Failed,
+        "the first finish fails the request: {exec:?}"
+    );
+    assert_eq!(
+        exec.terminal_code.as_deref(),
+        Some("artifact_unfulfillable"),
+        "the tracked collision is a distinct, diagnosable failure: {exec:?}"
+    );
+    assert_ne!(
+        exec.waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "no ArtifactRecovery budget is burned: {exec:?}"
+    );
+    assert_eq!(
+        exec.recovery_attempts_used, 0,
+        "the collision never charges a recovery attempt"
+    );
+    let outcome = exec.outcome.as_ref().expect("failed terminal outcome");
+    assert!(
+        outcome
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("tracked repository content")),
+        "the failure keeps the collision reason for diagnosis: {outcome:?}"
+    );
+}
+
+/// A tracked `artifact.json` whose worktree entry is *absent* is not
+/// the collision — nothing at the slot proves different bytes, and
+/// the worker-runtime artifact store may still hold this
+/// invocation's bound manifest. The finish reports `missing`, the
+/// Execution enters bounded recovery, and the recovery pass promotes
+/// the store copy into the root and reports `Present`: an outcome
+/// the fast-fail on absence would have made unreachable.
+#[test]
+fn an_absent_tracked_artifact_json_stays_on_the_recovery_path() {
+    let root = tmp_root("tracked-artifact-absent");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    std::fs::write(src.join("artifact.json"), "repository content\n").unwrap();
+    git(&src, &["add", "artifact.json"]);
+    git(&src, &["commit", "-m", "track artifact.json"]);
+    let (w, e, rid) = admit(&store, "v2-tracked-absent", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "exit-no-artifact", true);
+    sup.consume_requests(&store, NOW).unwrap();
+
+    // The workspace is prepared and the writer launched. The tracked
+    // worktree entry disappears while the index still tracks it — a
+    // deletion, not a foreign file — and the runtime's artifact store
+    // holds this invocation's bound manifest.
+    let ws = sup.workspace_of(&w);
+    std::fs::remove_file(ws.join("artifact.json")).unwrap();
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    let store_dir = ws.join(".artifact-store");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    std::fs::write(
+        store_dir.join("artifact.json"),
+        serde_json::json!({
+            "format_version": "taisan.worker.artifact/1",
+            "worker": "taisan-worker-claude",
+            "request_id": rid,
+            "invocation_id": invocation.id.0,
+            "status": "success",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    drive_to_done(&sup, &store, &rid);
+
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.state,
+        ExecutionState::Waiting,
+        "absent tracked slot enters bounded recovery, not fast-fail: {exec:?}"
+    );
+    assert_eq!(
+        exec.waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "the finish reported `missing`, never `unfulfillable`: {exec:?}"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.observations_for_execution(&e))
+            .unwrap()
+            .iter()
+            .any(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::Artifact {
+                        invocation_id,
+                        state: workloop_core::observation::ArtifactFact::Present { .. },
+                        ..
+                    } if invocation_id == &invocation.id
+                )
+            }),
+        "recovery promoted the bound store copy and reported Present"
+    );
+    assert!(
+        !store
+            .transact(|tx| tx.observations_for_execution(&e))
+            .unwrap()
+            .iter()
+            .any(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::Artifact {
+                        state: workloop_core::observation::ArtifactFact::Unfulfillable { .. },
+                        ..
+                    }
+                )
+            }),
+        "no unfulfillable refusal was ever recorded"
+    );
+}
+
+/// A store copy bound to another producer, promoted onto a tracked
+/// slot, is the same structural refusal the finish path reports: the
+/// slot can never hold this invocation's bound manifest, so the
+/// recovery pass reports `Unfulfillable` instead of dropping it —
+/// the Execution settles `artifact_unfulfillable` at once rather
+/// than charging the bounded-recovery bound into
+/// `artifact_recovery_exhausted`.
+#[test]
+fn a_promoted_foreign_copy_on_a_tracked_slot_fails_unfulfillable() {
+    let root = tmp_root("tracked-artifact-foreign");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    std::fs::write(src.join("artifact.json"), "repository content\n").unwrap();
+    git(&src, &["add", "artifact.json"]);
+    git(&src, &["commit", "-m", "track artifact.json"]);
+    let (w, e, rid) = admit(&store, "v2-tracked-foreign", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "exit-no-artifact", true);
+    sup.consume_requests(&store, NOW).unwrap();
+
+    // The tracked worktree entry is absent while the index still
+    // tracks it, and the runtime's artifact store holds a manifest
+    // bound to a DIFFERENT producer — the stale copy recovery
+    // promotes onto the tracked slot, where it can never become this
+    // invocation's bound evidence.
+    let ws = sup.workspace_of(&w);
+    std::fs::remove_file(ws.join("artifact.json")).unwrap();
+    let store_dir = ws.join(".artifact-store");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    std::fs::write(
+        store_dir.join("artifact.json"),
+        serde_json::json!({
+            "format_version": "taisan.worker.artifact/1",
+            "worker": "taisan-worker-claude",
+            "request_id": "other-execution:inv:0",
+            "invocation_id": "inv-foreign",
+            "status": "success",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    drive_to_done(&sup, &store, &rid);
+
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.state,
+        ExecutionState::Failed,
+        "the structural refusal settles at once: {exec:?}"
+    );
+    assert_eq!(
+        exec.terminal_code.as_deref(),
+        Some("artifact_unfulfillable"),
+        "the collision code is recorded, never recovery-exhausted: {exec:?}"
+    );
+    assert_eq!(
+        exec.recovery_attempts_used, 0,
+        "a pass that decides a refused slot never consumes the bound: {exec:?}"
+    );
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    assert!(
+        store
+            .transact(|tx| tx.observations_for_execution(&e))
+            .unwrap()
+            .iter()
+            .any(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::Artifact {
+                        invocation_id,
+                        state: workloop_core::observation::ArtifactFact::Unfulfillable { .. },
+                        ..
+                    } if invocation_id == &invocation.id
+                )
+            }),
+        "the recovery pass reported the structural refusal to Core"
+    );
+}
+
+/// A symlinked slot is never written through: the store holds this
+/// invocation's bound manifest and recovery would promote it, but the
+/// destination is a symlink a writer could have planted — copying
+/// onto it would overwrite a file outside the workspace. The
+/// promotion is refused, the target is left untouched, and no
+/// evidence is fabricated: the Execution stays on the bounded
+/// recovery path.
+#[test]
+fn a_symlinked_slot_is_never_written_through_by_recovery() {
+    let root = tmp_root("symlink-slot");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, e, rid) = admit(&store, "v2-symlink-slot", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "exit-no-artifact", true);
+    sup.consume_requests(&store, NOW).unwrap();
+
+    // The slot is a symlink pointing at a file outside the workspace,
+    // while the runtime store holds this invocation's bound manifest —
+    // the promotion copy's destination must never follow the link.
+    let ws = sup.workspace_of(&w);
+    let victim = root.join("victim-outside-workspace.json");
+    std::fs::write(&victim, "original content\n").unwrap();
+    std::os::unix::fs::symlink(&victim, ws.join("artifact.json")).unwrap();
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    let store_dir = ws.join(".artifact-store");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    std::fs::write(
+        store_dir.join("artifact.json"),
+        serde_json::json!({
+            "format_version": "taisan.worker.artifact/1",
+            "worker": "taisan-worker-claude",
+            "request_id": rid,
+            "invocation_id": invocation.id.0,
+            "status": "success",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    drive_to_done(&sup, &store, &rid);
+    for _ in 0..20 {
+        if execution(&store, &e).recovery_attempts_used > 0 {
+            break;
+        }
+        sup.run_once(&store, NOW).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "original content\n",
+        "the symlink target outside the workspace is untouched"
+    );
+    assert!(
+        ws.join("artifact.json").is_symlink(),
+        "the slot symlink is never replaced by a copy"
+    );
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "a symlinked slot reports no fabricated evidence: {exec:?}"
+    );
+    assert!(
+        !store
+            .transact(|tx| tx.observations_for_execution(&e))
+            .unwrap()
+            .iter()
+            .any(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::Artifact {
+                        state: ArtifactFact::Present { .. },
+                        ..
+                    }
+                )
+            }),
+        "no Present fact was ever recorded through the link"
+    );
+}
+
+/// A caller-declared artifact path may nest: `out/report.json` is a
+/// valid declaration the workspace gate normalizes verbatim. A writer
+/// can then plant `out/` as a link to a directory outside the
+/// workspace — every ancestor is still followed by a leaf-only check.
+/// The promotion copy's destination resolves through that link, so
+/// copying the store's bound manifest would create a file on the
+/// host. The component-wise walk refuses the promotion, the outside
+/// directory gains nothing, and no evidence is fabricated: the
+/// Execution stays on the bounded recovery path.
+#[test]
+fn a_symlinked_ancestor_dir_is_never_written_through_by_recovery() {
+    let root = tmp_root("symlink-ancestor-write");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, e, rid) = admit(&store, "v2-symlink-ancestor-write", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "exit-no-artifact", true);
+    sup.consume_requests(&store, NOW).unwrap();
+
+    // Rebind the durable Invocation to the nested declaration — the
+    // same record `required_artifacts` parsing would write for a
+    // caller-supplied `path` object.
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    let expected_state = invocation.state.clone();
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateInvocation {
+                invocation: Invocation {
+                    required_artifacts: vec![RequiredArtifact {
+                        kind: "report".into(),
+                        path: "out/report.json".into(),
+                        expected_digest: None,
+                    }],
+                    ..invocation.clone()
+                },
+                expected_state,
+            })
+        })
+        .unwrap();
+
+    // `out/` is a symlink to an empty directory outside the workspace,
+    // while the runtime store holds this invocation's bound manifest
+    // under the same nested name — the promotion copy's destination
+    // must never follow the ancestor link.
+    let ws = sup.workspace_of(&w);
+    let outside = root.join("outside-workspace");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, ws.join("out")).unwrap();
+    let store_dir = ws.join(".artifact-store").join("out");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    std::fs::write(
+        store_dir.join("report.json"),
+        serde_json::json!({
+            "format_version": "taisan.worker.artifact/1",
+            "worker": "taisan-worker-claude",
+            "request_id": rid,
+            "invocation_id": invocation.id.0,
+            "status": "success",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    drive_to_done(&sup, &store, &rid);
+    for _ in 0..20 {
+        if execution(&store, &e).recovery_attempts_used > 0 {
+            break;
+        }
+        sup.run_once(&store, NOW).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert!(
+        !outside.join("report.json").exists(),
+        "the promotion copy never creates a file through the link"
+    );
+    assert!(
+        ws.join("out").is_symlink(),
+        "the ancestor link is never replaced by a real directory"
+    );
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "a refused promotion reports no fabricated evidence: {exec:?}"
+    );
+    assert!(
+        !store
+            .transact(|tx| tx.observations_for_execution(&e))
+            .unwrap()
+            .iter()
+            .any(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::Artifact {
+                        state: ArtifactFact::Present { .. },
+                        ..
+                    }
+                )
+            }),
+        "no Present fact was ever recorded through the link"
+    );
+}
+
+/// The mirror image on the read path: `out/` is a link to a host
+/// directory that holds a readable `report.json` — even one carrying
+/// this invocation's bound manifest. A leaf-only check would lstat
+/// through the link and report the outside file as `Present`
+/// evidence; the component-wise walk refuses the path instead, the
+/// slot records `missing`, and the Execution stays on bounded
+/// recovery. The outside file is never read and never touched.
+#[test]
+fn a_symlinked_ancestor_dir_is_never_read_through_as_evidence() {
+    let root = tmp_root("symlink-ancestor-read");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (src, _base, _newer) = git_source(&root);
+    let (w, e, rid) = admit(&store, "v2-symlink-ancestor-read", vec![]);
+    let sup = supervisor_v2(&root, &state_root, &src, "exit-no-artifact", true);
+    sup.consume_requests(&store, NOW).unwrap();
+
+    let invocation = invocation_for(&store, &rid).expect("invocation recorded");
+    let expected_state = invocation.state.clone();
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpdateInvocation {
+                invocation: Invocation {
+                    required_artifacts: vec![RequiredArtifact {
+                        kind: "report".into(),
+                        path: "out/report.json".into(),
+                        expected_digest: None,
+                    }],
+                    ..invocation.clone()
+                },
+                expected_state,
+            })
+        })
+        .unwrap();
+
+    // The strongest case: the outside file is this invocation's own
+    // bound manifest — following the link would read it as `Present`.
+    let ws = sup.workspace_of(&w);
+    let outside = root.join("outside-workspace");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(
+        outside.join("report.json"),
+        serde_json::json!({
+            "format_version": "taisan.worker.artifact/1",
+            "worker": "taisan-worker-claude",
+            "request_id": rid,
+            "invocation_id": invocation.id.0,
+            "status": "success",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let outside_bytes = std::fs::read(outside.join("report.json")).unwrap();
+    std::os::unix::fs::symlink(&outside, ws.join("out")).unwrap();
+    drive_to_done(&sup, &store, &rid);
+    for _ in 0..20 {
+        if execution(&store, &e).recovery_attempts_used > 0 {
+            break;
+        }
+        sup.run_once(&store, NOW).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert_eq!(
+        std::fs::read(outside.join("report.json")).unwrap(),
+        outside_bytes,
+        "the outside file is never touched"
+    );
+    assert!(
+        ws.join("out").is_symlink(),
+        "the ancestor link is never replaced"
+    );
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "a refused read reports no fabricated evidence: {exec:?}"
+    );
+    let observations = store
+        .transact(|tx| tx.observations_for_execution(&e))
+        .unwrap();
+    assert!(
+        !observations.iter().any(|o| {
+            matches!(
+                &o.fact,
+                ObservationFact::Artifact {
+                    state: ArtifactFact::Present { .. },
+                    ..
+                }
+            )
+        }),
+        "the outside file was never reported as evidence"
+    );
+    assert!(
+        observations.iter().any(|o| {
+            matches!(
+                &o.fact,
+                ObservationFact::Artifact {
+                    required_artifact,
+                    state: ArtifactFact::Missing,
+                    ..
+                } if required_artifact.as_str() == "report"
+            )
+        }),
+        "the linked slot records missing, like a failed write"
+    );
+}
+
+/// Insert a resolved writer bound to `request_id` requiring the
+/// workspace-root `artifact.json` — the durable shape the artifact
+/// gates read when they pick the producing Invocation.
+fn insert_writer(
+    store: &SqliteStore,
+    execution_id: &ExecutionId,
+    invocation_id: &str,
+    request_id: &str,
+    state: InvocationState,
+) {
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: InvocationId(invocation_id.into()),
+                    request_id: request_id.into(),
+                    execution_id: execution_id.clone(),
+                    role: InvocationRole::Coding,
+                    state,
+                    process_identity: None,
+                    descendants: vec![],
+                    required_artifacts: vec![RequiredArtifact {
+                        kind: "artifact.json".into(),
+                        path: "artifact.json".into(),
+                        expected_digest: None,
+                    }],
+                    evidence_refs: vec![],
+                },
+            })
+        })
+        .unwrap();
+}
+
+/// Move the admitted Execution into the `waiting` settle position a
+/// finished writer leaves — the only state `assess_completion` acts on.
+fn park_waiting(store: &SqliteStore, execution_id: &ExecutionId) {
+    store
+        .transact(|tx| {
+            let mut next = tx.execution(execution_id)?.expect("execution exists");
+            let expected = next.state.clone();
+            next.state = ExecutionState::Waiting;
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: expected,
+            })
+        })
+        .unwrap();
+}
+
+/// Authorize `push_ref` on the fixture host: the capability report the
+/// publish chain's guard reads before recording a stage-effect intent.
+fn authorize_push(store: &SqliteStore) {
+    handle_observation(
+        store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: None,
+            fact: ObservationFact::CapabilityReport {
+                host: host(),
+                capabilities: vec![CapabilityEntry {
+                    capability: HostCapability::PushRef,
+                    support: CapabilityState::Supported,
+                    authorization: CapabilityState::Authorized,
+                }],
+            },
+            observed_unix_seconds: NOW,
+        },
+        NOW,
+    )
+    .unwrap();
+}
+
+/// Record one `Artifact` fact the finish or recovery path reports for
+/// an Invocation's required `artifact.json` kind — the append-only
+/// evidence the artifact gates order by `(observed_unix_seconds,
+/// index)`.
+fn record_artifact_fact(
+    store: &SqliteStore,
+    execution_id: &ExecutionId,
+    invocation_id: &InvocationId,
+    state: ArtifactFact,
+    at: i64,
+) {
+    handle_observation(
+        store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: Some(execution_id.clone()),
+            fact: ObservationFact::Artifact {
+                invocation_id: invocation_id.clone(),
+                required_artifact: "artifact.json".into(),
+                state,
+            },
+            observed_unix_seconds: at,
+        },
+        at,
+    )
+    .unwrap();
+}
+
+/// The collision refusal binds to its producing Invocation: an
+/// `Unfulfillable` recorded under a superseded writer is stale
+/// evidence, never the current writer's outcome. Artifact
+/// observations survive the pause/resume and requeue that replace a
+/// writer, so the settle pass reads the CURRENT producing
+/// Invocation's latest fact per required kind — the same binding
+/// `artifact_digests` applies to satisfying evidence (WC-REV-01).
+#[test]
+fn a_superseded_writers_collision_never_fails_the_current_writer() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut cfg = config();
+    cfg.lanes = LanePolicy {
+        invariant_check: false,
+        code_review: false,
+    };
+    let (_w, e, rid) = admit_ex_cfg(&store, "v2-unfulfillable-stale", vec![], vec![], &cfg);
+    // The superseded writer whose finish recorded the tracked-artifact
+    // collision, and the current writer admitted after the path was
+    // untracked — both resolved `Done`.
+    insert_writer(
+        &store,
+        &e,
+        "inv-stale",
+        &format!("{rid}:prev"),
+        InvocationState::Done,
+    );
+    insert_writer(&store, &e, "inv-current", &rid, InvocationState::Done);
+    park_waiting(&store, &e);
+    authorize_push(&store);
+    // The stale collision's durable fact lands ahead of the current
+    // writer's evidence, exactly as a pause/resume replay delivers it.
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-stale".into()),
+        ArtifactFact::Unfulfillable {
+            reason: "required artifact path is tracked repository content".into(),
+        },
+        NOW,
+    );
+    let exec = execution(&store, &e);
+    assert_ne!(
+        exec.state,
+        ExecutionState::Failed,
+        "a superseded writer's collision is stale evidence: {exec:?}"
+    );
+    // The current writer's own `Present` — not the stale refusal —
+    // drives the publish chain.
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-current".into()),
+        ArtifactFact::Present {
+            digest: "cd".repeat(32),
+        },
+        NOW + 1,
+    );
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.waiting_reason,
+        Some(WaitingReason::HostWrite),
+        "the current writer's evidence advanced publication: {exec:?}"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.action_intents())
+            .unwrap()
+            .iter()
+            .any(|i| matches!(i.action, HostAction::PushRef { .. })),
+        "the publish intent is authorized by the current writer's artifact"
+    );
+}
+
+/// Within one producing Invocation the latest fact per required kind
+/// is the current evidence: a later `Present` for the same kind
+/// supersedes an earlier `Unfulfillable`. The observation log is
+/// append-only — the finish path can report a collision while the
+/// writer is still unresolved, and a later recovery pass over the
+/// same workspace then promotes a now-valid manifest under the same
+/// Invocation identity. The gate reads the newest fact, never the
+/// first.
+#[test]
+fn a_writers_later_present_supersedes_its_earlier_collision() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut cfg = config();
+    cfg.lanes = LanePolicy {
+        invariant_check: false,
+        code_review: false,
+    };
+    let (_w, e, rid) = admit_ex_cfg(&store, "v2-unfulfillable-supersede", vec![], vec![], &cfg);
+    // The writer is still unresolved while its finish path reports
+    // the collision — the settle pass defers to a live writer's later
+    // evidence, never settling on a mid-flight fact.
+    insert_writer(&store, &e, "inv-current", &rid, InvocationState::Running);
+    authorize_push(&store);
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-current".into()),
+        ArtifactFact::Unfulfillable {
+            reason: "required artifact path is tracked repository content".into(),
+        },
+        NOW,
+    );
+    // The path is untracked and the recovery pass promotes a valid
+    // manifest under the same Invocation: the writer resolves `Done`
+    // and the Execution waits for the settle pass.
+    store
+        .transact(|tx| {
+            let mut writer = tx
+                .invocations_for_execution(&e)?
+                .into_iter()
+                .next()
+                .expect("writer recorded");
+            let expected_writer = writer.state.clone();
+            writer.state = InvocationState::Done;
+            tx.apply(&Effect::UpdateInvocation {
+                invocation: writer,
+                expected_state: expected_writer,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    park_waiting(&store, &e);
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-current".into()),
+        ArtifactFact::Present {
+            digest: "ef".repeat(32),
+        },
+        NOW + 1,
+    );
+    let exec = execution(&store, &e);
+    assert_ne!(
+        exec.state,
+        ExecutionState::Failed,
+        "a superseded collision is not the Invocation's evidence: {exec:?}"
+    );
+    assert_eq!(
+        exec.waiting_reason,
+        Some(WaitingReason::HostWrite),
+        "the latest fact — `Present` — drove publication: {exec:?}"
+    );
+}
+
+/// An `artifact_unfulfillable` settle honors the terminal-settle rule
+/// every other failure path applies: a delivery-bound intent that may
+/// still be drained must not land under an already-recorded failure.
+/// While the publish chain's `push_ref` intent stays `pending`, the
+/// collision defers as `outbox_reconciliation` instead of failing;
+/// the reconciling receipt then re-drives the settle and the failure
+/// lands — never ahead of it.
+#[test]
+fn an_unfulfillable_settle_defers_until_the_outstanding_write_reconciles() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut cfg = config();
+    cfg.allowed_effects.host_write = true;
+    cfg.lanes = LanePolicy {
+        invariant_check: false,
+        code_review: false,
+    };
+    let (w, e, rid) = admit_ex_cfg(&store, "v2-unfulfillable-defer", vec![], vec![], &cfg);
+    insert_writer(&store, &e, "inv-current", &rid, InvocationState::Done);
+    park_waiting(&store, &e);
+    authorize_push(&store);
+    // The producing writer's evidence lands: the publish chain records
+    // a `push_ref` intent that stays `pending` — an effect whose
+    // receipt may still arrive.
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-current".into()),
+        ArtifactFact::Present {
+            digest: "ab".repeat(32),
+        },
+        NOW,
+    );
+    let pending = store
+        .transact(|tx| tx.action_intents())
+        .unwrap()
+        .into_iter()
+        .find(|i| matches!(i.action, HostAction::PushRef { .. }))
+        .expect("the publish chain recorded a push_ref intent");
+    assert_eq!(pending.status, HostActionStatus::Pending);
+
+    // The collision fact lands while the write is still outstanding:
+    // the settle defers, it does not fail.
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-current".into()),
+        ArtifactFact::Unfulfillable {
+            reason: "required artifact path is tracked repository content".into(),
+        },
+        NOW + 1,
+    );
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.state,
+        ExecutionState::Waiting,
+        "the outstanding host write defers the terminal failure: {exec:?}"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.deferrals())
+            .unwrap()
+            .iter()
+            .any(|d| d.execution_id == e && d.reason == "outbox_reconciliation"),
+        "the deferred settle explains itself as outbox reconciliation"
+    );
+
+    // The reconciling receipt re-drives the settle: with the outbox
+    // resolved, the same collision now fails the request.
+    handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(w.clone()),
+            subject_execution_id: None,
+            fact: ObservationFact::HostActionResult {
+                action_id: pending.action_id.clone(),
+                authenticated_actor: None,
+                status: HostActionStatus::Failed {
+                    reason: "transport lost".into(),
+                },
+                effects: vec![],
+            },
+            observed_unix_seconds: NOW + 2,
+        },
+        NOW + 2,
+    )
+    .unwrap();
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.state,
+        ExecutionState::Failed,
+        "the deferred failure lands once the outbox reconciles: {exec:?}"
+    );
+    assert_eq!(
+        exec.terminal_code.as_deref(),
+        Some("artifact_unfulfillable")
+    );
+    assert!(
+        store
+            .transact(|tx| tx.deferrals())
+            .unwrap()
+            .iter()
+            .all(|d| d.execution_id != e),
+        "a terminal Execution carries no stale deferral"
+    );
+}
+
+/// A collision detected on the bounded-recovery lane that defers for
+/// an outstanding host write is no longer a recovery wait: the
+/// refused slot can never hold the bound evidence, so the deferred
+/// settle takes the Execution off `artifact_recovery` at once. The
+/// recovery pass stops charging attempts and the sweep can never
+/// settle the slot as `artifact_recovery_exhausted` — the reconciling
+/// receipt lands `artifact_unfulfillable`, the same terminal outcome
+/// the finish path records.
+#[test]
+fn a_deferred_unfulfillable_refusal_leaves_the_recovery_lane() {
+    let root = tmp_root("unfulfillable-defer-recovery");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut cfg = config();
+    cfg.allowed_effects.host_write = true;
+    cfg.lanes = LanePolicy {
+        invariant_check: false,
+        code_review: false,
+    };
+    let (_w, e, rid) = admit_ex_cfg(
+        &store,
+        "v2-unfulfillable-defer-recovery",
+        vec![],
+        vec![],
+        &cfg,
+    );
+    insert_writer(&store, &e, "inv-current", &rid, InvocationState::Done);
+    park_waiting(&store, &e);
+
+    // The recovery lane: a Missing fact parks the Execution in
+    // `artifact_recovery` exactly as a finish-time recoverable absence
+    // does.
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-current".into()),
+        ArtifactFact::Missing,
+        NOW,
+    );
+    assert_eq!(
+        execution(&store, &e).waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "the missing artifact parked the Execution on the recovery lane"
+    );
+
+    // The publish chain records a `push_ref` intent that stays
+    // `pending` — the delivery-bound effect the settle must wait on.
+    authorize_push(&store);
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-current".into()),
+        ArtifactFact::Present {
+            digest: "ab".repeat(32),
+        },
+        NOW + 1,
+    );
+    let pending = store
+        .transact(|tx| tx.action_intents())
+        .unwrap()
+        .into_iter()
+        .find(|i| matches!(i.action, HostAction::PushRef { .. }))
+        .expect("the publish chain recorded a push_ref intent");
+    assert_eq!(pending.status, HostActionStatus::Pending);
+
+    // The artifact is lost again while the write drains: the Execution
+    // re-enters the recovery lane with the intent still outstanding.
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-current".into()),
+        ArtifactFact::Missing,
+        NOW + 2,
+    );
+    assert_eq!(
+        execution(&store, &e).waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "the re-lost artifact re-parked the Execution on the recovery lane"
+    );
+
+    // The recovery pass reports the structural refusal while the write
+    // is outstanding: the settle defers — and the Execution leaves the
+    // recovery lane at once, waiting on the outbox like every other
+    // deferred terminal outcome.
+    record_artifact_fact(
+        &store,
+        &e,
+        &InvocationId("inv-current".into()),
+        ArtifactFact::Unfulfillable {
+            reason: "required artifact path is tracked repository content".into(),
+        },
+        NOW + 3,
+    );
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.state,
+        ExecutionState::Waiting,
+        "the outstanding host write defers the terminal failure: {exec:?}"
+    );
+    assert_eq!(
+        exec.waiting_reason,
+        Some(WaitingReason::Reconciliation),
+        "the deferred settle waits on the outbox, not on recovery: {exec:?}"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.deferrals())
+            .unwrap()
+            .iter()
+            .any(|d| d.execution_id == e && d.reason == "outbox_reconciliation"),
+        "the deferred settle explains itself as outbox reconciliation"
+    );
+
+    // The recovery pass no longer selects it: the refused slot never
+    // consumes the bounded-recovery budget.
+    let sup = Supervisor::new(
+        PosixProcessControl,
+        root.join("workspaces"),
+        vec!["true".into()],
+        config(),
+    );
+    sup.run_recovery(&store, NOW + 4).unwrap();
+    assert_eq!(
+        execution(&store, &e).recovery_attempts_used,
+        0,
+        "a decided refusal is never charged a recovery attempt"
+    );
+
+    // Even fully spent, the lane no longer applies: the sweep cannot
+    // settle the refused slot as exhausted recovery.
+    store
+        .transact(|tx| {
+            let mut next = tx.execution(&e)?.expect("execution exists");
+            let expected = next.state.clone();
+            next.recovery_attempts_used = next.budget.artifact_recovery_attempts;
+            tx.apply(&Effect::UpdateExecution {
+                execution: next,
+                expected_state: expected,
+            })
+        })
+        .unwrap();
+    sweep(&store, &config(), NOW + 5).unwrap();
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.state,
+        ExecutionState::Waiting,
+        "a refused slot never settles as artifact_recovery_exhausted: {exec:?}"
+    );
+
+    // The reconciling receipt lands the deferred refusal: same
+    // terminal outcome as the finish path.
+    handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(exec.work_id.clone()),
+            subject_execution_id: None,
+            fact: ObservationFact::HostActionResult {
+                action_id: pending.action_id.clone(),
+                authenticated_actor: None,
+                status: HostActionStatus::Failed {
+                    reason: "transport lost".into(),
+                },
+                effects: vec![],
+            },
+            observed_unix_seconds: NOW + 6,
+        },
+        NOW + 6,
+    )
+    .unwrap();
+    let exec = execution(&store, &e);
+    assert_eq!(exec.state, ExecutionState::Failed);
+    assert_eq!(
+        exec.terminal_code.as_deref(),
+        Some("artifact_unfulfillable"),
+        "the deferred refusal, never recovery exhaustion: {exec:?}"
+    );
+}
+
+/// Persist the durable v2 request body for `request_id` — the marker
+/// `worker_request_body` reads to classify the dispatch as v2 for the
+/// `artifact.json` manifest-slot rule. Same stored shape
+/// `record_terminal_only_v2_invocation` writes, minus the Invocation:
+/// the caller owns the writer row.
+fn save_v2_request_body(
+    store: &SqliteStore,
+    work_id: &WorkId,
+    execution_id: &ExecutionId,
+    request_id: &str,
+    invocation_id: &str,
+    base: &str,
+) {
+    let repository = WireRepository {
+        host: "fixture".into(),
+        repository: "repo".into(),
+    };
+    let mut wire = WorkerRequestV2 {
+        format_version: WORKER_REQUEST_V2_FORMAT.into(),
+        request_id: request_id.into(),
+        invocation_id: invocation_id.into(),
+        request_digest: String::new(),
+        store_id: store.transact(|tx| tx.store_id()).unwrap().0,
+        work_id: work_id.0.clone(),
+        execution_id: execution_id.0.clone(),
+        role: InvocationRole::Coding,
+        repository: repository.clone(),
+        base: RequestBase {
+            repository,
+            object: base.into(),
+        },
+        spec: SpecRef {
+            revision: 1,
+            digest: store
+                .transact(|tx| tx.spec(work_id, Some(1)))
+                .unwrap()
+                .unwrap()
+                .digest,
+        },
+        workspace: WorkspaceGrant {
+            workspace_id: format!("ws-{}", work_id.0),
+            mount: "/workspace".into(),
+            read_only: false,
+        },
+        budget: RequestBudget {
+            deadline_unix_seconds: NOW + 3600,
+            max_runtime_seconds: 1800,
+            max_turns: 200,
+            max_report_bytes: 1 << 20,
+            max_log_bytes: 1 << 25,
+            max_verification_commands: 8,
+            max_continuation_refs: 4,
+        },
+        required_capabilities: RequiredCapabilities {
+            role: InvocationRole::Coding,
+            protocol_versions: vec![WORKER_REQUEST_V2_FORMAT.into()],
+            capabilities: vec![],
+            resume: "unsupported".into(),
+            verification_egress_hosts: vec![],
+        },
+        continuation: vec![],
+        task: TaskBody::Coding {
+            goal: GoalRef {
+                body_ref: "goal-1".into(),
+                media_type: "text/markdown".into(),
+                bytes: 4,
+                digest: "0".repeat(64),
+            },
+            issues: vec![],
+            constraints: vec![],
+            verification_argv: vec![],
+        },
+    };
+    wire.request_digest = wire.digest();
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertWorkerRequestBody {
+                body: WorkerRequestBody {
+                    request_id: request_id.into(),
+                    format_version: WORKER_REQUEST_V2_FORMAT.into(),
+                    canonical_body: wire.to_canonical_bytes(),
+                    body_digest: wire.digest(),
+                },
+            })
+        })
+        .unwrap();
+}
+
+/// The recovery-detected half of the refused slot's zero-burn rule:
+/// when the bounded-recovery pass itself uncovers the collision — a
+/// foreign store copy promoted onto a tracked slot — the refusal
+/// takes the Execution off the lane exactly like a finish-detected
+/// one. The discovering pass charges no attempt: the settle defers
+/// onto the outstanding write as outbox reconciliation, no further
+/// pass selects the Execution, and the reconciling receipt lands
+/// `artifact_unfulfillable`.
+#[test]
+fn a_recovery_detected_refusal_charges_no_attempt() {
+    let root = tmp_root("unfulfillable-recovery-defer");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut cfg = config();
+    cfg.allowed_effects.host_write = true;
+    cfg.lanes = LanePolicy {
+        invariant_check: false,
+        code_review: false,
+    };
+    let (w, e, rid) = admit_ex_cfg(
+        &store,
+        "v2-unfulfillable-recovery-defer",
+        vec![],
+        vec![],
+        &cfg,
+    );
+    let (_src, base, newer) = git_source(&root);
+    let inv_current = InvocationId("inv-current".into());
+    // The v2 durable shape: the saved request body is what marks the
+    // `artifact.json` slot as bound-manifest territory for the
+    // collision rule, and the acknowledged handoff names the produced
+    // commit the pending push intent carries.
+    save_v2_request_body(&store, &w, &e, &rid, "inv-current", &base);
+    insert_writer(&store, &e, "inv-current", &rid, InvocationState::Done);
+    store
+        .transact(|tx| {
+            let seq = tx.alloc_seq()?;
+            tx.apply(&Effect::UpsertHandoff {
+                handoff: ArtifactHandoff {
+                    artifact_id: "inv-current/artifact.json".into(),
+                    invocation_id: inv_current.clone(),
+                    request_id: rid.clone(),
+                    work_id: w.clone(),
+                    execution_id: e.clone(),
+                    base: base.clone(),
+                    produced: Some(newer.clone()),
+                    manifest_digest: Some("ab".repeat(32)),
+                    state: HandoffState::Acknowledged,
+                    invalid_reason: None,
+                    attempt: 0,
+                    recorded_seq: seq,
+                },
+                expected_seq: 0,
+            })
+        })
+        .unwrap();
+    park_waiting(&store, &e);
+
+    // A recoverable absence parks the Execution on the lane; the
+    // publish chain then leaves a delivery-bound intent outstanding —
+    // the write the terminal settle must defer behind — and a second
+    // loss re-parks the lane.
+    record_artifact_fact(&store, &e, &inv_current, ArtifactFact::Missing, NOW);
+    authorize_push(&store);
+    record_artifact_fact(
+        &store,
+        &e,
+        &inv_current,
+        ArtifactFact::Present {
+            digest: "ab".repeat(32),
+        },
+        NOW + 1,
+    );
+    let pending = store
+        .transact(|tx| tx.action_intents())
+        .unwrap()
+        .into_iter()
+        .find(|i| matches!(i.action, HostAction::PushRef { .. }))
+        .expect("the publish chain recorded a push_ref intent");
+    assert_eq!(pending.status, HostActionStatus::Pending);
+    record_artifact_fact(&store, &e, &inv_current, ArtifactFact::Missing, NOW + 2);
+    assert_eq!(
+        execution(&store, &e).waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "the re-lost artifact re-parked the Execution on the recovery lane"
+    );
+
+    // A real workspace whose index still tracks `artifact.json` while
+    // the worktree entry is absent, and a foreign bound manifest the
+    // recovery pass promotes onto the slot.
+    let sup = Supervisor::new(
+        PosixProcessControl,
+        root.join("workspaces"),
+        vec!["true".into()],
+        config(),
+    );
+    let ws = sup.workspace_of(&w);
+    std::fs::create_dir_all(&ws).unwrap();
+    git(&ws, &["init", "-b", "main"]);
+    git(&ws, &["config", "user.email", "t@t"]);
+    git(&ws, &["config", "user.name", "t"]);
+    std::fs::write(ws.join("artifact.json"), "repository content\n").unwrap();
+    git(&ws, &["add", "artifact.json"]);
+    git(&ws, &["commit", "-m", "track artifact.json"]);
+    std::fs::remove_file(ws.join("artifact.json")).unwrap();
+    let store_dir = ws.join(".artifact-store");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    std::fs::write(
+        store_dir.join("artifact.json"),
+        serde_json::json!({
+            "format_version": "taisan.worker.artifact/1",
+            "worker": "taisan-worker-claude",
+            "request_id": "other-execution:inv:0",
+            "invocation_id": "inv-foreign",
+            "status": "success",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // The discovering pass: the promoted foreign copy reports the
+    // structural refusal, the settle defers onto the outstanding
+    // write, and the refused slot never consumes the policy — no
+    // attempt is charged.
+    sup.run_recovery(&store, NOW + 3).unwrap();
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.state,
+        ExecutionState::Waiting,
+        "the outstanding host write defers the terminal failure: {exec:?}"
+    );
+    assert_eq!(
+        exec.waiting_reason,
+        Some(WaitingReason::Reconciliation),
+        "the deferred settle waits on the outbox, not on recovery: {exec:?}"
+    );
+    assert_eq!(
+        exec.recovery_attempts_used, 0,
+        "a refused slot is never charged a recovery attempt: {exec:?}"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.observations_for_execution(&e))
+            .unwrap()
+            .iter()
+            .any(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::Artifact {
+                        invocation_id,
+                        state: ArtifactFact::Unfulfillable { .. },
+                        ..
+                    } if invocation_id == &inv_current
+                )
+            }),
+        "the recovery pass reported the structural refusal to Core"
+    );
+
+    // Off the lane, the pass selects nothing and still charges nothing.
+    sup.run_recovery(&store, NOW + 4).unwrap();
+    assert_eq!(
+        execution(&store, &e).recovery_attempts_used,
+        0,
+        "the decided refusal keeps consuming no recovery attempts"
+    );
+
+    // The reconciling receipt lands the deferred refusal: the same
+    // terminal outcome the finish path records.
+    handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: Some(exec.work_id.clone()),
+            subject_execution_id: None,
+            fact: ObservationFact::HostActionResult {
+                action_id: pending.action_id.clone(),
+                authenticated_actor: None,
+                status: HostActionStatus::Failed {
+                    reason: "transport lost".into(),
+                },
+                effects: vec![],
+            },
+            observed_unix_seconds: NOW + 5,
+        },
+        NOW + 5,
+    )
+    .unwrap();
+    let exec = execution(&store, &e);
+    assert_eq!(exec.state, ExecutionState::Failed);
+    assert_eq!(
+        exec.terminal_code.as_deref(),
+        Some("artifact_unfulfillable"),
+        "the deferred refusal, never recovery exhaustion: {exec:?}"
+    );
+}
+
+/// The bound keeps pricing a refusal that does not end the wait: a
+/// collision recorded under a superseded Invocation is stale
+/// evidence — the producing writer's own record carries no refusal,
+/// so `assess_completion` cannot settle and the Execution stays on
+/// the lane. That pass is still bounded recovery, charged after its
+/// reports prove the wait continued, and every later pass that
+/// re-finds the stale collision is charged again — the attempt
+/// bound, not only the deadline, prices the loop.
+#[test]
+fn a_lane_bound_refusal_still_charges_an_attempt() {
+    let root = tmp_root("lane-bound-refusal");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e, rid) = admit(&store, "v2-lane-bound-refusal", vec![]);
+    let (_src, base, _newer) = git_source(&root);
+    let inv_current = InvocationId("inv-current".into());
+    // Two resolved writers share the `artifact.json` requirement, but
+    // only the superseded one's request carries the durable v2 body —
+    // the tracked-slot collision rule reads it — so the promoted
+    // foreign manifest is a structural refusal under `inv-stale` and
+    // an opaque foreign file under the producing `inv-current`.
+    insert_writer(&store, &e, "inv-stale", "rid-stale", InvocationState::Done);
+    insert_writer(&store, &e, "inv-current", &rid, InvocationState::Done);
+    insert_request(
+        &store,
+        &w,
+        &e,
+        "rid-stale",
+        InvocationRole::Coding,
+        serde_json::json!({}),
+    );
+    save_v2_request_body(&store, &w, &e, "rid-stale", "inv-stale", &base);
+    park_waiting(&store, &e);
+    record_artifact_fact(&store, &e, &inv_current, ArtifactFact::Missing, NOW);
+    assert_eq!(
+        execution(&store, &e).waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "the producing writer's missing artifact parked the lane"
+    );
+
+    // A tracked slot whose worktree entry is absent, and a foreign
+    // bound manifest the pass promotes onto it.
+    let sup = Supervisor::new(
+        PosixProcessControl,
+        root.join("workspaces"),
+        vec!["true".into()],
+        config(),
+    );
+    let ws = sup.workspace_of(&w);
+    std::fs::create_dir_all(&ws).unwrap();
+    git(&ws, &["init", "-b", "main"]);
+    git(&ws, &["config", "user.email", "t@t"]);
+    git(&ws, &["config", "user.name", "t"]);
+    std::fs::write(ws.join("artifact.json"), "repository content\n").unwrap();
+    git(&ws, &["add", "artifact.json"]);
+    git(&ws, &["commit", "-m", "track artifact.json"]);
+    std::fs::remove_file(ws.join("artifact.json")).unwrap();
+    let store_dir = ws.join(".artifact-store");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    std::fs::write(
+        store_dir.join("artifact.json"),
+        serde_json::json!({
+            "format_version": "taisan.worker.artifact/1",
+            "worker": "taisan-worker-claude",
+            "request_id": "other-execution:inv:0",
+            "invocation_id": "inv-foreign",
+            "status": "success",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // The pass reports the refusal under the superseded Invocation;
+    // the producing writer's record decides nothing, the Execution
+    // stays on the lane, and the attempt is charged after the
+    // reports — in-flight recovery like any other.
+    sup.run_recovery(&store, NOW + 1).unwrap();
+    let exec = execution(&store, &e);
+    assert_eq!(
+        exec.state,
+        ExecutionState::Waiting,
+        "a stale refusal settles nothing for the producing writer: {exec:?}"
+    );
+    assert_eq!(
+        exec.waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "the Execution stays on the recovery lane: {exec:?}"
+    );
+    assert_eq!(
+        exec.recovery_attempts_used, 1,
+        "a refusal that leaves the Execution on the lane is charged: {exec:?}"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.observations_for_execution(&e))
+            .unwrap()
+            .iter()
+            .any(|o| {
+                matches!(
+                    &o.fact,
+                    ObservationFact::Artifact {
+                        invocation_id,
+                        state: ArtifactFact::Unfulfillable { .. },
+                        ..
+                    } if invocation_id.0 == "inv-stale"
+                )
+            }),
+        "the refusal was recorded under the superseded Invocation"
+    );
+
+    // The stale collision is re-found on every pass; the attempt
+    // bound keeps applying until it — not the deadline — prices the
+    // loop out.
+    sup.run_recovery(&store, NOW + 2).unwrap();
+    assert_eq!(
+        execution(&store, &e).recovery_attempts_used,
+        2,
+        "each lane-bound refusal pass keeps consuming the bound"
     );
 }
 

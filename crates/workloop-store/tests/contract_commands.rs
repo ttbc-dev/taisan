@@ -4007,6 +4007,16 @@ fn seed_completion_evidence_minus_assessment(
             },
         ],
     );
+    seed_publish_and_lane_evidence(store, w, eid, key);
+}
+
+/// The publish receipts and lane-evidence half of
+/// `seed_completion_evidence_minus_assessment`, for fixtures that
+/// place their own writer set: the applied intents, the opened-change
+/// receipt, and the head's check/review facts — everything completion
+/// requires except the producing writer's artifact and the final
+/// assessment.
+fn seed_publish_and_lane_evidence(store: &SqliteStore, w: &WorkId, eid: &ExecutionId, key: &str) {
     // Completion requires the applied publish intents for the Work.
     for (action_id, action) in [
         (
@@ -4166,6 +4176,362 @@ fn sweep_reassessment_settles_a_waiting_execution_whose_evidence_completed_off_p
     );
 }
 
+/// Insert a superseded writer — resolved `Done` after its replacement
+/// was admitted — carrying one stale artifact `fact` bound to its own
+/// Invocation identity, evidence no later observation can supersede
+/// under that identity.
+fn superseded_done_writer(store: &SqliteStore, eid: &ExecutionId, key: &str, fact: ArtifactFact) {
+    let mut stale = recorded_invocation(eid, &format!("{key}-stale"));
+    stale.state = InvocationState::Done;
+    stale.request_id = format!("{}:inv:stale", eid.0);
+    stale.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: None,
+    }];
+    apply_effects(
+        store,
+        &[
+            Effect::InsertInvocation { invocation: stale },
+            Effect::InsertObservation {
+                observation: Observation {
+                    delivery: None,
+                    subject_work_id: None,
+                    subject_execution_id: Some(eid.clone()),
+                    fact: ObservationFact::Artifact {
+                        invocation_id: InvocationId(format!("{key}-stale")),
+                        required_artifact: "artifact.json".into(),
+                        state: fact,
+                    },
+                    observed_unix_seconds: NOW,
+                },
+            },
+        ],
+    );
+}
+
+/// A superseded writer's declared artifact set is stale exactly like
+/// its evidence (WC-REV-01): the collision it recorded can never be
+/// re-reported under its own identity, so holding the completion gate
+/// on its required set would park the Execution in `waiting` until the
+/// runtime bound — never succeeding on the current writer's complete
+/// evidence, never failing with `artifact_unfulfillable`.
+#[test]
+fn a_superseded_writers_unsatisfied_required_set_never_blocks_completion() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("sup1"), NOW).unwrap());
+    superseded_done_writer(
+        &store,
+        &e1,
+        "sup1",
+        ArtifactFact::Unfulfillable {
+            reason: "workspace-root artifact.json is tracked repository content".into(),
+        },
+    );
+    // The current writer's complete evidence set: its own `Present`
+    // artifact, the publish receipts, and the lane evidence.
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "sup1");
+    emit_work_fact(&store, &w, positive_assessment("sha-1"));
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Succeeded,
+        "the superseded writer's unsatisfiable declared set is stale evidence, not a live obligation: {e:?}"
+    );
+}
+
+/// The same waiver covers every stale terminal fact class: a
+/// superseded writer whose latest fact is `Missing` is just as
+/// unrefreshable under its own identity — recovery reports under the
+/// CURRENT writer — so its declared set cannot gate either.
+#[test]
+fn a_superseded_writers_missing_fact_never_blocks_completion() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("sup2"), NOW).unwrap());
+    superseded_done_writer(&store, &e1, "sup2", ArtifactFact::Missing);
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "sup2");
+    emit_work_fact(&store, &w, positive_assessment("sha-1"));
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Succeeded,
+        "a superseded writer's `Missing` is stale evidence, not a live obligation: {e:?}"
+    );
+}
+
+/// Supersession waives only the stale writer's obligation, never the
+/// current one's: a later `Missing` reported under the CURRENT
+/// writer's own identity re-opens the declared-set gate and the
+/// Execution drops back to bounded recovery instead of completing.
+#[test]
+fn the_current_writers_own_missing_fact_still_gates_completion() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("sup3"), NOW).unwrap());
+    superseded_done_writer(
+        &store,
+        &e1,
+        "sup3",
+        ArtifactFact::Unfulfillable {
+            reason: "workspace-root artifact.json is tracked repository content".into(),
+        },
+    );
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "sup3");
+    // The current writer's newest evidence reports the artifact gone:
+    // the latest-fact-per-kind selection every artifact gate shares.
+    handle_observation(
+        &store,
+        &config(),
+        &Observation {
+            delivery: None,
+            subject_work_id: None,
+            subject_execution_id: Some(e1.clone()),
+            fact: ObservationFact::Artifact {
+                invocation_id: InvocationId("sup3-coding".into()),
+                required_artifact: "artifact.json".into(),
+                state: ArtifactFact::Missing,
+            },
+            observed_unix_seconds: NOW + 1,
+        },
+        NOW + 1,
+    )
+    .unwrap();
+    emit_work_fact(&store, &w, positive_assessment("sha-1"));
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Waiting,
+        "the current writer's own unsatisfied set still gates: {e:?}"
+    );
+    assert_eq!(
+        e.waiting_reason,
+        Some(WaitingReason::ArtifactRecovery),
+        "the hold is bounded artifact recovery, not a stall: {e:?}"
+    );
+}
+
+/// Supersession requires a *resolved* successor: a later writer that
+/// never reached `Done` took over nothing, and the last Done writer's
+/// declared set still gates — an `Abandoned` tail writer cannot waive
+/// it and let the Execution drift to `succeeded` on receipts alone.
+#[test]
+fn a_non_done_successor_does_not_waive_the_previous_writers_declared_set() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("sup4"), NOW).unwrap());
+    force_state(&store, &e1, ExecutionState::Waiting);
+    // The producing writer resolved `Done` without ever reporting its
+    // declared artifact; the successor dispatched after it was
+    // abandoned before it could produce anything.
+    let mut writer = recorded_invocation(&e1, "sup4-coding");
+    writer.state = InvocationState::Done;
+    writer.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: None,
+    }];
+    let mut successor = recorded_invocation(&e1, "sup4-fix");
+    successor.role = InvocationRole::Fix;
+    successor.state = InvocationState::Abandoned;
+    successor.request_id = format!("{}:inv:fix", e1.0);
+    successor.required_artifacts = writer.required_artifacts.clone();
+    let mut check = recorded_invocation(&e1, "sup4-check");
+    check.role = InvocationRole::InvariantCheck;
+    check.state = InvocationState::Done;
+    check.request_id = format!("{}:inv:check", e1.0);
+    apply_effects(
+        &store,
+        &[
+            Effect::InsertInvocation { invocation: writer },
+            Effect::InsertInvocation {
+                invocation: successor,
+            },
+            Effect::InsertInvocation { invocation: check },
+            Effect::InsertObservation {
+                observation: check_exit_observation(&e1, "sup4-check"),
+            },
+        ],
+    );
+    // Receipts and lane evidence all satisfied: the declared-set gate
+    // is the only thing that can hold this Execution.
+    seed_publish_and_lane_evidence(&store, &w, &e1, "sup4");
+    emit_work_fact(&store, &w, positive_assessment("sha-1"));
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Waiting,
+        "an abandoned successor transferred no obligation: {e:?}"
+    );
+}
+
+/// The refusal and the declared-set gate share the same producer
+/// binding (latest writer resolved `Done`): with only an abandoned
+/// tail after it, the producing writer's own collision is still the
+/// current evidence and fails fast `artifact_unfulfillable` instead of
+/// parking until the runtime bound.
+#[test]
+fn an_abandoned_tail_does_not_stale_the_producing_writers_collision() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (_w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("sup5"), NOW).unwrap());
+    force_state(&store, &e1, ExecutionState::Waiting);
+    let mut writer = recorded_invocation(&e1, "sup5-coding");
+    writer.state = InvocationState::Done;
+    writer.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: None,
+    }];
+    let mut tail = recorded_invocation(&e1, "sup5-fix");
+    tail.role = InvocationRole::Fix;
+    tail.state = InvocationState::Abandoned;
+    tail.request_id = format!("{}:inv:fix", e1.0);
+    apply_effects(
+        &store,
+        &[
+            Effect::InsertInvocation { invocation: writer },
+            Effect::InsertInvocation { invocation: tail },
+            Effect::InsertObservation {
+                observation: Observation {
+                    delivery: None,
+                    subject_work_id: None,
+                    subject_execution_id: Some(e1.clone()),
+                    fact: ObservationFact::Artifact {
+                        invocation_id: InvocationId("sup5-coding".into()),
+                        required_artifact: "artifact.json".into(),
+                        state: ArtifactFact::Unfulfillable {
+                            reason: "workspace-root artifact.json is tracked repository content"
+                                .into(),
+                        },
+                    },
+                    observed_unix_seconds: NOW,
+                },
+            },
+        ],
+    );
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(report.terminal_failures, 1, "{report:?}");
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Failed,
+        "the producing writer's collision stays current evidence: {e:?}"
+    );
+    assert_eq!(e.terminal_code.as_deref(), Some("artifact_unfulfillable"));
+}
+
+/// The same binding never reads the abandoned tail's own stale facts:
+/// a `Done` writer's complete evidence settles `succeeded` even when a
+/// later `Abandoned` record carries an `Unfulfillable` it could never
+/// have produced — that record is not the producing Invocation.
+#[test]
+fn an_abandoned_tails_stale_collision_never_fails_the_execution() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("sup6"), NOW).unwrap());
+    // Complete evidence under the producing writer first.
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "sup6");
+    // Then a successor is dispatched, abandoned, and its durable
+    // record somehow carries a collision — stale by construction.
+    let mut tail = recorded_invocation(&e1, "sup6-fix");
+    tail.role = InvocationRole::Fix;
+    tail.state = InvocationState::Abandoned;
+    tail.request_id = format!("{}:inv:fix", e1.0);
+    tail.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: None,
+    }];
+    apply_effects(
+        &store,
+        &[
+            Effect::InsertInvocation { invocation: tail },
+            Effect::InsertObservation {
+                observation: Observation {
+                    delivery: None,
+                    subject_work_id: None,
+                    subject_execution_id: Some(e1.clone()),
+                    fact: ObservationFact::Artifact {
+                        invocation_id: InvocationId("sup6-fix".into()),
+                        required_artifact: "artifact.json".into(),
+                        state: ArtifactFact::Unfulfillable {
+                            reason: "workspace-root artifact.json is tracked repository content"
+                                .into(),
+                        },
+                    },
+                    observed_unix_seconds: NOW + 1,
+                },
+            },
+        ],
+    );
+    emit_work_fact(&store, &w, positive_assessment("sha-1"));
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Succeeded,
+        "an abandoned record is never the producing Invocation: {e:?}"
+    );
+}
+
+/// Re-assessment settles in both directions: a Waiting Execution
+/// whose recorded evidence proves a terminal refusal — the producing
+/// writer's `Unfulfillable` artifact collision — fails on the sweep
+/// pass, and the report counts that failure in `terminal_failures`
+/// like any bound exhaustion instead of reporting an unchanged pass.
+#[test]
+fn sweep_reassessment_failure_counts_as_a_terminal_failure() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (_w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("rf1"), NOW).unwrap());
+    force_state(&store, &e1, ExecutionState::Waiting);
+    let mut invocation = recorded_invocation(&e1, "rf1-coding");
+    invocation.state = InvocationState::Done;
+    invocation.required_artifacts = vec![RequiredArtifact {
+        kind: "artifact.json".into(),
+        path: "artifact.json".into(),
+        expected_digest: None,
+    }];
+    apply_effects(
+        &store,
+        &[
+            Effect::InsertInvocation { invocation },
+            // The collision fact lands as a durable record with no
+            // ingest assessment — the same off-path shape the
+            // completion re-assessment exists for.
+            Effect::InsertObservation {
+                observation: Observation {
+                    delivery: None,
+                    subject_work_id: None,
+                    subject_execution_id: Some(e1.clone()),
+                    fact: ObservationFact::Artifact {
+                        invocation_id: InvocationId("rf1-coding".into()),
+                        required_artifact: "artifact.json".into(),
+                        state: ArtifactFact::Unfulfillable {
+                            reason: "workspace-root artifact.json is tracked repository content"
+                                .into(),
+                        },
+                    },
+                    observed_unix_seconds: NOW,
+                },
+            },
+        ],
+    );
+    assert_eq!(
+        read_execution(&store, &e1).state,
+        ExecutionState::Waiting,
+        "no ingest assessment ran — the sweep owns the settle"
+    );
+
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(report.terminal_failures, 1, "{report:?}");
+    assert_eq!(report.completed, 0, "{report:?}");
+    let e = read_execution(&store, &e1);
+    assert_eq!(e.state, ExecutionState::Failed);
+    assert_eq!(e.terminal_code.as_deref(), Some("artifact_unfulfillable"));
+}
+
 /// Re-assessment re-applies the same gates: a superseded-target
 /// Assessment and a missing Assessment never succeed, no matter how
 /// often the sweep runs — and the same Execution completes on a later
@@ -4300,6 +4666,350 @@ fn sweep_conflict_during_reassessment_is_deferred_not_fatal() {
             .iter()
             .all(|d| d.execution_id != e1),
         "settlement resolves the recorded conflict"
+    );
+}
+
+/// An inconclusive lane assessment fact on the current target — the
+/// verdict that parked the lane forever before the #469 re-drive.
+fn inconclusive_assessment(head: &str) -> ObservationFact {
+    ObservationFact::Assessment {
+        target: target(head),
+        set_digest: "invariants".into(),
+        complete: true,
+        items: vec![AssessmentItem {
+            id: "inv-1".into(),
+            verdict: AssessmentVerdict::Inconclusive,
+            refs: vec![],
+        }],
+    }
+}
+
+/// Record one verification result row exactly as `handoff::verify`
+/// writes them — on an acknowledged artifact handoff, lazily seeded
+/// the first time a result lands for `artifact_id` (the results table
+/// foreign-keys to `artifact_handoffs`). Returns the durable evidence
+/// id the run was given.
+fn record_verification_result(
+    store: &SqliteStore,
+    eid: &ExecutionId,
+    artifact_id: &str,
+    requirement: &str,
+    outcome: VerificationOutcome,
+) -> String {
+    store
+        .transact(|tx| {
+            if tx.artifact_handoff(artifact_id)?.is_none() {
+                let invocations = tx.invocations_for_execution(eid)?;
+                let producing = invocations
+                    .iter()
+                    .find(|i| {
+                        i.required_artifacts
+                            .iter()
+                            .any(|a| format!("{}/{}", i.id.0, a.kind) == artifact_id)
+                    })
+                    .expect("a producing invocation declares the artifact");
+                let work_id = tx.execution(eid)?.expect("the execution exists").work_id;
+                let handoff_seq = tx.alloc_seq()?;
+                tx.apply(&Effect::UpsertHandoff {
+                    handoff: ArtifactHandoff {
+                        artifact_id: artifact_id.into(),
+                        invocation_id: producing.id.clone(),
+                        request_id: producing.request_id.clone(),
+                        work_id,
+                        execution_id: eid.clone(),
+                        base: "base-sha".into(),
+                        produced: Some("produced-commit".into()),
+                        manifest_digest: Some("manifest-digest".into()),
+                        state: HandoffState::Acknowledged,
+                        invalid_reason: None,
+                        attempt: 1,
+                        recorded_seq: handoff_seq,
+                    },
+                    expected_seq: 0,
+                })?;
+            }
+            let id = tx.alloc_id("verify")?;
+            let recorded_seq = tx.alloc_seq()?;
+            tx.apply(&Effect::InsertVerificationResult {
+                result: VerificationResult {
+                    id: id.clone(),
+                    artifact_id: artifact_id.into(),
+                    requirement: requirement.into(),
+                    argv: vec!["verify".into()],
+                    produced: "produced-commit".into(),
+                    environment_digest: "0".repeat(64),
+                    result: outcome,
+                    output: String::new(),
+                    recorded_seq,
+                },
+            })?;
+            Ok(id)
+        })
+        .expect("verification result records")
+}
+
+/// The durable v2 request body for the seeded check Invocation's
+/// request (`<eid>:inv:1`), binding `evidence` as the verification
+/// results that check judged — the fixture equivalent of the bound
+/// request a real v2 dispatch wrote before launch.
+fn bind_check_request_body(
+    store: &SqliteStore,
+    w: &WorkId,
+    eid: &ExecutionId,
+    check_invocation_id: &str,
+    artifact_id: &str,
+    evidence: &[String],
+) {
+    use workloop_core::worker_v2::*;
+    let repository = WireRepository {
+        host: "test-host".into(),
+        repository: "local-repo".into(),
+    };
+    let mut request = WorkerRequestV2 {
+        format_version: WORKER_REQUEST_V2_FORMAT.into(),
+        request_id: format!("{}:inv:1", eid.0),
+        invocation_id: check_invocation_id.into(),
+        request_digest: String::new(),
+        store_id: "store".into(),
+        work_id: w.0.clone(),
+        execution_id: eid.0.clone(),
+        role: InvocationRole::InvariantCheck,
+        repository: repository.clone(),
+        base: RequestBase {
+            repository,
+            object: "0".repeat(40),
+        },
+        spec: SpecRef {
+            revision: 1,
+            digest: "0".repeat(64),
+        },
+        workspace: WorkspaceGrant {
+            workspace_id: format!("ws-{}", w.0),
+            mount: "/workspace".into(),
+            read_only: true,
+        },
+        budget: RequestBudget {
+            deadline_unix_seconds: NOW + 3600,
+            max_runtime_seconds: 1800,
+            max_turns: 200,
+            max_report_bytes: 1_048_576,
+            max_log_bytes: 33_554_432,
+            max_verification_commands: 8,
+            max_continuation_refs: 4,
+        },
+        required_capabilities: RequiredCapabilities {
+            role: InvocationRole::InvariantCheck,
+            protocol_versions: vec![
+                "taisan.worker.request/2".into(),
+                "taisan.worker.report/2".into(),
+            ],
+            capabilities: vec![],
+            resume: "unsupported".into(),
+            verification_egress_hosts: vec![],
+        },
+        continuation: vec![],
+        task: TaskBody::InvariantCheck {
+            artifact: ArtifactRef {
+                artifact_id: artifact_id.into(),
+                manifest_digest: "1".repeat(64),
+                produced: "2".repeat(40),
+            },
+            invariant_set: InvariantSetRef {
+                id: "invariants".into(),
+                revision: 1,
+                digest: "3".repeat(64),
+            },
+            verification_evidence: evidence
+                .iter()
+                .map(|id| VerificationEvidence {
+                    evidence_id: id.clone(),
+                    kind: "verification".into(),
+                    digest: "4".repeat(64),
+                })
+                .collect(),
+        },
+    };
+    request.request_digest = request.digest();
+    apply_effects(
+        store,
+        &[
+            // The request row the body exports for — a real dispatch
+            // wrote it at mint and consumed it at spawn.
+            Effect::InsertRequest {
+                request: InvocationRequest {
+                    request_id: request.request_id.clone(),
+                    work_id: w.clone(),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::InvariantCheck,
+                    spec_revision: 1,
+                    payload: serde_json::json!({}),
+                    adapter_binding: None,
+                },
+            },
+            Effect::MarkRequestConsumed {
+                request_id: request.request_id.clone(),
+            },
+            Effect::InsertWorkerRequestBody {
+                body: workloop_core::worker_v2::WorkerRequestBody {
+                    request_id: request.request_id.clone(),
+                    format_version: WORKER_REQUEST_V2_FORMAT.into(),
+                    canonical_body: request.to_canonical_bytes(),
+                    body_digest: request.digest(),
+                },
+            },
+        ],
+    );
+}
+
+/// #469: an inconclusive lane assessment is not terminal evidence —
+/// when a conclusive `VerificationResult` exists that the satisfied
+/// check's bound request never carried, the timed sweep re-mints the
+/// invariant check so the unjudged evidence gets a re-judged
+/// assessment instead of parking the lane on the stale verdict.
+#[test]
+fn sweep_remints_the_invariant_check_on_unjudged_conclusive_evidence() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("uc1"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "uc1");
+    let artifact = "uc1-coding/artifact.json";
+    // The satisfied check's bound request judged the inconclusive run.
+    let judged = record_verification_result(
+        &store,
+        &e1,
+        artifact,
+        "verification_argv[0]",
+        VerificationOutcome::Inconclusive,
+    );
+    bind_check_request_body(&store, &w, &e1, "uc1-check", artifact, &[judged]);
+    record_unassessed_observation(&store, &w, inconclusive_assessment("sha-1"));
+    // A later verification run converged on a different requirement —
+    // conclusive evidence the bound request never carried.
+    record_verification_result(
+        &store,
+        &e1,
+        artifact,
+        "verification_argv[1]",
+        VerificationOutcome::Pass,
+    );
+
+    let report = sweep(&store, &config(), NOW).unwrap();
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Ready,
+        "the lane re-minted its check for the unjudged evidence: {report:?}"
+    );
+    let pending = store.transact(|tx| tx.pending_requests()).unwrap();
+    assert!(
+        pending
+            .iter()
+            .any(|r| r.execution_id == e1 && r.role == InvocationRole::InvariantCheck),
+        "a new InvariantCheck request is durable: {pending:?}"
+    );
+}
+
+/// The re-drive needs *newer* conclusive evidence: an inconclusive
+/// lane with only its judged results stays waiting — no churn, and a
+/// rerun that is itself still inconclusive never mints either.
+#[test]
+fn the_invariant_lane_does_not_remint_without_newer_conclusive_evidence() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let (w1, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("uc2"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w1, &e1, "uc2");
+    let artifact1 = "uc2-coding/artifact.json";
+    let judged = record_verification_result(
+        &store,
+        &e1,
+        artifact1,
+        "verification_argv[0]",
+        VerificationOutcome::Inconclusive,
+    );
+    bind_check_request_body(&store, &w1, &e1, "uc2-check", artifact1, &[judged]);
+    record_unassessed_observation(&store, &w1, inconclusive_assessment("sha-1"));
+
+    // A newer run that is itself still inconclusive is not conclusive
+    // evidence either.
+    let (w2, e2) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("uc3"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w2, &e2, "uc3");
+    let artifact2 = "uc3-coding/artifact.json";
+    let judged = record_verification_result(
+        &store,
+        &e2,
+        artifact2,
+        "verification_argv[0]",
+        VerificationOutcome::Inconclusive,
+    );
+    bind_check_request_body(&store, &w2, &e2, "uc3-check", artifact2, &[judged]);
+    record_unassessed_observation(&store, &w2, inconclusive_assessment("sha-1"));
+    record_verification_result(
+        &store,
+        &e2,
+        artifact2,
+        "verification_argv[1]",
+        VerificationOutcome::Inconclusive,
+    );
+
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(read_execution(&store, &e1).state, ExecutionState::Waiting);
+    assert_eq!(read_execution(&store, &e2).state, ExecutionState::Waiting);
+    assert!(
+        report.completed == 0,
+        "nothing settles on stale or still-inconclusive evidence: {report:?}"
+    );
+    let pending = store.transact(|tx| tx.pending_requests()).unwrap();
+    assert!(
+        pending
+            .iter()
+            .all(|r| r.role != InvocationRole::InvariantCheck),
+        "no check re-minted: {pending:?}"
+    );
+}
+
+/// "Newer" is ordered against the bound set, not just against
+/// membership: an unbound conclusive result recorded BEFORE the newest
+/// bound result is older evidence the request's evidence window
+/// skipped — it must not mint.
+#[test]
+fn an_older_unbound_conclusive_result_does_not_remint() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("uc4"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "uc4");
+    let artifact = "uc4-coding/artifact.json";
+    // Recorded first but never bound — an older run the request's
+    // evidence window skipped.
+    record_verification_result(
+        &store,
+        &e1,
+        artifact,
+        "verification_argv[0]",
+        VerificationOutcome::Pass,
+    );
+    let judged = record_verification_result(
+        &store,
+        &e1,
+        artifact,
+        "verification_argv[1]",
+        VerificationOutcome::Inconclusive,
+    );
+    bind_check_request_body(&store, &w, &e1, "uc4-check", artifact, &[judged]);
+    record_unassessed_observation(&store, &w, inconclusive_assessment("sha-1"));
+
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(
+        read_execution(&store, &e1).state,
+        ExecutionState::Waiting,
+        "an older unbound result is not newer evidence: {report:?}"
+    );
+    let pending = store.transact(|tx| tx.pending_requests()).unwrap();
+    assert!(
+        pending
+            .iter()
+            .all(|r| r.role != InvocationRole::InvariantCheck),
+        "no check re-minted: {pending:?}"
     );
 }
 
@@ -4913,7 +5623,7 @@ fn a_v2_store_upgrades_to_the_current_format_preserving_rows() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 15, "the upgrade lands on the current format");
+        assert_eq!(version, 16, "the upgrade lands on the current format");
     }
     // A second open must not re-migrate — the schema is already current.
     let _ = SqliteStore::open(&db, 1).unwrap();
@@ -4978,7 +5688,7 @@ fn a_v9_store_gains_the_retirement_generation_column() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 15, "the upgrade lands on the current format");
+        assert_eq!(version, 16, "the upgrade lands on the current format");
     }
     drop(store);
     // Re-opening after the upgrade is a no-op, not a second migration.
@@ -5030,7 +5740,7 @@ fn a_v12_store_gains_the_observation_execution_index() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 15, "the upgrade lands on the current format");
+        assert_eq!(version, 16, "the upgrade lands on the current format");
     }
     drop(store);
     // Re-opening after the upgrade is a no-op, not a second migration.
@@ -7101,7 +7811,7 @@ fn a_previous_release_v1_store_is_upgraded_in_place() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 15, "the upgrade lands on the current format");
+        assert_eq!(version, 16, "the upgrade lands on the current format");
     }
     // Re-opening after the upgrade is a no-op, not a second migration.
     drop(store);

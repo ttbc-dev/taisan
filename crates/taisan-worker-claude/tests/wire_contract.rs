@@ -52,10 +52,14 @@ fn tmp(name: &str) -> PathBuf {
 ///   FAKE_ARGV_CAPTURE  file that receives the runtime argv, one per line
 ///   FAKE_VERSION_ORPHAN  seconds a backgrounded --version descendant
 ///                      sleeps while holding the stdout pipe open
+///   FAKE_POST_HANG  seconds to sleep after emitting output, before exit
 fn fake_runtime(dir: &Path) -> PathBuf {
     let path = dir.join("fake-claude");
+    // Write-then-rename: executing a file whose inode was just opened
+    // for writing fails ETXTBUSY on Linux; the renamed inode never was.
+    let tmp = dir.join("fake-claude.tmp");
     fs::write(
-        &path,
+        &tmp,
         r#"#!/bin/sh
 for a in "$@"; do
   if [ "$a" = "--version" ]; then
@@ -80,6 +84,7 @@ fi
 if [ -n "$FAKE_SYMLINK" ]; then ln -sf "$FAKE_SYMLINK" artifact.json; fi
 if [ -n "$FAKE_STDERR" ]; then printf '%s\n' "$FAKE_STDERR" >&2; fi
 if [ -n "$FAKE_EVENTS" ]; then cat "$FAKE_EVENTS"; fi
+if [ -n "$FAKE_POST_HANG" ]; then sleep "$FAKE_POST_HANG"; fi
 exit "${FAKE_EXIT:-0}"
 "#,
     )
@@ -87,8 +92,9 @@ exit "${FAKE_EXIT:-0}"
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
     }
+    fs::rename(&tmp, &path).unwrap();
     path
 }
 
@@ -178,6 +184,17 @@ fn request_json(role: &str, task: Value, mount: &Path, read_only: bool) -> Value
     // Sanity: the adapter's own parser must accept what tests mint.
     WorkerRequestV2::parse(&canonical_json(&request)).expect("test request must parse");
     request
+}
+
+/// Recompute `request_digest` after mutating a minted request.
+fn re_digest(req: &mut Value) {
+    let digest = request_v2_digest(&canonical_json(&{
+        let mut v = req.clone();
+        v.as_object_mut().unwrap().remove("request_digest");
+        v
+    }));
+    req["request_digest"] = json!(digest);
+    WorkerRequestV2::parse(&canonical_json(req)).unwrap();
 }
 
 /// Materialize one dispatch directory: `request.json`, `input/`, `out/`.
@@ -998,13 +1015,7 @@ fn log_flood_reports_output_limit_reached() {
         false,
     );
     req["budget"]["max_log_bytes"] = json!(2048);
-    let digest = request_v2_digest(&canonical_json(&{
-        let mut v = req.clone();
-        v.as_object_mut().unwrap().remove("request_digest");
-        v
-    }));
-    req["request_digest"] = json!(digest);
-    WorkerRequestV2::parse(&canonical_json(&req)).unwrap();
+    re_digest(&mut req);
     let events = events_file(&dir, "done", json!({}));
     let (request_path, _, out_dir) = dispatch("flood", &req, &[("goal.md", "goal\n")]);
     let out = run_shim(
@@ -1018,6 +1029,49 @@ fn log_flood_reports_output_limit_reached() {
         ],
     );
     assert!(out.status.success());
+    let r = report(&out_dir);
+    assert_eq!(r["status"], "limit_reached");
+    assert_eq!(r["reason"]["code"], "output_limit_reached");
+    assert_eq!(r["log"]["truncated"], true);
+    assert!(fs::metadata(out_dir.join("runtime.log")).unwrap().len() <= 4096);
+}
+
+#[test]
+fn log_flood_running_reports_output_limit_reached() {
+    // The still-running half of #466: the flood crosses the bound
+    // while the runtime is alive, so the in-loop check must kill it
+    // — the outcome must not depend on who wins the exit race.
+    let dir = tmp("flood-running");
+    let fake = fake_runtime(&dir);
+    let ws = workspace(&dir);
+    let mut req = request_json(
+        "coding",
+        json!({"kind": "coding", "goal": goal_ref(), "issues": [],
+               "constraints": [], "verification_argv": []}),
+        &ws,
+        false,
+    );
+    req["budget"]["max_log_bytes"] = json!(2048);
+    re_digest(&mut req);
+    let events = events_file(&dir, "done", json!({}));
+    let (request_path, _, out_dir) = dispatch("flood-running", &req, &[("goal.md", "goal\n")]);
+    let start = std::time::Instant::now();
+    let out = run_shim(
+        &fake,
+        &request_path,
+        &out_dir,
+        &ws,
+        &[
+            ("FAKE_FLOOD", "1048576"),
+            ("FAKE_EVENTS", events.to_str().unwrap()),
+            ("FAKE_POST_HANG", "60"),
+        ],
+    );
+    assert!(out.status.success());
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(20),
+        "flooding runtime must be killed, not awaited"
+    );
     let r = report(&out_dir);
     assert_eq!(r["status"], "limit_reached");
     assert_eq!(r["reason"]["code"], "output_limit_reached");
@@ -1735,8 +1789,11 @@ fn auth_token_reaches_runtime_but_not_verification() {
     // Fake captures its env for assertion.
     let env_capture = dir.join("env.txt");
     let fake2 = dir.join("fake-env-claude");
+    // Write-then-rename: executing a file whose inode was just opened
+    // for writing fails ETXTBUSY on Linux; the renamed inode never was.
+    let fake2_tmp = dir.join("fake-env-claude.tmp");
     fs::write(
-        &fake2,
+        &fake2_tmp,
         format!(
             "#!/bin/sh\nenv | grep -E '^(ANTHROPIC_API_KEY|GH_TOKEN)=' > {}\ncat {}\nexit 0\n",
             env_capture.display(),
@@ -1747,8 +1804,9 @@ fn auth_token_reaches_runtime_but_not_verification() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&fake2, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&fake2_tmp, fs::Permissions::from_mode(0o755)).unwrap();
     }
+    fs::rename(&fake2_tmp, &fake2).unwrap();
     let req = request_json(
         "coding",
         json!({"kind": "coding", "goal": goal_ref(), "issues": [],

@@ -1,16 +1,36 @@
-# Release versioning and tag policy — proposal
+# Release versioning and tag policy
 
-Status: **proposal, pending owner sign-off** (issue #370). This document
-proposes the version/tag policy and the procedures the release freeze
-will follow. It is a draft prepared before the final candidate is
-frozen — the freeze itself stays blocked on the release-acceptance
-(#365), clean-install reproduction (#367), public-content audit (#368),
-and license (#369) gates. **No tag exists, no release exists, and no
-commit named here is a release candidate.** Nothing in this document
-authorizes a tag, a GitHub release, a version-metadata change, a
-visibility change, or publication. The public-release route (routes
-A/B/C in [release audit](release-audit.md#6-options-for-owner-decision))
-is an open owner decision this document does not make.
+Status: **decided — version `0.3.0`, candidate frozen** (issue #370).
+This document proposed the version/tag policy and the procedures the
+release freeze follows; the owner signed off 2026-11-26 — the release
+version is `0.3.0`, the candidate is pinned at
+`5f134b964aca05637d4fa1fc8198779dd408913f` (re-pinned 2026-11-26
+from `00fed690cf2993e220116901f1c2d14584305e18` after the #398/#399
+repair merged as PR #479), and the defect
+dispositions are all recorded: the dispositioned defect issues were
+closed under the owner's 'Fixed on the release candidate' wording
+(#313/#358/#359/#361/#398/#399/#400; #313 and #400 remain
+confirmed present — closure was a disposition act — while
+#398/#399 were reopened as pre-publication fix targets, repaired
+under #479, and re-closed on merge) and #437 was
+deferred to v0.6 (milestone 11). The evidence issues behind the
+acceptance record are complete (#270 manual acceptance
+owner-approved, #271 pilot and #367 clean install closed, #368
+dispositioned by the #438 ruling, #369 license applied), #365 is
+closed, and repair PR #431 (for #419) merged `e0e31e9` — inside the
+pin. **No tag exists and no release exists** — the §5 tag/dist steps
+and the §7 owner acts (candidate sign-off was exercised; live-demo
+segment, visibility flip) remain. Nothing in this document
+authorizes a tag, a GitHub release, a version-metadata change beyond
+the applied alignment, a visibility change, or publication. The two
+route decisions the draft left open are made: the **publication
+route** is in-place
+publication with history kept (owner ruling under issue #438,
+[release audit](release-audit.md) §7 — no history rewrite, no squash)
+and the **distribution route** is prebuilt binaries via cargo-dist on
+GitHub Releases plus a personal Homebrew tap and cargo-binstall
+metadata (owner decision on #370, 2026-11-25 — crates.io is not a
+channel).
 
 Per `AGENTS.md` no private source repository is named; private
 counterparts are described by role only. Issue/PR numbers and revision
@@ -19,7 +39,7 @@ SHAs appear as owner-verifiable evidence locators.
 ## 1. Proposed release identity
 
 The milestone
-["Initial public release — validated v0.3"](https://github.com/shimpeiws/taisan/milestone/8)
+["Initial public release — validated v0.3"](https://github.com/ttbc-dev/taisan/milestone/8)
 names the delivered unit **v0.3** — the same ordinal the design
 documents use for the v0.1/v0.3 requirement slices. The proposal keeps
 that ordinal visible in the public identity:
@@ -28,8 +48,9 @@ that ordinal visible in the public identity:
   release can ship as `0.3.1`, `0.3.2`, … without reusing the milestone
   ordinal. Pre-1.0 semantics apply: minor bumps may change behavior;
   patch bumps are for fixes on a frozen release line only.
-- **Tag:** `v0.3.0` — annotated tag (`git tag -a`) on the frozen
-  candidate commit once the freeze criteria below are met.
+- **Tag:** `v0.3.0` — annotated tag (`git tag -a`) on the freeze
+  record's merge commit (docs-finalized descendant of the frozen
+  candidate) once the freeze criteria below are met.
 - **Release title:** "taisan 0.3.0 — initial public release (validated
   v0.3)" or owner-adjusted equivalent; the title names the validated
   unit so release names stay consistent with the milestone and the
@@ -50,27 +71,27 @@ recorded here so the decision is explicit either way.
   acceptance record ([release-acceptance-v0.3.md](release-acceptance-v0.3.md)
   §1), and the milestone — so `git show v0.3.0` is itself a small
   provenance record.
-- **Tag target is the recorded candidate commit**, not "current main"
-  at tag time. The candidate is recorded before tagging (§3); the tag
-  is applied with `git tag -a v0.3.0 <recorded-sha>` and verified with
-  `git rev-list -n 1 v0.3.0` against the record. Where the route
-  rewrites history, `<recorded-sha>` is the candidate's commit in the
-  published history — see the placement rule below and §3.4.
+- **Tag target is the freeze record's merge commit** — the
+  docs-finalized descendant of the recorded candidate SHA — not
+  "current main" at tag time. The recorded SHA stays the verified-code
+  SHA; before tagging, every path in
+  `git diff --name-only <recorded-sha> <tag-sha>` must be release
+  documentation (`docs/`, `README.md`) — an allowlist, so changes
+  outside the checked paths cannot pass silently (freeze checklist
+  §5.2). The tag is applied with
+  `git tag -a v0.3.0 <tag-sha>` and verified with
+  `git rev-list -n 1 v0.3.0` against the record.
 - **Patch releases** on the line reuse the procedure: `v0.3.1` tags the
   recorded fix commit after the same check record.
-- **Tag placement depends on the owner's publication route** and this
-  proposal does not choose one, but under every route the published
-  history can differ from this repository's private `main`: route A
-  (publish in place) still rewrites all 1,017 commits to strip names
-  and identities
-  ([release audit](release-audit.md#6-options-for-owner-decision) §6),
-  and routes B (fresh publication) and C (truncated history) publish a
-  sanitized/squashed tree. So under every route the tag names the
-  recorded candidate's commit *in the published history* — never a
-  private pre-rewrite commit — and tagging waits for the published
-  tree to exist. The candidate record carries both the private
-  pre-rewrite SHA and the published SHA so either side of the rewrite
-  can be re-verified (§3.4).
+- **Tag placement is direct under the decided publication route.** The
+  #438 ruling is in-place publication with the existing history kept —
+  the published `main` *is* this repository's `main`, so the tag names
+  a descendant of the recorded candidate whose code content is
+  byte-identical to it (verified by the §5.2 empty-diff check), with
+  no rewritten-history duality to carry. Publication must still
+  precede the release's public announcement steps, and the tag object,
+  the candidate record, and the published history all trace to the
+  same verified-code SHA.
 
 ## 3. Candidate-commit recording procedure
 
@@ -78,11 +99,15 @@ The acceptance record already models the pattern: its §1 records the
 exact `origin/main` HEAD (`git log -1`, full SHA, merge subject) and
 the merges the evidence depends on. The freeze extends it:
 
-1. After the acceptance gate (#365, which consumes the #270 manual
-   and #271 scheduled evidence) and the release-blocking fixes
-   (#344, #364 per
-   [release-acceptance-v0.3.md](release-acceptance-v0.3.md) §6) have
-   landed, record the candidate:
+1. After the owner's candidate sign-off — the acceptance evidence is
+   met, the gating fixes (#344/#363/#364, #447–#450, #466) have
+   landed, and the defect dispositions are recorded in #365's
+   closing comment — all exercised 2026-11-26 (dispositioned defect
+   issues closed, #437 deferred to v0.6, repair PR #431 merged
+   `e0e31e9`), tracked in
+   [release-acceptance-v0.3.md](release-acceptance-v0.3.md) §6–§7 and
+   the [freeze checklist](release-freeze-checklist.md) — record the
+   candidate:
 
    ```text
    git fetch origin
@@ -96,26 +121,29 @@ the merges the evidence depends on. The freeze extends it:
    results run **on that exact commit** — not on whatever main happens
    to point at later.
 3. Any merge to `main` after recording invalidates the record: the
-   candidate is re-recorded and the checks re-run. A later merge does
-   not silently extend the candidate.
-4. The tag is applied only against the recorded SHA (§2). If the
-   publication route rewrites history, the record names both the
-   pre-rewrite and published SHAs so either side of the rewrite can be
-   re-verified.
+   candidate is re-recorded and the checks re-run — unless the merge's
+   diff is confined to release documentation (the §5.2 allowlist), in
+   which case the empty-diff proof stands in for a gate re-run. Any
+   other later merge does not silently extend the candidate.
+4. The tag is applied to the freeze record's merge commit (§2) after
+   the empty-diff check proves it carries the recorded SHA's code
+   unchanged. Under the decided in-place publication route the tag
+   target and the published history's commit are the same object — no
+   pre/post-rewrite pair needs to be carried.
 
 ## 4. Version metadata alignment
 
-Today the workspace carries almost no version metadata: every crate
-except `workloop-evidence-protocol` (0.1.0) declares no `version`
-field and resolves to Cargo's `0.0.0` default; there is no
-`workspace.package.version`. This matters beyond cosmetics —
-`taisan-worker-claude`'s `describe` reports
+Before the freeze alignment the workspace carried almost no version
+metadata: every crate except `workloop-evidence-protocol` (0.1.0)
+declared no `version` field and resolved to Cargo's `0.0.0` default;
+there was no `workspace.package.version`. This mattered beyond
+cosmetics — `taisan-worker-claude`'s `describe` reports
 `adapter_version: env!("CARGO_PKG_VERSION")` into the durable
-declaration the supervisor digests, so released binaries currently
-self-report `0.0.0`.
+declaration the supervisor digests, so released binaries would have
+self-reported `0.0.0`.
 
-Proposed alignment **at freeze time** (not in this draft change, and
-not before the owner signs off):
+The alignment **was applied at freeze** (PR #477, owner version
+decision 2026-11-26):
 
 - Set `workspace.package.version = "0.3.0"` and have member crates
   inherit it (`version.workspace = true`), so `taisan`,
@@ -141,15 +169,14 @@ not before the owner signs off):
   freeze records both so the notes' tested-identity values stay
   honest.
 
-This draft intentionally changes no `Cargo.toml`: the version bump is
-part of the freeze, and landing it early would make builds claim a
-version that has no candidate behind it.
+The bump was applied at freeze per the above (PR #477): the tagged
+tree carries `0.3.0`, and this record changes no further `Cargo.toml`.
 
 ## 5. Changelog generation policy
 
 The release notes ([release-notes-v0.3.md](release-notes-v0.3.md)) are
-the public-facing changelog for the release (0.3.0 as proposed,
-pending the §6 decision). Proposed policy:
+the public-facing changelog for the release (0.3.0, decided in §7 —
+the "proposed" phrasing here predates the decision). Proposed policy:
 
 - **Source of truth is the tracker plus merged history**: the notes
   are compiled from milestone-#8 issue titles/states and the merge
@@ -162,9 +189,9 @@ pending the §6 decision). Proposed policy:
   not ship.
 - **Evidence-class discipline is preserved**: fixture/contract-tested
   behavior is described as such; only owner-run live evidence
-  authorizes "verified live" wording. Unexercised scope (e.g.
-  scheduled intake, #271) appears under known limitations, never as a
-  capability.
+  authorizes "verified live" wording. Unexercised scope (e.g. remote
+  execution and remote review) appears under known limitations, never
+  as a capability.
 - **Public-artifact rules apply**: English, standalone,
   provider-neutral, no private source names, no personal schedule —
   per the milestone-#8 boundary and `AGENTS.md`.
@@ -173,11 +200,44 @@ pending the §6 decision). Proposed policy:
   claims; a hand-edited claim that no longer matches evidence is a
   release-note defect, fixed or removed.
 
-## 6. What remains for the owner
+## 6. Distribution route — decided
 
-| Decision | Options | This draft |
+Owner decision on #370 (2026-11-25): taisan ships as **prebuilt
+binaries**, not as a registry package.
+
+- **Primary channel: cargo-dist on GitHub Releases.** One cargo-dist
+  configuration produces the release matrix (per-platform archives),
+  per-artifact checksums, shell and PowerShell installers, and the
+  generated release notes. The artifact checksums cargo-dist emits
+  are the packaged-artifact evidence the release notes' verification
+  section records (the AC asks for checksums "if binaries are
+  distributed" — they are).
+- **Secondary channels from the same setup:** a personal Homebrew
+  tap (`brew tap` against the owner's tap repository; homebrew-core
+  deferred until notability justifies it) and **cargo-binstall**
+  metadata so `cargo binstall` fetches the prebuilt binary instead
+  of compiling.
+- **crates.io is not a release channel.** taisan is a CLI tool, not
+  a library; no registry publishing. The `0.3.0` workspace version
+  (§4) is an identity marker, not a registry contract — unchanged by
+  this decision.
+- **Source build stays supported** (`cargo install --path
+  crates/workloop-cli --bin taisan`, per the release notes'
+  requirements section); the dist artifacts are a convenience route
+  over the same binaries.
+- **Lane boundary:** the cargo-dist workflow definition and release
+  automation live under #441; this document records the route
+  decision and the steps that follow it
+  ([freeze checklist](release-freeze-checklist.md) §5) but does not
+  create or modify `.github/workflows/`.
+
+## 7. What remains for the owner
+
+| Decision | Options | This record |
 | --- | --- | --- |
-| Release version | `0.3.0` (proposed) / `1.0.0` | no choice made |
-| Publication route | A / B / C ([release audit](release-audit.md#6-options-for-owner-decision)) | no choice made; tag placement follows it |
-| Crate version alignment | workspace `0.3.0` inheritance (proposed) / leave `0.0.0` | proposed, not applied |
-| Tag creation | annotated `v0.3.0` on the recorded candidate | procedure only; no tag exists |
+| Release version | `0.3.0` (proposed) / `1.0.0` | **decided: `0.3.0`** — owner decision, 2026-11-26; accompanying owner acts also exercised (candidate sign-off → `00fed69`, re-pinned `5f134b96` on merge of the #398/#399 repair; #437 disposition recorded on the issue) — status paragraph, freeze checklist |
+| Candidate commit | recorded `origin/main` SHA at sign-off (§3) | **named** — `5f134b964aca05637d4fa1fc8198779dd408913f`, re-pinned 2026-11-26 (original pin `00fed690cf2993e220116901f1c2d14584305e18` recorded earlier the same day, superseded when PR #479 merged) |
+| Publication route | in-place, history kept | **decided** — #438 ruling ([release audit](release-audit.md) §7) |
+| Distribution route | cargo-dist → GitHub Releases + Homebrew tap + cargo-binstall; no crates.io | **decided** — #370 comment, 2026-11-25 (§6); workflow is #441's lane |
+| Crate version alignment | workspace `0.3.0` inheritance (proposed) / leave `0.0.0` | **applied** — PR #477 applies the workspace `0.3.0` inheritance, following the owner's version choice |
+| Tag creation | annotated `v<version>` on the recorded candidate | procedure only; no tag exists. Tag target = the merge commit landing the freeze record (PR #478) — `5f134b96` stays the verified-code SHA; the tag SHA's code diff against it must be empty (freeze checklist §5.2) |

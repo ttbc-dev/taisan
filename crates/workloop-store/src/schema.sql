@@ -1,6 +1,6 @@
--- workloop v15 store: current-state tables enforcing structural
+-- workloop v16 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
--- `PRAGMA user_version = 15` marks the format; a stamped older file with
+-- `PRAGMA user_version = 16` marks the format; a stamped older file with
 -- the complete recognized schema upgrades additively at open, while an
 -- unversioned slice-0 database and a newer version are refused.
 -- v7 added work_usage.last_progress_basis; v8 added the intake run and
@@ -12,7 +12,9 @@
 -- added the observations_execution evidence-lookup index; v14 added the
 -- executor_bindings and executor_operations durable remote-binding
 -- tables (#375, docs/executor-transport-contract.md); v15 added the
--- executor_collections durable remote-collection record (#376).
+-- executor_collections durable remote-collection record (#376); v16
+-- added work_usage.merge_check_services, the bounded per-pair service
+-- cursor that replaced the merge-check observation record.
 
 CREATE TABLE IF NOT EXISTS store_meta (
     key TEXT PRIMARY KEY,
@@ -81,7 +83,8 @@ CREATE TABLE IF NOT EXISTS work_usage (
     first_dispatch_unix_seconds INTEGER,
     last_progress_unix_seconds INTEGER,
     human_wait_seconds_total INTEGER NOT NULL DEFAULT 0,
-    last_progress_basis TEXT
+    last_progress_basis TEXT,
+    merge_check_services TEXT
 );
 
 CREATE TABLE IF NOT EXISTS executions (

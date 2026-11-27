@@ -6,6 +6,8 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+use workloop_config::load_or_create;
+
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_workloop-cli"))
 }
@@ -112,6 +114,64 @@ fn init_then_plain_check_round_trip() {
             .is_empty()
     );
     assert_eq!(env["result"]["remote_writes"], 0);
+    // check is strictly read-only: an absent installation record is
+    // left absent — nothing is published under the state root.
+    assert!(
+        !install.state.join("store.config.json").exists(),
+        "check published an installation record"
+    );
+
+    let _ = std::fs::remove_dir_all(&install.root);
+}
+
+/// The record the `store` stage inspects is the one under the state
+/// root: an explicit `--db` belongs to the store-backed surface and
+/// never steers `check` to a different installation record (#469
+/// verdict).
+#[test]
+fn check_ignores_db_for_record_resolution() {
+    let install = install("record-ignores-db");
+    let output = run(&install, &init_args(&install));
+    assert!(
+        output.status.success(),
+        "init: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let record_path = install.state.join("store.config.json");
+    std::fs::create_dir_all(&install.state).unwrap();
+    let mut record = load_or_create(&record_path).expect("record publishes");
+    let real = install.root.join("real-cache");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = install.root.join("cache-link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    record.verification_cache_paths = vec![link.to_string_lossy().into_owned()];
+    std::fs::write(&record_path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+
+    // A clean record beside an explicit --db must not be the one
+    // inspected: the state-root record still fails the paths stage.
+    let foreign_db = install.root.join("elsewhere").join("x.db");
+    std::fs::create_dir_all(foreign_db.parent().unwrap()).unwrap();
+    let _ =
+        load_or_create(&foreign_db.with_extension("config.json")).expect("decoy record publishes");
+    let output = command(&install, &["check", "--db", foreign_db.to_str().unwrap()])
+        .output()
+        .expect("taisan runs");
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let env = envelope(&output);
+    let stages = env["result"]["stages"].as_array().unwrap();
+    let paths = stages
+        .iter()
+        .find(|stage| stage["stage"] == "paths")
+        .expect("paths stage reported");
+    assert!(
+        paths["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "paths.cache_symlink"),
+        "the state-root record, not the --db-side one, was inspected: {paths}"
+    );
 
     let _ = std::fs::remove_dir_all(&install.root);
 }
@@ -188,6 +248,99 @@ fn check_probe_is_opt_in_and_fails_closed_without_a_backend() {
             .is_empty()
     );
     assert_eq!(env["result"]["remote_writes"], 0);
+
+    let _ = std::fs::remove_dir_all(&install.root);
+}
+
+/// `check` inspects the installation record beside the store file its
+/// `store` stage validates — `<state_root>/store.config.json` — never
+/// the `--db`-derived default in the ambient working directory: a
+/// record there declaring a symlinked verification cache path fails
+/// the paths stage `paths.cache_symlink` (#469 verdict).
+#[test]
+fn check_inspects_the_state_root_installation_record() {
+    let install = install("record-path");
+    let output = run(&install, &init_args(&install));
+    assert!(
+        output.status.success(),
+        "init: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let record_path = install.state.join("store.config.json");
+    std::fs::create_dir_all(&install.state).unwrap();
+    let mut record = load_or_create(&record_path).expect("record publishes");
+    let real = install.root.join("real-cache");
+    std::fs::create_dir_all(&real).unwrap();
+    let link = install.root.join("cache-link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    record.verification_cache_paths = vec![link.to_string_lossy().into_owned()];
+    std::fs::write(&record_path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+
+    let output = command(&install, &["check"]).output().expect("taisan runs");
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let env = envelope(&output);
+    assert_eq!(env["status"], "error");
+    assert_eq!(env["reason"]["code"], "config");
+    let stages = env["result"]["stages"].as_array().unwrap();
+    let paths = stages
+        .iter()
+        .find(|stage| stage["stage"] == "paths")
+        .expect("paths stage reported");
+    assert_eq!(paths["status"], "fail", "{paths}");
+    assert!(
+        paths["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "paths.cache_symlink"),
+        "the declared symlink is named: {paths}"
+    );
+
+    let _ = std::fs::remove_dir_all(&install.root);
+}
+
+/// A present-but-foreign installation record is not "absent": `check`
+/// treats an empty or malformed `store.config.json` as a config-class
+/// failure and never passes with the declared verification boundary
+/// uninspected — the same refusal `load_existing` documents.
+#[test]
+fn check_fails_closed_on_a_foreign_installation_record() {
+    let install = install("record-foreign");
+    let output = run(&install, &init_args(&install));
+    assert!(
+        output.status.success(),
+        "init: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let record_path = install.state.join("store.config.json");
+    std::fs::create_dir_all(&install.state).unwrap();
+    for content in ["", "{ not json"] {
+        std::fs::write(&record_path, content).unwrap();
+        let output = command(&install, &["check"]).output().expect("taisan runs");
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "foreign record {content:?}: {output:?}"
+        );
+        let env = envelope(&output);
+        assert_eq!(env["status"], "error");
+        assert_eq!(env["reason"]["code"], "config", "{env}");
+    }
+
+    // A record whose boundary keys violate the validated surface —
+    // a relative cache path — fails at the same boundary rather than
+    // reaching the paths stage uninspected.
+    std::fs::remove_file(&record_path).unwrap();
+    let mut record = load_or_create(&record_path).expect("record publishes");
+    record.verification_cache_paths = vec!["relative/cache".into()];
+    std::fs::write(&record_path, serde_json::to_string_pretty(&record).unwrap()).unwrap();
+    let output = command(&install, &["check"]).output().expect("taisan runs");
+    assert_eq!(output.status.code(), Some(3), "{output:?}");
+    let env = envelope(&output);
+    assert_eq!(env["status"], "error");
+    assert_eq!(env["reason"]["code"], "config", "{env}");
 
     let _ = std::fs::remove_dir_all(&install.root);
 }

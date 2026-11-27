@@ -87,25 +87,44 @@ const EVIDENCE_RETRY_SECONDS: i64 = 300;
 /// wedged sandbox answers `Bounded` and fails the battery.
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Whether a host directory would be exposed inside the sandbox by a
-/// fixed system bind: strictly beneath an existing `SYSTEM_BINDS`
-/// member (a root that *is* a bound prefix needs no mask — it is the
-/// runtime surface, not installation state). The root must exist on
-/// the host, otherwise it is absent inside the bind and masking a
-/// path that does not exist could fail the mount outright.
-fn system_bind_covers(root: &Path) -> bool {
+/// The sandbox spellings at which a mask root's tmpfs must render —
+/// one per existing system-bind member whose canonical target the
+/// root's canonical path resolves under. Every member is bound as its
+/// own mount of that target: on a merged-`/usr` host `/lib` mounts the
+/// contents of `/usr/lib` as a separate mount, so a root beneath the
+/// shared target is reachable at `/usr/lib/<root>` and `/lib/<root>`
+/// and is shadowed at both. A member whose target *is* the root (or is
+/// not an ancestor) contributes nothing — the bound prefix itself is
+/// the runtime surface, and a tmpfs at a destination nothing created
+/// would fail the whole mount setup. An absent root is absent inside
+/// every bound ancestor too, so it emits nothing.
+fn mask_root_dests_among(root: &Path, binds: &[&str]) -> Vec<PathBuf> {
     if !root.exists() {
-        return false;
+        return Vec::new();
     }
     let resolved = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    SYSTEM_BINDS
-        .iter()
-        .filter(|d| Path::new(d).exists())
-        .map(Path::new)
-        .any(|bound| {
-            let bound = bound.canonicalize().unwrap_or_else(|_| bound.to_path_buf());
-            resolved != bound && resolved.starts_with(&bound)
-        })
+    let mut dests = Vec::new();
+    for member in binds.iter().map(Path::new).filter(|b| b.exists()) {
+        let target = member
+            .canonicalize()
+            .unwrap_or_else(|_| member.to_path_buf());
+        let Ok(rel) = resolved.strip_prefix(&target) else {
+            continue;
+        };
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let dest = member.join(rel);
+        if !dests.contains(&dest) {
+            dests.push(dest);
+        }
+    }
+    dests
+}
+
+/// The production [`mask_root_dests_among`], against `SYSTEM_BINDS`.
+fn mask_root_dests(root: &Path) -> Vec<PathBuf> {
+    mask_root_dests_among(root, SYSTEM_BINDS)
 }
 
 /// What one contained launch binds into the sandbox. Every field is a
@@ -199,11 +218,15 @@ pub struct MountPlan {
     /// is never the mount.
     pub mask_roots: Vec<PathBuf>,
     /// Individual host files that must never be visible inside the
-    /// sandbox: a `file:` credential source beneath a bound system
-    /// prefix would otherwise stay readable at its original path even
-    /// though the contract exposes only the staged
-    /// `/taisan/runtime-auth`. Each covered file is shadowed with a
-    /// read-only `/dev/null` bind.
+    /// sandbox: a `file:` credential source would otherwise stay
+    /// readable wherever a fixed system bind or an own-path plan bind
+    /// covers its spelling, even though the contract exposes only the
+    /// staged `/taisan/runtime-auth`. Every covered spelling is
+    /// shadowed with a read-only `/dev/null` bind rendered after all
+    /// plan binds; an entry no mount covers is already invisible and
+    /// emits nothing. [`plan_denial`] refuses an entry that would be
+    /// visible but cannot be shadowed — one a fixed-destination bind
+    /// carries, or a covered path that is not a regular file.
     pub masked_files: Vec<PathBuf>,
 }
 
@@ -368,6 +391,106 @@ pub fn ca_trust_binds(profile: &IsolationProfile) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The sandbox spellings at which a `masked_files` entry stays
+/// visible — the destinations its `/dev/null` shadow must cover. An
+/// own-path plan bind mounts host content at its own spelling, so a
+/// covered file is reachable inside at that path. A symlinked bind or
+/// ancestor exposes the same file under a second spelling, so the
+/// literal path and its canonical form are both checked, and coverage
+/// through a resolved bind renders the mask under the spelling the
+/// plan named. A path beneath an emitted mask-root tmpfs is already
+/// invisible — only an own-path bind re-mounting over the tmpfs can
+/// make it reachable again, and that coverage is collected first.
+/// Nothing else creates the path inside the sandbox: an entry no
+/// mount covers is already invisible and must not be masked — a
+/// `--ro-bind` destination nothing created would fail the whole mount
+/// setup.
+fn masked_file_dests(plan: &MountPlan, file: &Path) -> Vec<PathBuf> {
+    masked_file_dests_among(plan, file, SYSTEM_BINDS)
+}
+
+/// `masked_file_dests` against an explicit system-bind set — the
+/// production value is `SYSTEM_BINDS`; tests substitute a synthetic
+/// layout. Every existing member is bound into the sandbox as its own
+/// mount of the member's canonical target: on a merged-`/usr` host
+/// `bwrap` mounts `/bin` as the *contents* of `/usr/bin`, not as the
+/// host's symlink, so a file under the shared target is reachable
+/// once per bound spelling — `/usr/bin/secret` and `/bin/secret` are
+/// separate mounts and each takes its own `/dev/null` shadow.
+fn masked_file_dests_among(plan: &MountPlan, file: &Path, binds: &[&str]) -> Vec<PathBuf> {
+    // A host-absent entry is absent inside every bound ancestor too.
+    if !file.exists() {
+        return Vec::new();
+    }
+    let resolved = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    let mut spellings = vec![file.to_path_buf()];
+    if resolved != *file {
+        spellings.push(resolved.clone());
+    }
+    let mut dests: Vec<PathBuf> = Vec::new();
+    for bind in plan
+        .toolchain
+        .iter()
+        .chain(plan.caches.iter())
+        .chain(plan.ca_bundles.iter())
+        .chain(plan.extra_binds.iter())
+        .chain(plan.extra_rw_binds.iter())
+        .chain(plan.worker.iter())
+    {
+        let bind_resolved = bind.canonicalize().unwrap_or_else(|_| bind.clone());
+        for spelling in &spellings {
+            // Literal coverage mounts the file at its own spelling; a
+            // bind reached through a symlink mounts the same tree at
+            // the spelling the plan named.
+            let dest = if spelling.starts_with(bind) {
+                spelling.clone()
+            } else if let Ok(rel) = spelling.strip_prefix(&bind_resolved) {
+                bind.join(rel)
+            } else {
+                continue;
+            };
+            if !dests.contains(&dest) {
+                dests.push(dest);
+            }
+        }
+    }
+    // A mask root's tmpfs renders at every bound spelling the root is
+    // reachable under — one per system-bind member that mounts the
+    // root's shared target. A dest beneath any of those spellings is
+    // already invisible; every other bound spelling of the file still
+    // needs the `/dev/null` shadow.
+    let mut tmpfs_spellings: Vec<PathBuf> = Vec::new();
+    for root in &plan.mask_roots {
+        for dest in mask_root_dests_among(root, binds) {
+            if !tmpfs_spellings.contains(&dest) {
+                tmpfs_spellings.push(dest);
+            }
+        }
+    }
+    for member in binds.iter().map(Path::new).filter(|b| b.exists()) {
+        let target = member
+            .canonicalize()
+            .unwrap_or_else(|_| member.to_path_buf());
+        let Ok(rel) = resolved.strip_prefix(&target) else {
+            continue;
+        };
+        // The member's target itself is the mounted surface, not a
+        // file beneath it — an entry equal to a bound prefix is the
+        // `plan_denial` case, not a shadow destination.
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let dest = member.join(rel);
+        if tmpfs_spellings.iter().any(|root| dest.starts_with(root)) {
+            continue;
+        }
+        if !dests.contains(&dest) {
+            dests.push(dest);
+        }
+    }
+    dests
+}
+
 /// Refuse a mount plan whose binds would cover or enter the
 /// supervisor-owned sandbox surface, or whose sources the contract
 /// never admits. Every bind the plan mounts at its own spelling is
@@ -523,6 +646,55 @@ pub fn plan_denial(plan: &MountPlan) -> Option<String> {
                     ));
                 }
             }
+        }
+    }
+    // A `masked_files` entry that stays visible must also stay
+    // shadowable. A file a fixed-destination bind carries — the
+    // workspace, the request/input/out trees, the generated configs,
+    // the provider config, the toolchain's canonical mount — is
+    // reachable at a sandbox spelling no host-path mask covers, and a
+    // covered entry that is not a regular file cannot take a
+    // `/dev/null` shadow at all. Both refuse the plan rather than
+    // leave the credential surface half-shadowed.
+    let fixed_destinations = [
+        plan.workspace.as_ref().map(|(path, _)| path),
+        plan.request.as_ref(),
+        plan.input.as_ref(),
+        plan.out.as_ref(),
+        plan.gitconfig.as_ref(),
+        plan.runtime_auth.as_ref(),
+        plan.provider_config.as_ref(),
+        plan.proxy_sock.as_ref(),
+        plan.toolchain.as_ref(),
+    ];
+    for file in &plan.masked_files {
+        let resolved = file.canonicalize().unwrap_or_else(|_| file.clone());
+        let carried = fixed_destinations.iter().flatten().any(|source| {
+            let source_resolved = source.canonicalize().unwrap_or_else(|_| (*source).clone());
+            resolved.starts_with(&source_resolved) || file.starts_with(source)
+        });
+        if carried {
+            return Some(format!(
+                "masked file '{}' is mounted at a fixed sandbox destination — \
+                 it cannot be shadowed",
+                file.display()
+            ));
+        }
+        // A covered path that is not a regular file — a directory
+        // named in `masked_files` — cannot take a `/dev/null` shadow;
+        // refusing beats emitting a mask that cannot hold. "Covered"
+        // includes the bound prefixes themselves: an entry equal to a
+        // system bind is the mounted surface, not a file beneath it.
+        let visible = !masked_file_dests(plan, file).is_empty()
+            || SYSTEM_BINDS.iter().map(Path::new).any(|bound| {
+                let bound = bound.canonicalize().unwrap_or_else(|_| bound.to_path_buf());
+                resolved == bound
+            });
+        if visible && std::fs::metadata(file).is_ok_and(|meta| !meta.is_file()) {
+            return Some(format!(
+                "masked file '{}' is not a regular file — it cannot be shadowed",
+                file.display()
+            ));
         }
     }
     None
@@ -728,9 +900,8 @@ pub fn bwrap_args(
     // plan legitimately names under the root is re-mounted by its own
     // bind — the mask never subtracts a declared mount.
     for root in &plan.mask_roots {
-        if system_bind_covers(root) {
-            let resolved = root.canonicalize().unwrap_or_else(|_| root.clone());
-            args.extend(["--tmpfs".to_string(), s(&resolved)]);
+        for dest in mask_root_dests(root) {
+            args.extend(["--tmpfs".to_string(), s(&dest)]);
         }
     }
     args.extend(
@@ -825,21 +996,19 @@ pub fn bwrap_args(
     if let Some(worker) = &plan.worker {
         args.extend(["--ro-bind".to_string(), s(worker), s(worker)]);
     }
-    // A host file beneath a bound system prefix — a `file:` credential
-    // source — stays visible through the wholesale bind unless it is
-    // shadowed: ro-bind /dev/null over it. The mask renders after every
-    // plan bind: an own-path bind whose source is the credential (or an
-    // ancestor of it) would otherwise re-mount the secret after the
-    // mask, and the staged `/taisan/runtime-auth` must be the only
-    // credential surface inside the sandbox.
+    // A host file any mount carries — a `file:` credential source
+    // beneath a bound system prefix or an own-path plan bind — stays
+    // visible unless it is shadowed: ro-bind /dev/null over every
+    // covered spelling. The mask renders after every plan bind: an
+    // own-path bind whose source is the credential (or an ancestor of
+    // it) would otherwise re-mount the secret after the mask, and the
+    // staged `/taisan/runtime-auth` must be the only credential
+    // surface inside the sandbox. An entry no mount reaches is
+    // already invisible — masking it would emit a `--ro-bind`
+    // destination nothing created and fail the whole mount setup.
     for file in &plan.masked_files {
-        if system_bind_covers(file) {
-            let resolved = file.canonicalize().unwrap_or_else(|_| file.clone());
-            args.extend([
-                "--ro-bind".to_string(),
-                "/dev/null".to_string(),
-                s(&resolved),
-            ]);
+        for dest in masked_file_dests(plan, file) {
+            args.extend(["--ro-bind".to_string(), "/dev/null".to_string(), s(&dest)]);
         }
     }
     args.extend([
@@ -1711,8 +1880,7 @@ mod tests {
     /// A host file beneath a system bind — a `file:` credential
     /// source — is shadowed with a read-only `/dev/null` bind so the
     /// staged `/taisan/runtime-auth` is the only credential surface
-    /// inside the sandbox. A file outside every system bind needs no
-    /// mask.
+    /// inside the sandbox.
     #[test]
     fn a_system_bind_covered_masked_file_is_shadowed_with_dev_null() {
         // /bin/sh exists on every unix layout this suite runs on and
@@ -1733,10 +1901,23 @@ mod tests {
             text.contains(&format!("--ro-bind /dev/null {}", resolved.display())),
             "the covered credential source is masked: {text}"
         );
-        // A masked file outside every system bind emits nothing.
-        let uncovered = tmp("uncovered-file");
-        std::fs::create_dir_all(&uncovered).unwrap();
-        plan.masked_files = vec![uncovered.clone()];
+    }
+
+    /// A masked file outside every system-bind prefix still gets
+    /// shadowed when a plan bind carries it: an own-path `extra_binds`
+    /// entry — the argv-derived shape a worker-chosen argv produces —
+    /// mounts the credential read-only unless the `/dev/null` shadow
+    /// renders over it. A file no mount reaches is already invisible
+    /// and emits nothing (#399).
+    #[test]
+    fn a_masked_file_outside_system_binds_is_shadowed_when_bound() {
+        let dir = tmp("masked-bound");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("credential-source");
+        std::fs::write(&file, b"sentinel").unwrap();
+        let mut plan = plan_fixture();
+        plan.masked_files = vec![file.clone()];
+        plan.extra_binds = vec![file.clone()];
         let args = bwrap_args(
             Path::new("/usr/bin/bwrap"),
             &plan,
@@ -1744,8 +1925,83 @@ mod tests {
             "/workspace",
         );
         let text = args.join(" ");
-        assert!(!text.contains("uncovered-file"), "{text}");
+        let own_bind = text
+            .find(&format!("--ro-bind {0} {0}", file.display()))
+            .expect("the plan binds the path at its own spelling");
+        let mask = text
+            .find(&format!("--ro-bind /dev/null {}", file.display()))
+            .expect("the mask renders for a non-system path");
+        assert!(
+            mask > own_bind,
+            "the mask must shadow the own-path bind: {text}"
+        );
+        // Coverage through an ancestor bind masks the file at the same
+        // spelling.
+        plan.extra_binds = vec![dir.clone()];
+        let args = bwrap_args(
+            Path::new("/usr/bin/bwrap"),
+            &plan,
+            &["worker".into()],
+            "/workspace",
+        );
+        let text = args.join(" ");
+        let dir_bind = text
+            .find(&format!("--ro-bind {0} {0}", dir.display()))
+            .expect("the ancestor bind renders");
+        let mask = text
+            .find(&format!("--ro-bind /dev/null {}", file.display()))
+            .expect("the ancestor-bound file is masked");
+        assert!(mask > dir_bind, "the mask renders last: {text}");
+
+        // A file outside every system bind and named by no bind never
+        // enters the sandbox view — masking it would emit a `--ro-bind`
+        // destination nothing created and fail the mount setup.
+        let uncovered = tmp("uncovered-file");
+        std::fs::create_dir_all(&uncovered).unwrap();
+        let file = uncovered.join("credential-source");
+        std::fs::write(&file, b"sentinel").unwrap();
+        plan.masked_files = vec![file.clone()];
+        plan.extra_binds = vec![];
+        let args = bwrap_args(
+            Path::new("/usr/bin/bwrap"),
+            &plan,
+            &["worker".into()],
+            "/workspace",
+        );
+        let text = args.join(" ");
+        assert!(
+            !text.contains(&format!("--ro-bind /dev/null {}", file.display())),
+            "an unbound file needs no mask: {text}"
+        );
+        assert!(plan_denial(&plan).is_none(), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&uncovered);
+    }
+
+    /// A masked file that would stay visible but cannot be shadowed
+    /// fails the plan closed: inside a fixed-destination bind (the
+    /// writable out tree) it is reachable at a sandbox spelling no
+    /// host-path mask covers, and a covered directory cannot take a
+    /// `/dev/null` shadow at all.
+    #[test]
+    fn a_visible_but_unmaskable_masked_file_is_refused() {
+        let dir = tmp("unmaskable");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A file inside the fixed-destination out bind is visible at
+        // its /taisan/out spelling — unreachable by a host-path mask.
+        let carried = dir.join("nested");
+        std::fs::write(&carried, b"sentinel").unwrap();
+        let mut plan = plan_fixture();
+        plan.masked_files = vec![carried];
+        plan.out = Some(dir.clone());
+        assert!(plan_denial(&plan).is_some());
+        // A covered directory named in masked_files is unshadowable.
+        let covered = Path::new("/usr/lib");
+        assert!(covered.is_dir(), "test assumes /usr/lib exists");
+        plan = plan_fixture();
+        plan.masked_files = vec![covered.to_path_buf()];
+        assert!(plan_denial(&plan).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A masked path the plan also binds at its own spelling must stay
@@ -1777,6 +2033,59 @@ mod tests {
             mask > own_bind,
             "the mask must shadow the own-path bind: {text}"
         );
+    }
+
+    /// On a merged-`/usr` layout each system-bind member is bound as
+    /// its own mount of the shared target — the host's `/bin` symlink
+    /// does not carry into the sandbox — so a credential under the
+    /// target is reachable once per bound spelling and every spelling
+    /// takes the `/dev/null` shadow. The synthetic tree stands in for
+    /// the fixed `SYSTEM_BINDS` list, which the test host's layout may
+    /// not merge.
+    #[test]
+    fn a_merged_usr_masked_file_is_shadowed_at_every_bound_spelling() {
+        let root = tmp("merged-usr");
+        let usr = root.join("usr");
+        std::fs::create_dir_all(usr.join("bin")).unwrap();
+        std::fs::create_dir_all(usr.join("lib")).unwrap();
+        std::fs::create_dir_all(usr.join("share")).unwrap();
+        std::os::unix::fs::symlink("usr/bin", root.join("bin")).unwrap();
+        std::os::unix::fs::symlink("usr/lib", root.join("lib")).unwrap();
+        let file = usr.join("bin/secret");
+        std::fs::write(&file, b"sentinel").unwrap();
+        let binds: Vec<String> = [
+            root.join("usr"),
+            root.join("bin"),
+            root.join("lib"),
+            // A member absent on the host is never bound — it must
+            // contribute no mask destination.
+            root.join("missing"),
+        ]
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+        let binds: Vec<&str> = binds.iter().map(String::as_str).collect();
+        let plan = plan_fixture();
+        let dests = masked_file_dests_among(&plan, &file, &binds);
+        // /usr's mount exposes `bin/secret`; /bin's mount exposes
+        // `secret` — both spellings shadowed, /lib's mount does not
+        // hold the file, and the unbound member emits nothing.
+        assert_eq!(
+            dests,
+            vec![usr.join("bin/secret"), root.join("bin/secret")],
+            "every bound spelling of the credential is masked"
+        );
+        // The same file spelled through the alias yields the same
+        // destinations — the mask set is a property of the mounted
+        // target, not of the spelling the config named.
+        let aliased = root.join("bin/secret");
+        assert_eq!(masked_file_dests_among(&plan, &aliased, &binds), dests);
+        // A file whose target holds no sibling-bound member is masked
+        // only at its own spelling.
+        let lone = usr.join("share/secret");
+        std::fs::write(&lone, b"sentinel").unwrap();
+        assert_eq!(masked_file_dests_among(&plan, &lone, &binds), vec![lone]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A mask root strictly beneath an existing system bind — a
@@ -1818,6 +2127,65 @@ mod tests {
         );
         let text = args.join(" ");
         assert!(!text.contains("uncovered-root"), "{text}");
+    }
+
+    /// On a merged-`/usr` layout a mask root beneath the shared target
+    /// is reachable under every bound spelling of that target, so the
+    /// tmpfs renders at each one — not only at the resolved spelling.
+    /// The synthetic tree stands in for the fixed `SYSTEM_BINDS` list,
+    /// which the test host's layout may not merge.
+    #[test]
+    fn a_merged_usr_mask_root_is_shadowed_at_every_bound_spelling() {
+        let root = tmp("merged-usr-mask-root");
+        let usr = root.join("usr");
+        std::fs::create_dir_all(usr.join("lib/state")).unwrap();
+        std::fs::create_dir_all(usr.join("bin")).unwrap();
+        std::os::unix::fs::symlink("usr/lib", root.join("lib")).unwrap();
+        std::os::unix::fs::symlink("usr/bin", root.join("bin")).unwrap();
+        let binds: Vec<String> = [
+            root.join("usr"),
+            root.join("bin"),
+            root.join("lib"),
+            // A member absent on the host is never bound — it must
+            // contribute no mask destination.
+            root.join("missing"),
+        ]
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+        let binds: Vec<&str> = binds.iter().map(String::as_str).collect();
+        let mask_root = usr.join("lib/state");
+        let masked_file = mask_root.join("secret");
+        std::fs::write(&masked_file, b"sentinel").unwrap();
+        let dests = mask_root_dests_among(&mask_root, &binds);
+        // /usr's mount exposes `lib/state`; /lib's mount exposes
+        // `state` — both spellings shadowed, /bin's mount does not
+        // hold the root, and the unbound member emits nothing.
+        assert_eq!(
+            dests,
+            vec![usr.join("lib/state"), root.join("lib/state")],
+            "every bound spelling of the mask root gets a tmpfs"
+        );
+        // The same root spelled through the alias yields the same
+        // destination set — a property of the target, not the spelling.
+        assert_eq!(
+            mask_root_dests_among(&root.join("lib/state"), &binds),
+            dests
+        );
+        // A root equal to a bound target is the runtime surface, and an
+        // absent root is absent inside every bind — neither emits.
+        assert!(mask_root_dests_among(&root.join("usr"), &binds).is_empty());
+        assert!(mask_root_dests_among(&usr.join("missing"), &binds).is_empty());
+        // A file beneath the root is already invisible under every
+        // emitted tmpfs spelling; no `/dev/null` shadow destination is
+        // left that nothing created.
+        let mut plan = plan_fixture();
+        plan.mask_roots = vec![mask_root.clone()];
+        assert!(
+            masked_file_dests_among(&plan, &masked_file, &binds).is_empty(),
+            "the tmpfs masks the file at every bound spelling"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -1449,6 +1449,310 @@ fn the_same_proposal_key_replays_the_recorded_decision_for_a_finished_source() {
     assert_eq!(works_count(&f.store), 1, "replay never duplicates Work");
 }
 
+/// A known replay must not consume the only free pending position.
+/// With the queue limit at one, the second invocation asks for one
+/// slot plus the one saved replay identity: the adapter returns the
+/// replayed Issue and the new one, admission replays the first, and
+/// the new proposal still gets the free position instead of being
+/// starved out of the response by the returned-candidate bound.
+#[test]
+fn a_replay_does_not_consume_the_only_free_pending_slot() {
+    let dir = tmp_root("replay-budget");
+    let store = SqliteStore::in_memory(4).unwrap();
+    set_intake_settings(&store, settings("rev-1", 1), None).unwrap();
+
+    let replayed = proposal("issue-1", "first work");
+    let first_capture = dir.join("first-request.json");
+    let first_script = adapter_script(
+        &dir,
+        "first.sh",
+        &success_template(std::slice::from_ref(&replayed)),
+        &first_capture,
+    );
+    let mut f = fixture(dir.clone(), first_script);
+    f.store = store;
+
+    let first = run(&f, Duration::from_secs(10));
+    assert_eq!(first.state, IntakeRunState::Completed);
+    assert_eq!(first.candidates[0].status, IntakeCandidateStatus::Accepted);
+    let w1 = first.candidates[0].work_id.clone().unwrap();
+    let executions = f
+        .store
+        .transact_deferred(|tx| tx.executions_for_work(&w1))
+        .unwrap();
+    force_execution(&f.store, &executions[0].id, ExecutionState::Succeeded);
+    release_claims(&f.store, &w1);
+    assert_eq!(works_count(&f.store), 1);
+
+    // The replay sorts first; without the replay-aware ask the single
+    // returned candidate would be the replay and `issue-2` would never
+    // be proposed.
+    let fresh = proposal("issue-2", "second work");
+    let second_capture = dir.join("second-request.json");
+    let second_script = adapter_script(
+        &dir,
+        "second.sh",
+        &success_template(&[replayed, fresh]),
+        &second_capture,
+    );
+    f.binding.argv = vec!["/bin/sh".into(), second_script];
+
+    let second = run(&f, Duration::from_secs(10));
+    assert_eq!(second.state, IntakeRunState::Completed);
+    let request = captured_request(&second_capture);
+    assert_eq!(
+        request["max_candidates"], 2,
+        "one free slot plus the known replay identity"
+    );
+    assert_eq!(second.candidates.len(), 2);
+    assert_eq!(
+        second.candidates[0].status,
+        IntakeCandidateStatus::Replayed,
+        "{:?}",
+        second.candidates[0]
+    );
+    assert_eq!(
+        second.candidates[1].status,
+        IntakeCandidateStatus::Accepted,
+        "{:?}",
+        second.candidates[1]
+    );
+    assert_eq!(
+        works_count(&f.store),
+        2,
+        "the new proposal occupies the free slot"
+    );
+}
+
+/// A replay trailing a capacity refusal is still resolved from the
+/// ledger, never recorded `capacity_deferred`: that status promises no
+/// saved decision exists under the replay key, so a saved replay must
+/// not be mislabeled (and left unlinked) just because it sorted behind
+/// a fresh proposal the full queue refused.
+#[test]
+fn a_replay_after_a_capacity_refusal_is_still_resolved() {
+    let dir = tmp_root("replay-after-capacity");
+    let store = SqliteStore::in_memory(4).unwrap();
+    set_intake_settings(&store, settings("rev-1", 1), None).unwrap();
+
+    // Seed the replay's saved decision with one accepted Work, then
+    // settle it so the queue has its single position free again.
+    let replayed = proposal("issue-1", "first work");
+    let first_capture = dir.join("first-request.json");
+    let first_script = adapter_script(
+        &dir,
+        "first.sh",
+        &success_template(std::slice::from_ref(&replayed)),
+        &first_capture,
+    );
+    let mut f = fixture(dir.clone(), first_script);
+    f.store = store;
+    let first = run(&f, Duration::from_secs(10));
+    assert_eq!(first.candidates[0].status, IntakeCandidateStatus::Accepted);
+    let replay_work = first.candidates[0].work_id.clone().unwrap();
+    let executions = f
+        .store
+        .transact_deferred(|tx| tx.executions_for_work(&replay_work))
+        .unwrap();
+    force_execution(&f.store, &executions[0].id, ExecutionState::Succeeded);
+    release_claims(&f.store, &replay_work);
+
+    // A second saved identity under the same binding inflates the ask
+    // to three without being returned, so the response may carry two
+    // fresh proposals and the replay with only one free position.
+    let saved = handle_command(
+        &f.store,
+        &config(false),
+        &CommandRequest {
+            actor: f.actor.clone(),
+            origin: Origin("selector".into()),
+            idempotency_key: "proposal/test-sel:saved-extra".into(),
+            body: CommandBody::Submit {
+                intent: "saved decision".into(),
+                sources: vec![SourceSnapshot {
+                    issue: issue("cap-seed"),
+                    source_revision: "rev-0".into(),
+                    content_digest: "digest-0".into(),
+                }],
+                constraints: vec![],
+                verification_argv: vec![],
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    assert!(matches!(saved, CommandDecision::Rejected { .. }));
+
+    let fresh_a = proposal("issue-2", "second work");
+    let fresh_b = proposal("issue-3", "third work");
+    let capture = dir.join("request.json");
+    let script = adapter_script(
+        &dir,
+        "sel.sh",
+        &success_template(&[fresh_a, fresh_b, replayed]),
+        &capture,
+    );
+    f.binding.argv = vec!["/bin/sh".into(), script];
+
+    let report = run(&f, Duration::from_secs(10));
+    assert_eq!(report.state, IntakeRunState::Completed);
+    // One free position plus two known replay identities, under the
+    // protocol bound.
+    assert_eq!(captured_request(&capture)["max_candidates"], 3);
+    assert_eq!(
+        report.candidates[0].status,
+        IntakeCandidateStatus::Accepted,
+        "{:?}",
+        report.candidates[0]
+    );
+    assert_eq!(
+        report.candidates[1].status,
+        IntakeCandidateStatus::CapacityDeferred,
+        "the second fresh proposal exhausts the queue: {:?}",
+        report.candidates[1]
+    );
+    let replay = &report.candidates[2];
+    assert_eq!(
+        replay.status,
+        IntakeCandidateStatus::Replayed,
+        "a saved replay is not deferred: {replay:?}"
+    );
+    assert_eq!(replay.work_id.as_ref(), Some(&replay_work));
+    assert!(
+        replay.command_id.is_some(),
+        "the resolved replay links its saved decision"
+    );
+    assert_eq!(works_count(&f.store), 2);
+}
+
+/// Only saved decision identities for *this* selector and actor may
+/// inflate the ask: another selector's key, or the same selector's
+/// key under another actor, is not a replay this run can present.
+#[test]
+fn the_replay_ask_is_scoped_to_the_binding_and_actor() {
+    let dir = tmp_root("replay-scope");
+    let store = SqliteStore::in_memory(4).unwrap();
+    set_intake_settings(&store, settings("rev-1", 1), None).unwrap();
+
+    let rejecting = config(false);
+    let other_actor = Actor {
+        kind: ActorKind::Automation,
+        external_id: "other".into(),
+    };
+    for (key, decision_actor) in [
+        ("proposal/other-sel:saved", actor()),
+        ("proposal/test-sel:saved", other_actor),
+    ] {
+        let decision = handle_command(
+            &store,
+            &rejecting,
+            &CommandRequest {
+                actor: decision_actor,
+                origin: Origin("selector".into()),
+                idempotency_key: key.into(),
+                body: CommandBody::Submit {
+                    intent: "saved decision".into(),
+                    sources: vec![SourceSnapshot {
+                        issue: issue("scope-seed"),
+                        source_revision: "rev-0".into(),
+                        content_digest: "digest-0".into(),
+                    }],
+                    constraints: vec![],
+                    verification_argv: vec![],
+                },
+            },
+            NOW,
+        )
+        .unwrap();
+        assert!(matches!(decision, CommandDecision::Rejected { .. }));
+    }
+
+    let proposals = vec![proposal("issue-new", "fresh work")];
+    let capture = dir.join("request.json");
+    let script = adapter_script(&dir, "sel.sh", &success_template(&proposals), &capture);
+    let mut f = fixture(dir.clone(), script);
+    f.store = store;
+    let report = run(&f, Duration::from_secs(10));
+
+    assert_eq!(report.state, IntakeRunState::Completed);
+    let request = captured_request(&capture);
+    assert_eq!(
+        request["max_candidates"], 1,
+        "out-of-scope saved keys do not inflate the ask"
+    );
+    assert_eq!(report.candidates[0].status, IntakeCandidateStatus::Accepted);
+}
+
+/// The replay read is bounded by the protocol candidate bound rather
+/// than the (never pruned) command ledger: the store returns only the
+/// requested number of prefix-matching keys, and the ask stays at
+/// `MAX_CANDIDATES` even when far more decisions are saved.
+#[test]
+fn the_replay_ask_is_capped_at_the_protocol_bound() {
+    let dir = tmp_root("replay-cap");
+    let store = SqliteStore::in_memory(4).unwrap();
+    set_intake_settings(&store, settings("rev-1", 1), None).unwrap();
+
+    let rejecting = config(false);
+    for i in 0..40 {
+        let decision = handle_command(
+            &store,
+            &rejecting,
+            &CommandRequest {
+                actor: actor(),
+                origin: Origin("selector".into()),
+                idempotency_key: format!("proposal/test-sel:saved-{i:02}"),
+                body: CommandBody::Submit {
+                    intent: format!("saved decision {i}"),
+                    sources: vec![SourceSnapshot {
+                        issue: issue(&format!("cap-seed-{i}")),
+                        source_revision: "rev-0".into(),
+                        content_digest: "digest-0".into(),
+                    }],
+                    constraints: vec![],
+                    verification_argv: vec![],
+                },
+            },
+            NOW,
+        )
+        .unwrap();
+        assert!(matches!(decision, CommandDecision::Rejected { .. }));
+    }
+
+    let bounded = store
+        .transact_deferred(|tx| {
+            tx.decided_idempotency_keys(
+                &Origin("selector".into()),
+                &actor(),
+                "proposal/test-sel:",
+                5,
+            )
+        })
+        .unwrap();
+    assert_eq!(bounded.len(), 5, "the read stops at the requested limit");
+    assert!(
+        bounded
+            .iter()
+            .all(|key| key.starts_with("proposal/test-sel:")),
+        "{bounded:?}"
+    );
+
+    let proposals = vec![proposal("issue-cap", "fresh work")];
+    let capture = dir.join("request.json");
+    let script = adapter_script(&dir, "cap.sh", &success_template(&proposals), &capture);
+    let mut f = fixture(dir.clone(), script);
+    f.store = store;
+    let report = run(&f, Duration::from_secs(10));
+
+    assert_eq!(report.state, IntakeRunState::Completed);
+    let request = captured_request(&capture);
+    assert_eq!(
+        request["max_candidates"], 32,
+        "the replay-widened ask is capped at the protocol bound"
+    );
+    assert_eq!(report.candidates[0].status, IntakeCandidateStatus::Accepted);
+}
+
 /// `queued` is not the only owning state: Works forced into `running`
 /// and `paused` still hold their issues, so the request's
 /// `excluded_sources` carries both — the wire-level half of the

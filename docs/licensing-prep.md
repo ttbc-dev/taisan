@@ -1,12 +1,14 @@
 # License preparation: dependency inventory and options
 
-Status: preparation document for the license-selection gate
-([issue #369](https://github.com/shimpeiws/taisan/issues/369)). This
-document inventories what the planned release would redistribute and
-what each component requires. It does **not** select a license, add a
-`LICENSE` file, or change Cargo metadata — the owner selects the license
-first. This is an evidence-backed audit, not a legal guarantee; items
-that could not be resolved are listed as release blockers in §5.
+Status: **decision applied** — the owner selected
+`MIT OR Apache-2.0` (dual; licensees pick either) for code and
+unmarked project files, with `assets/taisan-hero.jpg` excluded under
+its own usage terms in `assets/LICENSE.md`. `LICENSE-MIT`,
+`LICENSE-APACHE`, `CONTRIBUTING.md`, `THIRD-PARTY.md`, and `LICENSES/`
+are in place; every workspace crate declares
+`license.workspace = true`. This document remains the evidence-backed
+inventory the selection was made from — see §5 for resolved and
+remaining items. ([issue #369](https://github.com/ttbc-dev/taisan/issues/369))
 
 Evidence basis: `cargo metadata --format-version 1 --locked` and
 `cargo tree --locked` resolved against `Cargo.lock` in this checkout,
@@ -156,21 +158,28 @@ What the release redistributes, beyond source:
 
 | Component | What it is | License status |
 | --- | --- | --- |
-| `taisan` binary (`crates/workloop-cli`) | Primary CLI; statically links the unix-linked crates in §1 | Project code; license pending owner selection |
+| `taisan` binary (`crates/workloop-cli`) | Primary CLI; statically links the unix-linked crates in §1 | Project code; `MIT OR Apache-2.0` |
 | `taisan-tui` binary (`crates/workloop-tui`) | Management console (deferred from release requirements, still built/distributed) | Same as above |
 | `public-issue-selector` binary (`crates/workloop-selector`) | Packaged public reference Selector | Same as above |
 | `taisan-worker-claude` binary (`crates/taisan-worker-claude`) | Packaged reference Worker adapter | Same as above. It **invokes an external, user-installed agent runtime CLI** — it does not embed or redistribute any part of that runtime. The runtime is an installation prerequisite, not a bundled component. |
-| Test/fixture binaries (`workloop-fixture-worker`, `workloop-fixture-selector`, `workloop-contract-worker`, `s1_bridge`) | Deterministic fixture workers and contract-test helpers used by the test suite and docs evidence | Project code; same license as project once chosen. Ship in source; whether prebuilt copies are release artifacts is a packaging decision. |
+| `workloop-fixture-worker` binary (`crates/workloop-fixture-worker`) | Deterministic fixture worker shipped as a release binary — the Worker the non-live bindings use; listed in `[workspace.metadata.dist].packages` | Project code; `MIT OR Apache-2.0` |
+| Non-shipped binaries (`workloop-executor`'s `taisan-executor`, `workloop-fixture-selector`, `workloop-contract-worker`, `s1_bridge`, and the legacy-named `workloop-cli`/`workloop-tui` binaries) | Internal executor, contract-test helpers, the scenario bridge used by the test suite and docs evidence, and the packages' legacy-named binaries; excluded from release artifacts (`dist = false` on each standalone crate; `s1_bridge` and the legacy `workloop-cli`/`workloop-tui` binaries are extra bin targets of their packages dropped by the `[package.metadata.dist.binaries]` overrides) | Project code; `MIT OR Apache-2.0`; ships in source only |
 | **SQLite amalgamation** (compiled in via `rusqlite` feature `bundled` → `libsqlite3-sys`) | The sqlite3.c amalgamation is compiled into every binary that links `workloop-store` | SQLite itself is **public domain**; no notice legally required. `libsqlite3-sys` crate is MIT. Recommend still recording it in third-party notices for transparency. |
 | `skills/taisan/SKILL.md` | Agent skill installed into users' coding agents via `npx skills add` | Project-authored text; same license as project |
 | `assets/taisan-hero.jpg` | README/hero image, resized from an owner-approved issue attachment (provenance recorded in `assets/README.md`) | Owner-supplied asset — see §5 for the required confirmation |
 | `scripts/` (Python + shell), `fixtures/` (JSON), `docs/` | Verification scripts, seeded fixture data, documentation | Project-authored; same license as project |
-| `gh` CLI, agent runtimes, Rust toolchain | External tools invoked or installed at operation time (`scripts/worker/setup.sh` downloads rustup at run time, in the target environment) | **Not redistributed** — external prerequisites |
+| `gh` CLI, agent runtimes, Rust toolchain, cargo-dist | External tools invoked or installed at operation time (`scripts/worker/setup.sh` downloads rustup at run time, in the target environment; the release workflow downloads and installs cargo-dist in CI) | **Not redistributed** — external prerequisites |
 | CI workflow (`.github/workflows/rust.yml`) | References GitHub-hosted actions by name | Referenced, not vendored; no bundled third-party code |
+| CI workflow (`.github/workflows/release.yml`) | cargo-dist-generated release workflow vendored in-tree, with hand-applied permission/identity patches (see `docs/distribution.md`) | **Third-party-generated content embedded in the tree** — header carries `Copyright 2022-2024, axodotdev` / `SPDX-License-Identifier: MIT or Apache-2.0`; both license texts already ship in `LICENSES/` |
 
-No `vendor/` directory, no `.crate` archives, and no third-party source
-embedded in the tree (checked: no foreign copyright/license headers in
-`crates/`, `scripts/`, `skills/`, `docs/`).
+No `vendor/` directory and no `.crate` archives. The only third-party
+material embedded in the tree is `.github/workflows/release.yml`
+(cargo-dist-generated, axodotdev copyright — the row above). A
+tree-wide scan for `copyright` / `SPDX-License-Identifier` headers
+(excluding `.git`, `target/`, the `LICENSES/` texts, `THIRD-PARTY.md`,
+and `Cargo.lock`) finds no other foreign copyright or license headers —
+`crates/`, `scripts/`, `skills/`, `docs/`, `fixtures/`, and the rest of
+`.github/` are otherwise clean.
 
 ## 3. Compatibility summary and candidate licenses
 
@@ -214,6 +223,14 @@ developer tool and not listed as a primary candidate.
 
 **Apache-2.0 `NOTICE` files:** none. No dependency ships a `NOTICE`
 file, so Apache-2.0 §4(d) adds no mandatory notice text to propagate.
+
+**Vendored `.github/workflows/release.yml`:** the cargo-dist-generated
+workflow carries `Copyright 2022-2024, axodotdev` under `MIT OR
+Apache-2.0` (§2). Both licenses require retaining the copyright notice
+and license text; the verbatim copyright/SPDX header in the file itself
+satisfies that for source distribution, and both license texts already
+ship in `LICENSES/`. The workflow is not part of any binary bundle, so
+no bundle-level notice is required for it.
 
 **License-text retention (required under every candidate):** binary
 distributions must carry the copyright and license text of each
@@ -269,8 +286,8 @@ file(s).
 
 | # | Item | Severity | Evidence |
 | --- | --- | --- | --- |
-| B1 | **Project license unselected** — every workspace crate currently declares no `license` field (cargo metadata shows `[]` for all 14 members) and no `LICENSE` file exists. Blocks the release itself, and blocks AC #3 (LICENSE + consistent Cargo metadata). | **Release blocker** — pending owner decision | `Cargo.toml` files; `cargo metadata` |
-| B2 | **`assets/taisan-hero.jpg` redistribution rights unconfirmed** — provenance is documented (resized from an owner-approved issue attachment, `assets/README.md`) but no explicit statement that the owner licenses it for redistribution under the chosen project license. Likely resolvable in one line by the owner; flagged rather than assumed. | Release blocker until owner confirms | `assets/README.md` |
+| B1 | **Project license unselected** — every workspace crate currently declares no `license` field (cargo metadata shows `[]` for all 14 members) and no `LICENSE` file exists. Blocks the release itself, and blocks AC #3 (LICENSE + consistent Cargo metadata). | **Resolved** — owner selected `MIT OR Apache-2.0`; `LICENSE-MIT`/`LICENSE-APACHE` added, all 15 members declare `license.workspace = true` (verified via `cargo metadata --no-deps`) | `Cargo.toml` files; `cargo metadata` |
+| B2 | **`assets/taisan-hero.jpg` redistribution rights unconfirmed** — provenance is documented (resized from an owner-approved issue attachment, `assets/README.md`) but no explicit statement that the owner licenses it for redistribution under the chosen project license. Likely resolvable in one line by the owner; flagged rather than assumed. | **Resolved** — owner confirmed repository inclusion and redistribution rights; the image is excluded from the dual license under its own terms in `assets/LICENSE.md` (scope: that file only) | `assets/README.md`; `assets/LICENSE.md` |
 | B3 | **`r-efi 6.0.0` ships no license text file** — SPDX expression `MIT OR Apache-2.0 OR LGPL-2.1-or-later` only. Not a practical blocker: the crate compiles solely for `target_os = "uefi"` (a getrandom backend not used by any planned target) and permissive options exist in the `OR`. Recorded so it is not silently smoothed over; if the project ever targets UEFI the missing license text would need an upstream request. | Anomaly — not blocking for planned targets | registry package contents |
 | B4 | **Publication disclosure review** — `docs/source-workflow-audit.md` retains source-internal names; publication previously required a disclosure review covering it and the git history. Dispositioned: the owner ruled under issue #438 that the names and owner identity are acceptable to disclose and the repository publishes in place with history kept (`docs/release-audit.md` §7); no disclosure review gates publication under that ruling. A publication gate rather than a copyright problem (the file is project-authored), recorded here because it gated the same release. | Dispositioned (non-license) — owner ruling #438 | `AGENTS.md` source-references rule; `docs/release-audit.md` §7 |
 
@@ -288,3 +305,35 @@ file(s).
   `cargo-deny` or `cargo-about` is installed; until then the §1 table
   is the audit record (reproduce with `cargo metadata --locked` +
   `cargo tree --locked`).
+
+## 6. Decision applied (2026-11-25)
+
+Owner selection: **`MIT OR Apache-2.0`** for code and unmarked project
+files; `assets/taisan-hero.jpg` is excluded under its own terms in
+`assets/LICENSE.md` (the exception scopes to that file only — not the
+whole `assets/` directory — and the standard MIT/Apache-2.0 texts carry
+no image exceptions).
+
+Applied artifacts: `LICENSE-MIT` (standard MIT text carrying the
+copyright line `2026 Shimpei Takamatsu`), `LICENSE-APACHE` (verbatim
+Apache Software Foundation text —
+https://www.apache.org/licenses/LICENSE-2.0.txt — the project
+copyright is recorded in `LICENSE-MIT` and here, not inside the
+standard text), `README.md` License section,
+`assets/LICENSE.md`, `CONTRIBUTING.md` (same dual license for
+contributions, no CLA/copyright assignment), `THIRD-PARTY.md` (87-crate
+inventory with per-package copyright or `authors` attribution),
+`LICENSES/` (full MIT, Apache-2.0, Unicode-3.0, BSD-2-Clause and
+Unlicense texts), `license.workspace = true` on all 15 member crates.
+
+**Distribution-path check (task: bundle completeness):** no crate is
+published (no `publish`/`package` configuration exists anywhere in the
+workspace). Binary-tarball machinery exists — cargo-dist is wired via
+`[workspace.metadata.dist]` (config in `Cargo.toml`, workflow in
+`.github/workflows/release.yml`, details in `docs/distribution.md`).
+Every binary bundle must carry `LICENSE-MIT`, `LICENSE-APACHE`,
+`THIRD-PARTY.md`, and `LICENSES/` — the dist `include` list
+(`auto-includes = false`) copies exactly that set, plus `README.md`,
+into every app's release archive, so the requirement is already met.
+No archive ships `assets/taisan-hero.jpg`, so `assets/LICENSE.md` is
+not required in the bundles.

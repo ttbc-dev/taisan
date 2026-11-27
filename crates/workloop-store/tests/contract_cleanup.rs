@@ -569,7 +569,7 @@ fn a_previous_format_store_missing_reclaim_tables_is_upgraded_in_place() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 15, "the upgrade lands on the current format");
+        assert_eq!(version, 16, "the upgrade lands on the current format");
     }
     drop(store);
     // A stamp-4 file (the worker-request-export format, reclaim tables
@@ -589,7 +589,7 @@ fn a_previous_format_store_missing_reclaim_tables_is_upgraded_in_place() {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            version, 15,
+            version, 16,
             "the stamp-4 upgrade lands on the current format"
         );
     }

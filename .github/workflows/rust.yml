@@ -5,6 +5,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -12,15 +15,18 @@ jobs:
   checks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Evidence records cite non-head slice revisions; the doc tests
           # resolve them via `git cat-file`, which a depth-1 checkout cannot.
           fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
+          # The input defaults to `stable`; pass it explicitly so the
+          # toolchain selection survives the SHA pin unambiguously.
+          toolchain: stable
           components: rustfmt, clippy
 
       # The runner image ships toolchains this job never uses; the
@@ -32,7 +38,7 @@ jobs:
           df -h /
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry

@@ -1871,6 +1871,20 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 }
             }
         }
+        // The contained-verification credential mask: a `file:`
+        // credential source stays readable inside the verification
+        // sandbox wherever a covered bind carries it unless the mount
+        // plans shadow it — the same source `contained_exec` masks for
+        // launches. Resolved once per pass (only when a verification
+        // sandbox is configured); a boundary refusal fails the
+        // verification closed — recorded `Inconclusive` — rather than
+        // masking nothing.
+        let credential_source = if layout.verification.is_some() {
+            self.boundary_grant()
+                .map(|grant| grant.and_then(|grant| grant.credential_source))
+        } else {
+            Ok(None)
+        };
         for (artifact_id, seed, bound) in seeds {
             if deadline_reached(clock, deadline) {
                 break;
@@ -1878,7 +1892,15 @@ impl<P: ProcessControlPort> Supervisor<P> {
             // A charged transport retry is not an error to the sweep —
             // but a store or filesystem failure must surface, never be
             // counted as a successful pass.
-            match crate::handoff::drive(store, layout, &artifact_id, &seed, bound, clock) {
+            match crate::handoff::drive(
+                store,
+                layout,
+                &artifact_id,
+                &seed,
+                bound,
+                &credential_source,
+                clock,
+            ) {
                 Ok(handoff_row) => {
                     self.record_claim_check(
                         store,
@@ -5080,24 +5102,27 @@ impl<P: ProcessControlPort> Supervisor<P> {
             }
             // Recover from workspace + checkpoints + worker-runtime store.
             let workspace = self.workspace_of(&execution.work_id);
-            let mut recovered: Vec<(RequiredArtifact, PathBuf)> = Vec::new();
+            let mut recovered: Vec<(RequiredArtifact, String, PathBuf)> = Vec::new();
             for invocation in store.transact(|tx| tx.invocations_for_execution(&execution.id))? {
                 for required in &invocation.required_artifacts {
-                    if let Some(dir) = find_artifact(&workspace, &required.path) {
-                        recovered.push((required.clone(), dir));
+                    // A declared path has an fs effect only as its
+                    // normalized porcelain name — a declaration that
+                    // cannot normalize names nothing inside the
+                    // workspace.
+                    let Some(name) = crate::workspace::declared_porcelain_path(&required.path)
+                    else {
+                        continue;
+                    };
+                    if let Some(dir) = find_artifact(&workspace, &name) {
+                        recovered.push((required.clone(), name, dir));
                     }
                 }
             }
-            // Record the attempt durably, then report any found artifacts.
-            let mut next = execution.clone();
-            next.recovery_attempts_used += 1;
-            store.transact(|tx| {
-                tx.apply(&Effect::UpdateExecution {
-                    execution: next,
-                    expected_state: execution.state.clone(),
-                })?;
-                Ok(())
-            })?;
+            // Promote and evaluate every recovered artifact first: the
+            // facts a pass can report decide whether the pass consumed
+            // the bounded-recovery policy at all.
+            let mut reports: Vec<(InvocationRequest, InvocationId, String, ArtifactFact)> =
+                Vec::new();
             for invocation in store.transact(|tx| tx.invocations_for_execution(&execution.id))? {
                 let request = match store.transact(|tx| tx.request(&invocation.request_id))? {
                     Some(r) => r,
@@ -5106,39 +5131,101 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 let v2_manifest = store
                     .transact(|tx| tx.worker_request_body(&invocation.request_id))?
                     .is_some();
-                for (required, dir) in &recovered {
-                    if invocation.required_artifacts.contains(required) {
-                        // Promote into the workspace root so downstream
-                        // evidence paths are uniform. A hit already in
-                        // the root needs no copy (copying a file onto
-                        // itself truncates it), and only a verified
-                        // artifact may be reported present.
-                        if dir != &workspace
-                            && std::fs::copy(
-                                dir.join(&required.path),
-                                workspace.join(&required.path),
-                            )
-                            .is_err()
-                        {
-                            continue;
-                        }
-                        let digest =
-                            match artifact_fact(&workspace, required, &invocation, v2_manifest) {
-                                ArtifactFact::Present { digest } => digest,
-                                _ => continue,
-                            };
-                        self.report(
-                            store,
-                            &request,
-                            ObservationFact::Artifact {
-                                invocation_id: invocation.id.clone(),
-                                required_artifact: required.kind.clone(),
-                                state: ArtifactFact::Present { digest },
-                            },
-                            _now_unix_seconds,
-                        )?;
+                for (required, name, dir) in &recovered {
+                    if !invocation.required_artifacts.contains(required) {
+                        continue;
                     }
+                    // Promote into the workspace root so downstream
+                    // evidence paths are uniform. A hit already in
+                    // the root needs no copy (copying a file onto
+                    // itself truncates it), and a symlinked slot is
+                    // never written through — the fact evaluation
+                    // below reports it on its own. The walk covers
+                    // every component of the workspace-relative path,
+                    // not only the leaf: under a nested declared name
+                    // a symlinked ancestor resolves `dest` outside the
+                    // workspace just as a leaf link does.
+                    let dest = workspace.join(name);
+                    if dir != &workspace
+                        && !path_has_symlink_component(&workspace, Path::new(name))
+                        && std::fs::copy(dir.join(name), &dest).is_err()
+                    {
+                        continue;
+                    }
+                    // Every fact the evidence path can act on is
+                    // reported, not only `Present`: a structural
+                    // `Unfulfillable` lets Core settle the collision
+                    // instead of charging the bounded-recovery bound
+                    // for a slot that can never hold the bound
+                    // manifest. Thinner states stay unreported —
+                    // recovery is still in flight for them.
+                    let state = match artifact_fact(&workspace, required, &invocation, v2_manifest)
+                    {
+                        fact @ (ArtifactFact::Present { .. }
+                        | ArtifactFact::Unfulfillable { .. }) => fact,
+                        _ => continue,
+                    };
+                    reports.push((
+                        request.clone(),
+                        invocation.id.clone(),
+                        required.kind.clone(),
+                        state,
+                    ));
                 }
+            }
+            // The bound prices recoverable absence: a pass that can
+            // only report structural refusals is decided, not
+            // recovering, so its reports land before the attempt
+            // record — whether the pass consumed the policy is settled
+            // by where the refusal leaves the Execution. Every other
+            // pass is the bounded work the policy prices; its attempt
+            // is durable before its reports.
+            let only_refusals = !reports.is_empty()
+                && reports
+                    .iter()
+                    .all(|(.., state)| matches!(state, ArtifactFact::Unfulfillable { .. }));
+            if !only_refusals {
+                let mut next = execution.clone();
+                next.recovery_attempts_used += 1;
+                store.transact(|tx| {
+                    tx.apply(&Effect::UpdateExecution {
+                        execution: next,
+                        expected_state: execution.state.clone(),
+                    })?;
+                    Ok(())
+                })?;
+            }
+            for (request, invocation_id, required_artifact, state) in reports {
+                self.report(
+                    store,
+                    &request,
+                    ObservationFact::Artifact {
+                        invocation_id,
+                        required_artifact,
+                        state,
+                    },
+                    _now_unix_seconds,
+                )?;
+            }
+            if only_refusals
+                && let Some(after) = store.transact(|tx| tx.execution(&execution.id))?
+                && after.state == ExecutionState::Waiting
+                && after.waiting_reason == Some(WaitingReason::ArtifactRecovery)
+            {
+                // A refusal that left the Execution on the lane —
+                // recorded under a superseded Invocation, or any
+                // settle that could not decide — is in-flight
+                // recovery like any other: charge the attempt once
+                // the reports prove the pass did not end the wait.
+                let mut next = after.clone();
+                next.recovery_attempts_used += 1;
+                store.transact(|tx| {
+                    tx.apply(&Effect::UpdateExecution {
+                        execution: next,
+                        expected_state: after.state.clone(),
+                    })?;
+                    Ok(())
+                })?;
             }
         }
         Ok(())
@@ -5366,15 +5453,56 @@ fn find_artifact(workspace: &Path, name: &str) -> Option<PathBuf> {
         workspace.join(".artifact-store"),
     ] {
         let candidate = dir.join(name);
-        if candidate.is_file()
-            && std::fs::metadata(&candidate)
-                .map(|m| m.len() > 0)
-                .unwrap_or(false)
+        let Ok(rel) = candidate.strip_prefix(workspace) else {
+            continue;
+        };
+        // symlink_metadata, never metadata: a link's target may live
+        // outside the workspace, and a found artifact is promoted —
+        // following it would read content the declaration never
+        // named. The rule covers every component, not only the leaf:
+        // a nested declared path like `out/report.json` resolves
+        // through `out/`, and the store directory itself is a
+        // component — a link planted at either re-roots the candidate
+        // onto host files. Only a non-empty regular file counts.
+        if path_has_symlink_component(workspace, rel) {
+            continue;
+        }
+        if std::fs::symlink_metadata(&candidate)
+            .map(|m| m.is_file() && m.len() > 0)
+            .unwrap_or(false)
         {
             return Some(dir);
         }
     }
     None
+}
+
+/// Whether any component of the workspace-relative `rel_path` is a
+/// symlink — the leaf itself or any ancestor directory it resolves
+/// through. A leaf-only `symlink_metadata` still follows every
+/// ancestor: under a nested declared path a workspace directory
+/// planted as a link re-roots the path outside the workspace, where a
+/// read picks up host files as evidence and a promotion copy would
+/// write through the link. A component that is missing or not a
+/// directory is a thinner state, not a link — the caller's own leaf
+/// probe reports it.
+fn path_has_symlink_component(root: &Path, rel_path: &Path) -> bool {
+    let mut current = root.to_path_buf();
+    let mut components = rel_path.components().peekable();
+    while let Some(component) = components.next() {
+        current.push(component);
+        let Ok(meta) = std::fs::symlink_metadata(&current) else {
+            return false;
+        };
+        if meta.file_type().is_symlink() {
+            return true;
+        }
+        // Only a real directory can carry the remaining components.
+        if components.peek().is_some() && !meta.is_dir() {
+            return false;
+        }
+    }
+    false
 }
 
 /// Whether the bytes at a required-artifact path are the v2 handoff
@@ -5418,14 +5546,70 @@ fn manifest_binding(bytes: &[u8], invocation: &Invocation) -> ManifestBinding {
 /// `v2_manifest` marks an invocation whose dispatch recorded a
 /// durable v2 request body; only then does the `artifact.json` path
 /// require the manifest contract — a v1 artifact stays opaque.
+///
+/// A tracked `artifact.json` is one exception to that degradation,
+/// but only while the slot holds provable bytes: a present tracked
+/// file that is not the bound manifest is repository content the
+/// shim never rewrites, so under a v2 dispatch it can never become
+/// `Present` and is reported `Unfulfillable` — Core fails the
+/// request at once instead of spending the artifact-recovery budget.
+/// An absent or empty worktree entry is different: nothing at the
+/// slot proves different bytes, and `.checkpoints/`/`.artifact-store`
+/// may still hold the bound manifest recovery promotes into the
+/// root, so it stays `missing` on the recovery path.
 fn artifact_fact(
     workspace: &Path,
     required: &RequiredArtifact,
     invocation: &Invocation,
     v2_manifest: bool,
 ) -> ArtifactFact {
-    let candidate = workspace.join(&required.path);
-    if !candidate.is_file() {
+    // A declared path earns an fs effect only as its normalized
+    // porcelain name: `.` and `//` fold to the same in-tree spelling
+    // the index reports, and a declaration that cannot normalize to a
+    // workspace-relative path — absolute, prefixed, or
+    // parent-traversing — names nothing inside the workspace and is
+    // never evidence.
+    let Some(declared) = crate::workspace::declared_porcelain_path(&required.path) else {
+        return ArtifactFact::Missing;
+    };
+    let candidate = workspace.join(&declared);
+    // The slot test reads the same normalized name: `./artifact.json`
+    // is the slot the shim refuses to rewrite, never a separate path.
+    let artifact_slot = v2_manifest && declared == "artifact.json";
+    // Absence is never a collision — an empty slot holds no provable
+    // bytes, and an unreadable entry proves nothing either. Only a
+    // present tracked file whose bytes are not the bound manifest is
+    // `Unfulfillable`; every thinner state stays `missing` so bounded
+    // recovery can promote a store copy into the root.
+    let tracked = artifact_slot && artifact_path_tracked(workspace, &declared);
+    let unfulfillable = || ArtifactFact::Unfulfillable {
+        reason: format!(
+            "workspace-root {} is tracked repository content; the worker shim \
+             never rewrites it, so it cannot be this invocation's bound \
+             handoff manifest",
+            required.path
+        ),
+    };
+    // A symlink anywhere on the workspace-relative path is never
+    // artifact bytes — the leaf itself or an ancestor directory a
+    // nested declared path resolves through: the link's target may
+    // live outside the workspace, so following it reads content the
+    // declaration never named, and a promotion copy would write
+    // through it. A tracked symlink at the slot is still repository
+    // content the shim never rewrites, so it is the same structural
+    // `Unfulfillable`; an untracked one is a thinner state recovery
+    // may replace.
+    if path_has_symlink_component(workspace, Path::new(&declared)) {
+        return if tracked {
+            unfulfillable()
+        } else {
+            ArtifactFact::Missing
+        };
+    }
+    let Ok(meta) = std::fs::symlink_metadata(&candidate) else {
+        return ArtifactFact::Missing;
+    };
+    if !meta.is_file() {
         return ArtifactFact::Missing;
     }
     let Ok(bytes) = std::fs::read(&candidate) else {
@@ -5434,14 +5618,19 @@ fn artifact_fact(
     if bytes.is_empty() {
         return ArtifactFact::Missing;
     }
-    match manifest_binding(&bytes, invocation) {
-        ManifestBinding::Foreign => return ArtifactFact::Missing,
-        ManifestBinding::Opaque
-            if v2_manifest && Path::new(&required.path) == Path::new("artifact.json") =>
-        {
-            return ArtifactFact::Missing;
+    let binding = manifest_binding(&bytes, invocation);
+    if artifact_slot {
+        if !matches!(binding, ManifestBinding::Bound) {
+            // An untracked stale or malformed file is output recovery
+            // may still replace; only the tracked collision is final.
+            return if tracked {
+                unfulfillable()
+            } else {
+                ArtifactFact::Missing
+            };
         }
-        _ => {}
+    } else if matches!(binding, ManifestBinding::Foreign) {
+        return ArtifactFact::Missing;
     }
     let digest = sha256_hex("artifact-v1", &bytes);
     // A present artifact must carry its exact payload digest; an
@@ -5457,6 +5646,19 @@ fn artifact_fact(
             reason: Some("payload digest does not match the declared expectation".into()),
         }
     }
+}
+
+/// Whether the workspace repository tracks `path` — staged or
+/// committed. Outside a git repository nothing is tracked. A tracked
+/// path is repository content the shim's manifest write path refuses
+/// to rewrite; it is not stale manifest debris. The probe runs
+/// through `workspace::git`'s scrubbed environment — the same
+/// hardened settings workspace preparation uses — so an ambient
+/// `GIT_DIR`, planted config, or transport override can never
+/// redirect the answer; `--error-unmatch` exits nonzero unless the
+/// workspace's own index tracks `path`.
+fn artifact_path_tracked(workspace: &Path, path: &str) -> bool {
+    crate::workspace::git(workspace, &["ls-files", "--error-unmatch", "--", path]).is_ok()
 }
 
 /// Recursively copy `source` into `dest` for the invariant check's
@@ -5806,6 +6008,499 @@ mod tests {
             artifact_fact(&dir, &wrong, &invocation, false),
             ArtifactFact::Corrupt { .. }
         ));
+    }
+
+    /// A tracked `artifact.json` is repository content the shim never
+    /// rewrites: under a v2 dispatch an untracked stale or opaque file
+    /// stays `missing` for recovery, and a *present* tracked file that
+    /// is not the bound manifest is a structural `Unfulfillable`. An
+    /// absent or empty worktree entry is only recoverable absence —
+    /// `.artifact-store` may still hold the bound copy — so it stays
+    /// `missing` too. A bound manifest is `Present` whatever the
+    /// index says, and the untracked rule returns once the path
+    /// leaves the index.
+    #[test]
+    fn a_tracked_artifact_json_is_unfulfillable_under_a_v2_dispatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "artifact-tracked-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        let invocation = Invocation {
+            id: InvocationId("inv-tracked".into()),
+            request_id: "req-tracked".into(),
+            execution_id: ExecutionId("e-tracked".into()),
+            role: InvocationRole::Coding,
+            state: InvocationState::Done,
+            process_identity: None,
+            required_artifacts: vec![],
+            evidence_refs: vec![],
+            descendants: vec![],
+        };
+        let required = RequiredArtifact {
+            kind: "artifact.json".into(),
+            path: "artifact.json".into(),
+            expected_digest: None,
+        };
+        let write = |body: &str| {
+            std::fs::write(dir.join("artifact.json"), body).unwrap();
+        };
+
+        // Tracked opaque content is repository content that can never
+        // be the bound manifest: a decisive, non-recoverable refusal.
+        write("tracked repository content");
+        git(&["add", "artifact.json"]);
+        git(&["commit", "-qm", "track artifact.json"]);
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, true),
+            ArtifactFact::Unfulfillable { .. }
+        ));
+        // An absent worktree entry is not a collision: nothing at the
+        // slot proves different bytes, and the artifact store may
+        // still hold this invocation's bound manifest for recovery to
+        // promote — the case stays `missing` on the recovery path.
+        std::fs::remove_file(dir.join("artifact.json")).unwrap();
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, true),
+            ArtifactFact::Missing
+        ));
+        // The promotion `run_recovery` performs: a bound copy in
+        // `.artifact-store` restores the root entry and reads
+        // `Present` — the tracked index never blocked it.
+        let store_dir = dir.join(".artifact-store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::fs::write(
+            store_dir.join("artifact.json"),
+            serde_json::json!({
+                "format_version": "taisan.worker.artifact/1",
+                "request_id": "req-tracked",
+                "invocation_id": "inv-tracked",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let found = find_artifact(&dir, "artifact.json").expect("store copy found");
+        assert_eq!(found, store_dir);
+        std::fs::copy(store_dir.join("artifact.json"), dir.join("artifact.json")).unwrap();
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, true),
+            ArtifactFact::Present { .. }
+        ));
+        // An empty tracked entry holds no provable bytes either —
+        // the same recoverable absence, never `Unfulfillable`.
+        std::fs::write(dir.join("artifact.json"), "").unwrap();
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, true),
+            ArtifactFact::Missing
+        ));
+
+        // A tracked manifest naming another producer is the same
+        // collision, not the ordinary stale-manifest `missing`.
+        write(
+            &serde_json::json!({
+                "format_version": "taisan.worker.artifact/1",
+                "request_id": "req-other",
+                "invocation_id": "inv-other",
+            })
+            .to_string(),
+        );
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, true),
+            ArtifactFact::Unfulfillable { .. }
+        ));
+
+        // A manifest bound to this invocation is evidence regardless of
+        // the index.
+        write(
+            &serde_json::json!({
+                "format_version": "taisan.worker.artifact/1",
+                "request_id": "req-tracked",
+                "invocation_id": "inv-tracked",
+            })
+            .to_string(),
+        );
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, true),
+            ArtifactFact::Present { .. }
+        ));
+
+        // Untracked stale manifests keep the #413 recovery rule: the
+        // shim may sweep them, so they stay `missing`, never
+        // `Unfulfillable`.
+        git(&["rm", "--cached", "-q", "artifact.json"]);
+        write(
+            &serde_json::json!({
+                "format_version": "taisan.worker.artifact/1",
+                "request_id": "req-other",
+                "invocation_id": "inv-other",
+            })
+            .to_string(),
+        );
+        assert!(matches!(
+            artifact_fact(&dir, &required, &invocation, true),
+            ArtifactFact::Missing
+        ));
+    }
+
+    /// The slot is the normalized name, never the raw spelling: a
+    /// `./artifact.json` declaration names the same tracked slot the
+    /// shim refuses to rewrite, so the collision rule applies to it
+    /// identically. A declaration that cannot normalize to a
+    /// workspace-relative path — absolute or parent-traversing —
+    /// produces no fs effect at all: a file planted at the resolved
+    /// outside location is never read, and the evidence is `missing`.
+    #[test]
+    fn the_slot_test_reads_the_normalized_declared_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "artifact-normalized-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&ws)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        let invocation = Invocation {
+            id: InvocationId("inv-normalized".into()),
+            request_id: "req-normalized".into(),
+            execution_id: ExecutionId("e-normalized".into()),
+            role: InvocationRole::Coding,
+            state: InvocationState::Done,
+            process_identity: None,
+            required_artifacts: vec![],
+            evidence_refs: vec![],
+            descendants: vec![],
+        };
+        // The tracked collision under a `.`-prefixed spelling of the
+        // slot: the normalized name is the same `artifact.json`, so the
+        // tracked repository content is `Unfulfillable`, never
+        // `Present` — a raw `Path` equality would have missed it.
+        std::fs::write(ws.join("artifact.json"), "tracked repository content").unwrap();
+        git(&["add", "artifact.json"]);
+        git(&["commit", "-qm", "track artifact.json"]);
+        let dotted = RequiredArtifact {
+            kind: "artifact.json".into(),
+            path: "./artifact.json".into(),
+            expected_digest: None,
+        };
+        assert!(matches!(
+            artifact_fact(&ws, &dotted, &invocation, true),
+            ArtifactFact::Unfulfillable { .. }
+        ));
+        // The same normalization under the v1 rule reads the identical
+        // file — `./` is a spelling, not a different path.
+        assert!(matches!(
+            artifact_fact(&ws, &dotted, &invocation, false),
+            ArtifactFact::Present { .. }
+        ));
+        // A parent-traversing or absolute declaration names nothing
+        // inside the workspace: the planted outside file is never
+        // read, so it can never surface as artifact evidence.
+        std::fs::write(dir.join("artifact.json"), "outside the workspace").unwrap();
+        let traversal = RequiredArtifact {
+            kind: "artifact.json".into(),
+            path: "../artifact.json".into(),
+            expected_digest: None,
+        };
+        assert!(matches!(
+            artifact_fact(&ws, &traversal, &invocation, true),
+            ArtifactFact::Missing
+        ));
+        assert!(matches!(
+            artifact_fact(&ws, &traversal, &invocation, false),
+            ArtifactFact::Missing
+        ));
+        let absolute = RequiredArtifact {
+            kind: "artifact.json".into(),
+            path: dir.join("artifact.json").to_string_lossy().into_owned(),
+            expected_digest: None,
+        };
+        assert!(matches!(
+            artifact_fact(&ws, &absolute, &invocation, true),
+            ArtifactFact::Missing
+        ));
+        assert!(matches!(
+            artifact_fact(&ws, &absolute, &invocation, false),
+            ArtifactFact::Missing
+        ));
+        // A `..`-containing declaration that would resolve back into
+        // the workspace still names nothing: porcelain can never
+        // report it, so even though `a/../artifact.json` exists as an
+        // fs path it is never the slot and never evidence.
+        std::fs::create_dir_all(ws.join("a")).unwrap();
+        let nested = RequiredArtifact {
+            kind: "artifact.json".into(),
+            path: "a/../artifact.json".into(),
+            expected_digest: None,
+        };
+        assert!(matches!(
+            artifact_fact(&ws, &nested, &invocation, true),
+            ArtifactFact::Missing
+        ));
+        assert!(matches!(
+            artifact_fact(&ws, &nested, &invocation, false),
+            ArtifactFact::Missing
+        ));
+        // A symlink at the slot is never followed: while the path is
+        // still tracked the link is repository content the shim never
+        // rewrites — `Unfulfillable`, with the target never read —
+        // and untracked it is a thinner `missing` recovery may
+        // replace. Neither spelling reads the outside file.
+        std::fs::remove_file(ws.join("artifact.json")).unwrap();
+        std::os::unix::fs::symlink(dir.join("artifact.json"), ws.join("artifact.json")).unwrap();
+        let symlinked = RequiredArtifact {
+            kind: "artifact.json".into(),
+            path: "artifact.json".into(),
+            expected_digest: None,
+        };
+        assert!(matches!(
+            artifact_fact(&ws, &symlinked, &invocation, true),
+            ArtifactFact::Unfulfillable { .. }
+        ));
+        git(&["rm", "--cached", "-q", "artifact.json"]);
+        assert!(matches!(
+            artifact_fact(&ws, &symlinked, &invocation, true),
+            ArtifactFact::Missing
+        ));
+        assert!(matches!(
+            artifact_fact(&ws, &symlinked, &invocation, false),
+            ArtifactFact::Missing
+        ));
+        // The recovery scan applies the same no-follow rule: a
+        // symlinked store entry is never a promotion source.
+        let store_dir = ws.join(".artifact-store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        std::os::unix::fs::symlink(dir.join("artifact.json"), store_dir.join("artifact.json"))
+            .unwrap();
+        std::fs::remove_file(ws.join("artifact.json")).unwrap();
+        assert!(find_artifact(&ws, "artifact.json").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A symlinked ancestor resolves outside the workspace exactly
+    /// like a symlinked leaf: under a nested declared path such as
+    /// `out/report.json`, a workspace `out/` planted as a link
+    /// re-roots the slot onto host files — a leaf-only check would
+    /// lstat through the link and read them as evidence. The
+    /// component-wise walk refuses the read on either dispatch rule,
+    /// and the recovery scan never finds or promotes through a link
+    /// at any component — not the declared ancestor, not the leaf,
+    /// not the store directory's own nested ancestor.
+    #[test]
+    fn a_symlinked_ancestor_is_never_read_or_written_through() {
+        let dir = std::env::temp_dir().join(format!(
+            "artifact-ancestor-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ws = dir.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("report.json"), "host bytes, never evidence").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("out")).unwrap();
+        let invocation = Invocation {
+            id: InvocationId("inv-ancestor".into()),
+            request_id: "req-ancestor".into(),
+            execution_id: ExecutionId("e-ancestor".into()),
+            role: InvocationRole::Coding,
+            state: InvocationState::Done,
+            process_identity: None,
+            required_artifacts: vec![],
+            evidence_refs: vec![],
+            descendants: vec![],
+        };
+        let nested = RequiredArtifact {
+            kind: "report".into(),
+            path: "out/report.json".into(),
+            expected_digest: None,
+        };
+        // `out/` is the link: the whole path refuses under either
+        // dispatch rule even though `outside/report.json` is a
+        // readable regular file.
+        assert!(path_has_symlink_component(
+            &ws,
+            Path::new("out/report.json")
+        ));
+        assert!(matches!(
+            artifact_fact(&ws, &nested, &invocation, true),
+            ArtifactFact::Missing
+        ));
+        assert!(matches!(
+            artifact_fact(&ws, &nested, &invocation, false),
+            ArtifactFact::Missing
+        ));
+        // A leaf link under a real directory refuses identically.
+        std::fs::create_dir_all(ws.join("real")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.join("report.json"),
+            ws.join("real").join("report.json"),
+        )
+        .unwrap();
+        let leaf_link = RequiredArtifact {
+            path: "real/report.json".into(),
+            ..nested.clone()
+        };
+        assert!(matches!(
+            artifact_fact(&ws, &leaf_link, &invocation, false),
+            ArtifactFact::Missing
+        ));
+        // The recovery scan walks the same components: the workspace
+        // hit through `out/` is never returned, while a real store
+        // copy under a clean nested path is still a promotion
+        // candidate — and a symlinked store-side ancestor is not.
+        let store_out = ws.join(".artifact-store").join("out");
+        std::fs::create_dir_all(&store_out).unwrap();
+        std::fs::write(store_out.join("report.json"), "store copy").unwrap();
+        assert!(!path_has_symlink_component(
+            &ws,
+            Path::new(".artifact-store/out/report.json")
+        ));
+        assert_eq!(
+            find_artifact(&ws, "out/report.json"),
+            Some(ws.join(".artifact-store"))
+        );
+        let linked_store = ws.join(".artifact-store").join("linked");
+        std::os::unix::fs::symlink(&outside, &linked_store).unwrap();
+        assert!(find_artifact(&ws, "linked/report.json").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The tracked-path probe reads the workspace's own index under
+    /// the same scrubbed environment every supervisor-side git call
+    /// uses: ambient `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`
+    /// pointing at a different repository can never redirect the
+    /// `ls-files` answer. The harness re-executes this one test in a
+    /// poisoned child process so the hostile variables never touch
+    /// this binary's other tests.
+    #[test]
+    fn artifact_path_probe_ignores_a_poisoned_ambient_git_env() {
+        const POISON: &str = "TAISAN_TEST_GIT_ENV_POISON";
+        if std::env::var_os(POISON).is_none() {
+            // Parent leg: a decoy repository whose index does NOT
+            // track `artifact.json` — an unhardened probe running
+            // under the redirected env would answer "untracked".
+            let decoy = std::env::temp_dir().join(format!(
+                "artifact-probe-decoy-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&decoy).unwrap();
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&decoy)
+                .args(["init", "-b", "main"])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "artifact_path_probe_ignores_a_poisoned_ambient_git_env",
+                    "--exact",
+                    "--nocapture",
+                ])
+                .env(POISON, "1")
+                .env("GIT_DIR", decoy.join(".git"))
+                .env("GIT_WORK_TREE", &decoy)
+                .env("GIT_INDEX_FILE", decoy.join(".git").join("decoy-index"))
+                .status()
+                .unwrap();
+            assert!(status.success(), "the poisoned-env child run failed");
+            return;
+        }
+        // Child leg: the ambient env redirects git at the decoy. Setup
+        // commands drop the poison explicitly — the probe under test
+        // is the surface that must ignore it on its own.
+        let dir = std::env::temp_dir().join(format!(
+            "artifact-probe-poisoned-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("artifact.json"), "tracked repository content").unwrap();
+        git(&["add", "artifact.json"]);
+        git(&["commit", "-qm", "track artifact.json"]);
+
+        assert!(
+            artifact_path_tracked(&dir, "artifact.json"),
+            "the probe answers from the workspace index, not GIT_DIR"
+        );
+        let invocation = Invocation {
+            id: InvocationId("inv-poisoned".into()),
+            request_id: "req-poisoned".into(),
+            execution_id: ExecutionId("e-poisoned".into()),
+            role: InvocationRole::Coding,
+            state: InvocationState::Done,
+            process_identity: None,
+            required_artifacts: vec![],
+            evidence_refs: vec![],
+            descendants: vec![],
+        };
+        let required = RequiredArtifact {
+            kind: "artifact.json".into(),
+            path: "artifact.json".into(),
+            expected_digest: None,
+        };
+        assert!(
+            matches!(
+                artifact_fact(&dir, &required, &invocation, true),
+                ArtifactFact::Unfulfillable { .. }
+            ),
+            "a poisoned probe would read a recoverable `missing`, not the collision"
+        );
     }
 
     struct SnapshotFailure;

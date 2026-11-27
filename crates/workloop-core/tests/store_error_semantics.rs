@@ -330,6 +330,16 @@ impl TxView for FailingTx<'_> {
     fn alloc_seq(&mut self) -> Result<EventSequence, StoreError> {
         Ok(1)
     }
+    fn next_counter(&mut self, _name: &str) -> Result<i64, StoreError> {
+        Ok(1)
+    }
+    fn write_merge_check_services(
+        &mut self,
+        _work_id: &WorkId,
+        _services: &[MergeCheckService],
+    ) -> Result<(), StoreError> {
+        Err(self.fail.clone())
+    }
     fn alloc_id(&mut self, prefix: &str) -> Result<String, StoreError> {
         Ok(format!("{prefix}-1"))
     }

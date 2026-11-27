@@ -1,6 +1,6 @@
 ---
 name: taisan
-description: Operate the taisan CLI (execution loop) for an agentic workflow — submit Work, inspect recorded state and Attention, intervene on eligible Executions, judge review findings, and recover lost command responses. Install with `npx skills add shimpeiws/taisan`.
+description: Operate the taisan CLI (execution loop) for an agentic workflow — submit Work, inspect recorded state and Attention, intervene on eligible Executions, judge review findings, and recover lost command responses. Install with `npx skills add ttbc-dev/taisan`.
 ---
 
 # taisan — run the execution loop through the CLI

@@ -564,6 +564,16 @@ fn publish_with(
     }
 }
 
+/// Read the installation config at `path` without creating it:
+/// `Ok(None)` when the name is absent, `Err` when a present file is
+/// foreign (empty or malformed — the same refusal `read` documents).
+/// Read-only consumers that must never auto-create the record — like
+/// `check`'s verification boundary-path inspection (#469) — use this
+/// rather than [`load_or_create`].
+pub fn load_existing(path: &Path) -> Result<Option<Installation>, String> {
+    read(path)
+}
+
 /// Read the installation config, creating it with a fresh stable actor
 /// id on first use. Creation is publish-by-link: the complete content
 /// is written to a scratch file and then atomically hard-linked into

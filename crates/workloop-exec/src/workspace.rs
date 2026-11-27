@@ -8,7 +8,7 @@ use workloop_core::domain::*;
 use workloop_core::identity::RepositoryRef;
 use workloop_core::ports::WorkerEnv;
 use workloop_core::store::{Store, StoreError, TxView};
-use workloop_core::worker_v2::{TaskBody, WorkerRequestV2};
+use workloop_core::worker_v2::{FixOrigin, TaskBody, WorkerRequestV2};
 
 use crate::bounded::{self, ExchangeBounds, ExchangeError};
 use crate::handoff::{self, HandoffLayout};
@@ -587,7 +587,7 @@ pub(crate) fn verify_git_dir_safe(git_dir: &Path) -> Result<(), PreparationError
 /// reports the same canonical name), while an absolute or
 /// parent-traversing declaration produces `None`: a path porcelain can
 /// never report inside the repo is never tolerated.
-fn declared_porcelain_path(path: &str) -> Option<String> {
+pub(crate) fn declared_porcelain_path(path: &str) -> Option<String> {
     let mut parts = Vec::new();
     for component in Path::new(path).components() {
         match component {
@@ -689,6 +689,10 @@ struct Gate {
     base: String,
     head: String,
     predecessor: Option<(String, PathBuf)>,
+    /// A conflict-repair Fix binds the post-merge target revision the
+    /// worker must merge; it exists only in the configured source
+    /// repo, never in the handoff bare.
+    conflict_target: Option<String>,
     /// The required-artifact set the durable Invocation declared at
     /// consume time — the same record the artifact-evidence path
     /// digests, so the names `verify_existing` tolerates have exactly
@@ -832,9 +836,13 @@ fn gates(
             });
         }
     }
-    let (head, predecessor) = match &request.task {
-        TaskBody::Coding { .. } => (request.base.object.clone(), None),
-        TaskBody::Fix { predecessor, .. } => {
+    let (head, predecessor, conflict_target) = match &request.task {
+        TaskBody::Coding { .. } => (request.base.object.clone(), None, None),
+        TaskBody::Fix {
+            predecessor,
+            origin,
+            ..
+        } => {
             let layout = handoff.ok_or_else(|| PreparationError::InvalidPredecessor {
                 detail: "no handoff layout is configured".into(),
             })?;
@@ -876,9 +884,23 @@ fn gates(
                     detail: "handoff base disagrees".into(),
                 });
             }
+            let conflict_target = match origin.as_ref() {
+                FixOrigin::Conflict {
+                    target_revision, ..
+                } => {
+                    if !is_hex_sha1(target_revision) {
+                        return Err(invalid(
+                            "conflict target is not a 40-lowerhex object id".into(),
+                        ));
+                    }
+                    Some(target_revision.clone())
+                }
+                _ => None,
+            };
             (
                 predecessor.produced.clone(),
                 Some((predecessor.artifact_id.clone(), layout.repository.clone())),
+                conflict_target,
             )
         }
         _ => {
@@ -903,6 +925,7 @@ fn gates(
         workspace_id,
         head,
         predecessor,
+        conflict_target,
         declared_artifacts,
     })
 }
@@ -947,6 +970,18 @@ fn validate_git_gate(gate: &Gate, source: &RepositorySource) -> Result<(), Prepa
                     detail: "produced does not descend from the request base".into(),
                 });
             }
+            if let Some(target) = &gate.conflict_target {
+                // The bound target is a raw source revision the worker
+                // must merge; a bound-but-absent revision would stage a
+                // workspace that can never resolve it, so refuse before
+                // any tree exists.
+                let object = git(&source.path, &["cat-file", "-t", target]).unwrap_or_default();
+                if object != "commit" {
+                    return Err(PreparationError::MissingBase {
+                        detail: "conflict target is not present in the source".into(),
+                    });
+                }
+            }
         }
     }
     Ok(())
@@ -960,6 +995,7 @@ fn same_gate(a: &Gate, b: &Gate) -> bool {
         && a.base == b.base
         && a.head == b.head
         && a.predecessor == b.predecessor
+        && a.conflict_target == b.conflict_target
         && a.declared_artifacts == b.declared_artifacts
 }
 
@@ -1005,12 +1041,45 @@ fn unique_staging(control: &Path, work_id: &str) -> PathBuf {
     ))
 }
 
+/// Import the bound conflict target into `repo_dir` from the
+/// configured source — the object exists only there, never in the
+/// handoff bare, and a remote-less workspace must resolve it to merge.
+/// The fresh-build and the workspace-reuse paths run the same import.
+fn import_conflict_target(
+    repo_dir: &Path,
+    source: &RepositorySource,
+    target: &str,
+) -> Result<(), PreparationError> {
+    let src = source.path.to_string_lossy().into_owned();
+    git(
+        repo_dir,
+        &[
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--",
+            &src,
+            &format!("+{target}"),
+        ],
+    )
+    .map_err(|_| PreparationError::MissingBase {
+        detail: "conflict target could not be imported".into(),
+    })?;
+    if git(repo_dir, &["cat-file", "-t", target])? != "commit" {
+        return Err(PreparationError::MissingBase {
+            detail: "conflict target is not present in the source".into(),
+        });
+    }
+    Ok(())
+}
+
 fn build_staging(
     staging: &Path,
     base: &str,
     head: &str,
     branch: &str,
     predecessor: &Option<(String, PathBuf)>,
+    conflict_target: Option<&str>,
     source: &RepositorySource,
 ) -> Result<(), PreparationError> {
     git(staging, &["init"])?;
@@ -1066,6 +1135,14 @@ fn build_staging(
                 return Err(PreparationError::InvalidPredecessor {
                     detail: "request base is not reachable from the predecessor".into(),
                 });
+            }
+            if let Some(target) = conflict_target {
+                // A conflict-repair Fix binds a post-merge target
+                // revision the worker must merge into the produced
+                // head; the handoff bare does not carry it, so import
+                // the raw object from the configured source repo the
+                // same way the Coding arm imports the base.
+                import_conflict_target(staging, source, target)?;
             }
         }
     }
@@ -1237,6 +1314,14 @@ fn prepare_locked(
                     },
                 )?;
             }
+            if let Some(target) = &gate.conflict_target {
+                // The reused tree pins the produced head but was built
+                // before this request bound the conflict target — the
+                // object the remote-less worker must merge. Import it
+                // from the configured source exactly as a fresh build
+                // does; the pin checks above already proved the tree.
+                import_conflict_target(&final_path, source, target)?;
+            }
             return Ok(PreparedWorkspace {
                 path: final_path,
                 branch: gate.branch,
@@ -1272,6 +1357,7 @@ fn prepare_locked(
             &gate.head,
             &gate.branch,
             &gate.predecessor,
+            gate.conflict_target.as_deref(),
             source,
         )?;
         verify_git_dir_safe(&staging.join(".git"))?;

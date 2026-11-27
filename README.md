@@ -4,7 +4,7 @@
 
 taisan is an adapter-based work orchestration loop for coordinating development work across GitHub repositories. A human chooses the work and supplies intent and constraints; taisan coordinates implementation, pull requests, review, bounded fixes, and the points where a human needs to intervene.
 
-**Status:** design plus a working implementation across the v0.1–v0.3 slices. The Rust workspace implements the core contracts, state store, execution supervisor, CLI, and TUI; the production GitHub host adapter runs in-process inside `taisan run` through the `gh` CLI transport; Workers launch through the executable `taisan.worker.request/2` / `taisan.worker.report/2` wire with declaration negotiation, immutable bound requests, filesystem/process/network containment, and reference-based credentials; intake runs the internal scheduler with a configuration-selected Selector. Contract and fixture evidence covers the wire, scheduling, recovery, and fail-closed boundaries; owner-run live acceptance of a real Worker and real host effects is still pending — see the [v0.3 installation and acceptance docs](docs/v0.3-installation.md). The agent-agnostic skill ships at `skills/taisan/SKILL.md` with a [walkthrough](docs/skill-walkthrough.md) covering setup, install, submit, inspect, Attention/decision, and recovery against fixtures. The CLI and CLI-backed agent skills are required for v0.1; the existing TUI is deferred from release requirements. See [provenance](docs/provenance.md) for what is built, what is fixture-only, and where the design came from.
+**Status:** design plus a working implementation across the v0.1–v0.3 slices. The Rust workspace implements the core contracts, state store, execution supervisor, CLI, and TUI; the production GitHub host adapter runs in-process inside `taisan run` through the `gh` CLI transport; Workers launch through the executable `taisan.worker.request/2` / `taisan.worker.report/2` wire with declaration negotiation, immutable bound requests, filesystem/process/network containment, and reference-based credentials; intake runs the internal scheduler with a configuration-selected Selector. Contract and fixture evidence covers the wire, scheduling, recovery, and fail-closed boundaries; owner-run live acceptance of a real Worker and real host effects is recorded in the [release acceptance record](docs/release-acceptance-v0.3.md) — the manual chain across runs 1–6 plus a scheduled-intake pilot on a clean install — with the release materials under [release notes](docs/release-notes-v0.3.md). The agent-agnostic skill ships at `skills/taisan/SKILL.md` with a [walkthrough](docs/skill-walkthrough.md) covering setup, install, submit, inspect, Attention/decision, and recovery against fixtures. The CLI and CLI-backed agent skills are required for v0.1; the existing TUI is deferred from release requirements. See [provenance](docs/provenance.md) for what is built, what is fixture-only, and where the design came from.
 
 ## Why build this?
 
@@ -49,10 +49,10 @@ The system can make routine implementation decisions within the supplied intent 
 
 ## Build and run
 
-Install Rust with support for edition 2024, then build from source. The v0.3 Worker path is documented in the [installation and operation guide](docs/v0.3-installation.md); live Worker and host acceptance remains owner-run.
+Install Rust with support for edition 2024, then build from source. A Linux install additionally needs `bwrap`, `git`, and a C toolchain; the `github` host transport needs the `gh` CLI, and the public reference Worker needs a Node.js runtime for `claude`. The public reference Selector/Worker install the same way per [public reference adapters](docs/reference-adapters.md). The v0.3 Worker path is documented in the [installation and operation guide](docs/v0.3-installation.md); live Worker and host acceptance is owner-run evidence — recorded in [release-acceptance-v0.3.md](docs/release-acceptance-v0.3.md) and the [filled manual-acceptance record](docs/evidence/v0.3-manual-acceptance.md).
 
 ```sh
-git clone https://github.com/shimpeiws/taisan.git
+git clone https://github.com/ttbc-dev/taisan.git
 cd taisan
 cargo build --workspace
 cargo run -p workloop-cli --bin taisan -- --help
@@ -64,7 +64,26 @@ To install the CLI from this checkout:
 cargo install --path crates/workloop-cli --bin taisan
 ```
 
-Install the agent skill from this checkout with `npx skills add ./skills/taisan` (or from the registry with `npx skills add shimpeiws/taisan`); the [skill walkthrough](docs/skill-walkthrough.md) documents setup, installation, invocation, and the direct-CLI fallback with captured output. See the [agent interface requirements](docs/agent-interface.md). The existing TUI remains available with `cargo run -p workloop-tui --bin taisan-tui -- --help` and can be installed with `cargo install --path crates/workloop-tui --bin taisan-tui`; it is not required for v0.1.
+Prebuilt binaries ship on GitHub Releases for x86_64 and aarch64
+Linux and macOS once a release is published (none exists yet — the
+first tag follows the release process in
+[docs/distribution.md](docs/distribution.md)). Three binary routes
+install the same archives:
+
+```sh
+# shell installer -> ~/.cargo/bin
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/ttbc-dev/taisan/releases/latest/download/workloop-cli-installer.sh | sh
+
+# Homebrew (owner's personal tap)
+brew install shimpeiws/tap/taisan
+
+# cargo-binstall (fetches the prebuilt archive, no compile;
+# --bin selects the shipped binary of the multi-bin package)
+cargo binstall --git https://github.com/ttbc-dev/taisan workloop-cli --bin taisan
+```
+
+Install the agent skill from this checkout with `npx skills add ./skills/taisan` (or from the registry with `npx skills add ttbc-dev/taisan`); the [skill walkthrough](docs/skill-walkthrough.md) documents setup, installation, invocation, and the direct-CLI fallback with captured output. See the [agent interface requirements](docs/agent-interface.md). The existing TUI remains available with `cargo run -p workloop-tui --bin taisan-tui -- --help` and can be installed with `cargo install --path crates/workloop-tui --bin taisan-tui`; it is not required for v0.1.
 
 The Cargo package names retain their existing names for compatibility. See [name migration](docs/name-migration.md) for legacy commands and state paths.
 
@@ -88,6 +107,7 @@ The Cargo package names retain their existing names for compatibility. See [name
 - [v0.3 installation and operation](docs/v0.3-installation.md) — clean install, the executable Worker wire, pinned delivery, operation with captured non-live output, cutover, drain, and rollback.
 - [v0.3 owner-run checklist](docs/v0.3-owner-acceptance-checklist.md) — real-Worker acceptance scenarios and expected results.
 - [v0.3 evidence template](docs/v0.3-evidence-template.md) — labeled fixture/contract versus owner-run live evidence for the real-Worker run.
+- [Binary distribution](docs/distribution.md) — the cargo-dist release pipeline, shipped packages, binary install routes, and owner-side release prerequisites.
 - [Decisions and open questions](docs/decisions.md) — assumptions to test before expanding the design.
 - [Provenance](docs/provenance.md) — source-system origins by role, implementation status, and the audit-record pointer.
 
@@ -101,7 +121,7 @@ v0.2 adds one configuration-selected Selector adapter, an internal intake schedu
 
 ## v0.3 direction
 
-v0.3 makes the Worker boundary executable: Workers launch through a versioned wire (`taisan.worker.declaration/1`, `taisan.worker.request/2`, `taisan.worker.report/2`) with immutable per-Invocation requests, declared capabilities, filesystem/process/network containment, and reference-based credentials — never secret values on argv, in requests, or in reports. Reports from Workers stay evidence, not authority: publication, verification, and completion remain Core- and host-adapter-gated. The [installation and operation guide](docs/v0.3-installation.md), [owner-run checklist](docs/v0.3-owner-acceptance-checklist.md), and [evidence template](docs/v0.3-evidence-template.md) prepare real-Worker acceptance without running it; the implementing documentation creates no live Issues, installs no credentials, enables no normal-installation automation, and executes no live models or host effects.
+v0.3 makes the Worker boundary executable: Workers launch through a versioned wire (`taisan.worker.declaration/1`, `taisan.worker.request/2`, `taisan.worker.report/2`) with immutable per-Invocation requests, declared capabilities, filesystem/process/network containment, and reference-based credentials — never secret values on argv, in requests, or in reports. Reports from Workers stay evidence, not authority: publication, verification, and completion remain Core- and host-adapter-gated. The [installation and operation guide](docs/v0.3-installation.md), [owner-run checklist](docs/v0.3-owner-acceptance-checklist.md), and [evidence template](docs/v0.3-evidence-template.md) prepared real-Worker acceptance — since executed and recorded as owner-run live evidence in the [release acceptance record](docs/release-acceptance-v0.3.md) and the [filled manual-acceptance record](docs/evidence/v0.3-manual-acceptance.md); the implementing documentation itself created no live Issues, installed no credentials, enabled no normal-installation automation, and executed no live models or host effects.
 
 ## Proposals
 
@@ -110,4 +130,10 @@ v0.3 makes the Worker boundary executable: Workers launch through a versioned wi
 
 ## License
 
-No license has been selected. Choose and add an open source license before distribution.
+Except where otherwise noted, this project is licensed under either
+the MIT License or the Apache License, Version 2.0, at your option.
+See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+
+The hero illustration at `assets/taisan-hero.jpg` is excluded from
+these licenses. See [assets/LICENSE.md](assets/LICENSE.md) for its
+usage terms.

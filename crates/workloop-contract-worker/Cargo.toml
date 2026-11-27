@@ -1,6 +1,16 @@
 [package]
 name = "workloop-contract-worker"
+version.workspace = true
 edition.workspace = true
+license.workspace = true
+
+# Test fixture, not release surface: `[workspace.metadata.dist].packages`
+# does not suppress cargo-dist's auto-detection of other binary crates —
+# a versioned crate outside the list still ships (verified with dist
+# 0.34.0). The #370 version freeze gives every crate a version, so pin
+# the exclusion here; see workloop-executor.
+[package.metadata.dist]
+dist = false
 
 [dependencies]
 serde_json = "1"
