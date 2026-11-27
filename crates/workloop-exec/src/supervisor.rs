@@ -107,6 +107,38 @@ pub(crate) fn normalize_lstart(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// `matching_processes`' equality — whitespace-normalized on both
+/// sides, with any token whose file name is a boundary staging shape
+/// (`runtime-auth`, the legacy `runtime-auth.<seq>`, the owner-tagged
+/// `runtime-auth.p<pid>.i<instance>.<seq>`, or its `.tmp` sibling)
+/// collapsed to one canonical basename. A contained launch's argv
+/// binds the grant's per-launch staged credential, and resolve
+/// rebuilds the signature from durable state where that exact name
+/// does not exist: `ensure` stages a fresh seq on every call, and a
+/// restarted supervisor stages under a new owner tag. The name is
+/// unreconstructable by design — a later grant must never rewrite a
+/// pending mount's path — so it cannot be a discriminating token in
+/// the comparison. Every other token — flags, bind destinations, all
+/// other paths — still compares literally, and a `runtime-auth*` name
+/// that is not one of these shapes (a purely numeric
+/// `runtime-auth.1.2.3` operator file) never normalizes.
+pub(crate) fn normalize_signature(s: &str) -> String {
+    s.split_whitespace()
+        .map(|token| {
+            let path = Path::new(token);
+            match path.file_name().and_then(|name| name.to_str()) {
+                Some(name) if crate::boundary::is_staging_name(name) => {
+                    let mut canonical = path.to_path_buf();
+                    canonical.set_file_name("runtime-auth.*");
+                    canonical.to_string_lossy().into_owned()
+                }
+                _ => token.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// One `ps` table row: `N` integer prefix fields followed by the
 /// locale-dependent lstart text. The tail is never field-counted — a
 /// localized `ps` renders different field text (e.g. ja_JP prints a CJK
@@ -875,7 +907,7 @@ impl ProcessControlPort for PosixProcessControl {
         // behind a false absence. The scan is system-wide, not limited
         // to this process's children: a supervisor restart reparents an
         // orphaned writer, and only the launch signature still finds it.
-        let expected = normalize_lstart(command);
+        let expected = normalize_signature(command);
         let table = ps_output(&["-ewwo", "pid=,command="])
             .map_err(|e| format!("process scan failed: {e}"))?;
         let mut out = Vec::new();
@@ -883,7 +915,7 @@ impl ProcessControlPort for PosixProcessControl {
             let Some(([pid], actual)) = parse_table_row::<1>(line)? else {
                 continue;
             };
-            if normalize_lstart(&actual) != expected {
+            if normalize_signature(&actual) != expected {
                 continue;
             }
             // Re-verify after the snapshot: a matched pid that already
@@ -3849,7 +3881,10 @@ impl<P: ProcessControlPort> Supervisor<P> {
             );
         };
         // The signature is the full command line the spawn actually
-        // exec'd, which is the bare argv only for v1. A v2 launch
+        // exec'd — compared through `normalize_signature`, so the one
+        // token resolve cannot rebuild (the grant's staged credential
+        // name) is never discriminating — which is the bare argv only
+        // for v1. A v2 launch
         // appended the `run --request/--out` transport pair — the
         // sandbox paths under containment, the host io paths
         // uncontained — and the durable record does not name which
@@ -6376,5 +6411,64 @@ mod tests {
             env.vars
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `normalize_signature` folds every staging-shaped basename —
+    /// the legacy `runtime-auth`/`runtime-auth.<seq>` shapes and the
+    /// owner-tagged `runtime-auth.p<pid>.i<instance>.<seq>`, plus
+    /// `.tmp` siblings — to one canonical name, so a launch argv and
+    /// a resolve-rebuilt argv compare equal however their staged
+    /// names differ. Every other token stays literal.
+    #[test]
+    fn normalize_signature_folds_every_staging_shape() {
+        for name in [
+            "runtime-auth",
+            "runtime-auth.7",
+            "runtime-auth.p12.i3.7",
+            "runtime-auth.7.tmp",
+            "runtime-auth.p12.i3.7.tmp",
+        ] {
+            let folded = normalize_signature(&format!("/run/dir/{name}"));
+            assert_eq!(folded, "/run/dir/runtime-auth.*", "{name}");
+        }
+        // The launch's staged name and the resolve pass's fresh stage
+        // are indistinguishable to the signature — the whole point.
+        let launch = "bwrap --ro-bind /r/runtime-auth.p9.i1.0 /taisan/runtime-auth -- sh";
+        let rebuilt = "bwrap --ro-bind /r/runtime-auth.p9.i1.4 /taisan/runtime-auth -- sh";
+        assert_eq!(normalize_signature(launch), normalize_signature(rebuilt));
+        // Whitespace is normalized as part of the same pass.
+        assert_eq!(normalize_signature("a  b\tc"), "a b c");
+    }
+
+    /// The canonical fold must not leak discrimination away: an
+    /// operator file whose name merely starts `runtime-auth.` — a
+    /// purely numeric `runtime-auth.1.2.3` versioned input — is not a
+    /// staging shape and keeps comparing literally, and staged names
+    /// under different directories stay distinct. The `/taisan/`
+    /// bind-destination token folds too — its basename is
+    /// staging-shaped — but it is a fixed constant folded identically
+    /// on both sides, so equality is unaffected.
+    #[test]
+    fn normalize_signature_keeps_non_staging_names_and_dirs_literal() {
+        let numeric = "x --ro-bind /r/runtime-auth.1.2.3 /taisan/runtime-auth";
+        assert_eq!(
+            normalize_signature(numeric),
+            "x --ro-bind /r/runtime-auth.1.2.3 /taisan/runtime-auth.*",
+            "the operator name stays literal; only the staging-shaped \
+             destination basename folds (symmetrically on both sides)"
+        );
+        // A bare `runtime-auth.` prefix alone is not staging grammar.
+        let odd = "x /r/runtime-auth.foo y";
+        assert_eq!(normalize_signature(odd), odd);
+        // Same staged basename, different staging dir: distinct.
+        let a = normalize_signature("bwrap /a/runtime-auth.p1.i1.0 done");
+        let b = normalize_signature("bwrap /b/runtime-auth.p1.i1.0 done");
+        assert_ne!(a, b);
+        // A flag carrying a staging-shaped name still folds — any
+        // token is judged on its file name alone.
+        assert_eq!(
+            normalize_signature("--flag=/r/runtime-auth.p1.i1.0"),
+            "--flag=/r/runtime-auth.*"
+        );
     }
 }

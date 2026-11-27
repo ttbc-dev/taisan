@@ -515,7 +515,7 @@ impl Drop for RuntimeBoundary {
 /// tagged shape, so it is operator content the sweep must never
 /// treat as stale staging, like any other `runtime-auth*` name that
 /// is not one of these shapes.
-fn is_staging_name(name: &str) -> bool {
+pub(crate) fn is_staging_name(name: &str) -> bool {
     let base = name.strip_suffix(".tmp").unwrap_or(name);
     if base == "runtime-auth" {
         return true;

@@ -251,10 +251,16 @@ pub trait ProcessControlPort {
     fn group_members(&self, pgid: i32) -> Result<Vec<ProcessIdentity>, String>;
 
     /// Every live process whose command line equals `command`
-    /// (whitespace-normalized on both sides), each with a re-verified
-    /// `pid + start time` identity. A spawn whose outcome was never
-    /// recorded leaves a writer findable only by its launch signature —
-    /// and proving no match exists is the only way to prove it absent.
+    /// (whitespace-normalized on both sides, with any argv token whose
+    /// file name is a runtime-boundary staging shape — `runtime-auth`,
+    /// `runtime-auth.<seq>`, `runtime-auth.p<pid>.i<instance>.<seq>`, or
+    /// a `.tmp` sibling — collapsed to one canonical basename: the
+    /// per-grant staged name is unreconstructable when resolve rebuilds
+    /// the signature, so it can never be a discriminating token), each
+    /// with a re-verified `pid + start time` identity. A spawn whose
+    /// outcome was never recorded leaves a writer findable only by its
+    /// launch signature — and proving no match exists is the only way
+    /// to prove it absent.
     /// The enumeration must be complete: a process-table read that
     /// fails or truncates returns `Err`, because a partial match list
     /// can never authorize an absence claim. An unsupported

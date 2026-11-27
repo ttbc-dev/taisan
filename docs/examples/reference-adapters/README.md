@@ -29,9 +29,11 @@ covered by the owner-run acceptance activity, not this example.
   binding: `worker_argv`, isolation profile, runtime credential
   *reference*, provider-config path, model API egress allowlist, and
   the v2 `worker_dispatch` budget/invariant-set.
-- `worker-provider.json` — the supervisor-validated provider config
-  staged at `/taisan/provider-config` (model and endpoint only; the
-  credential is staged separately at `/taisan/runtime-auth`).
+- `worker-provider.json` — the supervisor-validated
+  `taisan.worker.bindings/1` provider document staged at
+  `/taisan/provider-config` (the required `format_version` member plus
+  model and endpoint; the credential is staged separately at
+  `/taisan/runtime-auth`).
 
 ## The composed workflow
 
