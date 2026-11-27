@@ -55,8 +55,11 @@ fn tmp(name: &str) -> PathBuf {
 ///   FAKE_POST_HANG  seconds to sleep after emitting output, before exit
 fn fake_runtime(dir: &Path) -> PathBuf {
     let path = dir.join("fake-claude");
+    // Write-then-rename: executing a file whose inode was just opened
+    // for writing fails ETXTBUSY on Linux; the renamed inode never was.
+    let tmp = dir.join("fake-claude.tmp");
     fs::write(
-        &path,
+        &tmp,
         r#"#!/bin/sh
 for a in "$@"; do
   if [ "$a" = "--version" ]; then
@@ -89,8 +92,9 @@ exit "${FAKE_EXIT:-0}"
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
     }
+    fs::rename(&tmp, &path).unwrap();
     path
 }
 
@@ -1785,8 +1789,11 @@ fn auth_token_reaches_runtime_but_not_verification() {
     // Fake captures its env for assertion.
     let env_capture = dir.join("env.txt");
     let fake2 = dir.join("fake-env-claude");
+    // Write-then-rename: executing a file whose inode was just opened
+    // for writing fails ETXTBUSY on Linux; the renamed inode never was.
+    let fake2_tmp = dir.join("fake-env-claude.tmp");
     fs::write(
-        &fake2,
+        &fake2_tmp,
         format!(
             "#!/bin/sh\nenv | grep -E '^(ANTHROPIC_API_KEY|GH_TOKEN)=' > {}\ncat {}\nexit 0\n",
             env_capture.display(),
@@ -1797,8 +1804,9 @@ fn auth_token_reaches_runtime_but_not_verification() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&fake2, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&fake2_tmp, fs::Permissions::from_mode(0o755)).unwrap();
     }
+    fs::rename(&fake2_tmp, &fake2).unwrap();
     let req = request_json(
         "coding",
         json!({"kind": "coding", "goal": goal_ref(), "issues": [],

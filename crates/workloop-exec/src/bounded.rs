@@ -176,6 +176,15 @@ const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// waiting out the whole timeout.
 const WAIT_SLICE: Duration = Duration::from_millis(50);
 
+/// Spawn retries granted on `ETXTBSY`: a program file still held
+/// open for writing — a just-written script on a CI filesystem or a
+/// binary mid-deploy — clears in milliseconds, so a short bounded
+/// retry inside the exchange's own deadline clears it rather than
+/// classifying a phantom launch failure. A genuinely busy program
+/// still surfaces as `Launch` once the budget is spent.
+const ETXTBSY_RETRIES: u32 = 10;
+const ETXTBSY_RETRY_DELAY: Duration = Duration::from_millis(25);
+
 /// Run one bounded exchange: write `stdin_bytes` (the caller validates
 /// the request against `bounds.max_stdin` before spawn; the cap is
 /// enforced again defensively here), spawn `argv` under `env` in
@@ -220,9 +229,30 @@ pub fn exchange(
     for (k, v) in &env.vars {
         cmd.env(k, v);
     }
-    let mut child = cmd.spawn().map_err(|e| ExchangeError::Launch {
-        reason: format!("spawn {program}: {e}"),
-    })?;
+    // `execve` refuses `ETXTBSY` while any process holds the program
+    // file open for writing. `fs::write` closes synchronously, but a
+    // filesystem's deferred copy-up or a scanner can pin the inode a
+    // moment longer — the exchange's deadline already bounds the
+    // retry, so the transient case clears in place.
+    let mut retries = ETXTBSY_RETRIES;
+    let mut child = loop {
+        match cmd.spawn() {
+            Ok(child) => break child,
+            Err(error)
+                if error.raw_os_error() == Some(libc::ETXTBSY)
+                    && retries > 0
+                    && std::time::Instant::now() + ETXTBSY_RETRY_DELAY < deadline =>
+            {
+                retries -= 1;
+                std::thread::sleep(ETXTBSY_RETRY_DELAY);
+            }
+            Err(error) => {
+                return Err(ExchangeError::Launch {
+                    reason: format!("spawn {program}: {error}"),
+                });
+            }
+        }
+    };
     let pid = child.id() as i32;
 
     // Record the leader identity while the handle proves the pid is
