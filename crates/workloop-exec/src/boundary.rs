@@ -30,6 +30,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use workloop_core::domain::{canonical_json, sha256_hex};
 
@@ -92,20 +93,31 @@ pub struct BoundaryGrant {
 /// missing `--ro-bind` source, never on a substituted file.
 const RETAINED_GRANT_FILES: usize = 8;
 
+/// A staged grant file and the lock proving this instance owns it:
+/// the boundary holds an exclusive `flock` on every file it stages
+/// from before the name is published until its own `Drop` unlinks
+/// the file, so any boundary sweeping the shared staging dir can
+/// always prove whether the file still has a live owner — a proof
+/// no pid or namespace assumption can falsify.
+struct StagedFile {
+    path: PathBuf,
+    _lock: std::fs::File,
+}
+
 struct BoundaryReady {
     provider_config: Option<PathBuf>,
     /// The staged credential files this instance created and still
-    /// owns — one unique path per grant, bounded to the newest
-    /// [`RETAINED_GRANT_FILES`]. A later grant can never rewrite a
-    /// pending grant's path, and only the retention bound unlinks
-    /// owned files before this instance's `Drop`: a launch stalled
-    /// across more than the bound's grant cycles loses its staged
-    /// file and fails closed on the missing `--ro-bind` source. A
-    /// boundary that staged nothing removes nothing.
-    staged: Vec<PathBuf>,
-    /// The next per-grant staging suffix — the unique name is what
-    /// keeps a later grant's restage from clobbering an earlier
-    /// grant's pending mount.
+    /// owns — one unique owner-tagged path per grant, bounded to the
+    /// newest [`RETAINED_GRANT_FILES`]. A later grant can never
+    /// rewrite a pending grant's path, and only the retention bound
+    /// unlinks owned files before this instance's `Drop`: a launch
+    /// stalled across more than the bound's grant cycles loses its
+    /// staged file and fails closed on the missing `--ro-bind`
+    /// source. A boundary that staged nothing removes nothing.
+    staged: Vec<StagedFile>,
+    /// The next per-grant staging seq inside this instance's owner
+    /// tag — the unique name is what keeps a later grant's restage
+    /// from clobbering an earlier grant's pending mount.
     next_grant: u64,
     /// The proxy persists for the boundary's life: its allowlist is
     /// static configuration, so a provider-config edit never rebuilds
@@ -126,13 +138,25 @@ enum BoundaryState {
 /// start retries on the next call.
 pub struct RuntimeBoundary {
     config: BoundaryConfig,
+    /// This instance's staging-name owner tag —
+    /// `runtime-auth.<pid>.<instance>.<seq>` — so every file it stages
+    /// is attributable to exactly one owner: two boundaries sharing
+    /// the staging dir can never stage or drop the same name, and the
+    /// tag identifies the owning process to anyone reading the dir.
+    owner_tag: String,
     state: Mutex<BoundaryState>,
 }
 
 impl RuntimeBoundary {
     pub fn new(config: BoundaryConfig) -> Self {
+        static INSTANCE: AtomicU64 = AtomicU64::new(0);
         Self {
             config,
+            owner_tag: format!(
+                "{}.{}",
+                std::process::id(),
+                INSTANCE.fetch_add(1, Ordering::Relaxed)
+            ),
             state: Mutex::new(BoundaryState::Unresolved),
         }
     }
@@ -174,16 +198,16 @@ impl RuntimeBoundary {
     /// records it as a launch repair.
     pub fn ensure(&self) -> Result<BoundaryGrant, String> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        // A refused ensure still swept foreign staging files inside
+        // A refused ensure still swept stale staging residue inside
         // `grant_locked`; a failed stage removes its own partial copy.
         // It never touches an earlier grant's file — that file may be
-        // a pending launch's only credential surface — nor a path the
-        // configuration itself names.
+        // a pending launch's only credential surface — a live
+        // neighbour's file, nor a path the configuration itself names.
         self.grant_locked(&mut state)
     }
 
-    /// The per-call grant path under the state mutex: sweep foreign
-    /// staging files, resolve the credential reference fresh, validate
+    /// The per-call grant path under the state mutex: sweep stale
+    /// staging residue, resolve the credential reference fresh, validate
     /// the provider contract against the resolved bytes, start the
     /// CONNECT proxy once when hosts are configured, and stage the
     /// credential under a unique per-grant name. Nothing is cached
@@ -191,11 +215,13 @@ impl RuntimeBoundary {
     /// instance staged.
     fn grant_locked(&self, state: &mut BoundaryState) -> Result<BoundaryGrant, String> {
         {
-            let owned: &[PathBuf] = match state {
-                BoundaryState::Ready(ready) => &ready.staged,
-                BoundaryState::Unresolved => &[],
+            let owned: Vec<&Path> = match state {
+                BoundaryState::Ready(ready) => {
+                    ready.staged.iter().map(|s| s.path.as_path()).collect()
+                }
+                BoundaryState::Unresolved => vec![],
             };
-            self.sweep_foreign_staging(owned, &self.configured_paths())?;
+            self.sweep_foreign_staging(&owned, &self.configured_paths())?;
         }
         let resolved = match &self.config.credential_ref {
             None => None,
@@ -247,6 +273,16 @@ impl RuntimeBoundary {
             .map_err(|e| format!("egress.proxy_unavailable: {e}"))
     }
 
+    /// The staging name one grant is published at —
+    /// `runtime-auth.<pid>.<instance>.<seq>` — carrying this
+    /// boundary's owner tag so the file is attributable to exactly
+    /// one owner: no other instance can ever stage a name this
+    /// boundary tracks, and the tag names the process a reader of
+    /// the staging dir can hold responsible.
+    fn staging_name(&self, seq: u64) -> String {
+        format!("runtime-auth.{}.{}", self.owner_tag, seq)
+    }
+
     /// Stage the resolved credential as an owner-only file unique to
     /// this grant — the mount plan binds it read-only. The value
     /// exists only in this file and the provider's own storage, never
@@ -267,50 +303,61 @@ impl RuntimeBoundary {
         })?;
         // A staging name that exists after the sweep is not ours to
         // overwrite — it is a configured input the sweep deliberately
-        // kept, or another owner's live file (a second boundary
-        // sharing the dir counts its own grants from 0 too). Skip to
-        // a free name rather than rename over it; the `.tmp` sibling
-        // carries the same secret bytes the moment it is created, so
-        // it is checked as well. Past a bounded run of collisions the
-        // stage refuses rather than scan forever.
-        let mut tag = ready.next_grant;
-        let (path, tmp) = loop {
-            let path = self.config.runtime_dir.join(format!("runtime-auth.{tag}"));
-            let tmp = self
-                .config
-                .runtime_dir
-                .join(format!("runtime-auth.{tag}.tmp"));
-            tag += 1;
-            if std::fs::symlink_metadata(&path).is_err() && std::fs::symlink_metadata(&tmp).is_err()
-            {
-                break (path, tmp);
-            }
-            if tag - ready.next_grant > 64 {
+        // kept, or a live owner's file. Owner tags are only *usually*
+        // unique (two pid namespaces can mint the same `<pid>.<instance>`
+        // tag), so existence is not proof a name is foreign: publish is
+        // no-clobber (`write_staged_credential` links rather than
+        // renames over an existing name) and an occupied name — whether
+        // found here or raced past the check — costs a seq, never a
+        // neighbour's file. The `.tmp` sibling carries the same secret
+        // bytes the moment it is created, so it is checked as well.
+        // Past a bounded run of collisions the stage refuses rather
+        // than scan forever.
+        let mut seq = ready.next_grant;
+        loop {
+            let name = self.staging_name(seq);
+            let path = self.config.runtime_dir.join(&name);
+            let tmp = self.config.runtime_dir.join(format!("{name}.tmp"));
+            seq += 1;
+            if seq - ready.next_grant > 64 {
                 return Err("credential.stage_failed: no free staging name".into());
             }
-        };
-        ready.next_grant = tag;
-        match write_staged_credential(&tmp, &path, credential) {
-            Ok(()) => {
-                ready.staged.push(path.clone());
-                // Retention: only the newest grants can still have a
-                // pending mount, so files past the bound are stale
-                // secret material. A failed unlink still drops
-                // ownership — the next ensure's foreign sweep
-                // reclaims the entry (staging-shaped, unowned, and
-                // never configured).
-                while ready.staged.len() > RETAINED_GRANT_FILES {
-                    let evicted = ready.staged.remove(0);
-                    let _ = std::fs::remove_file(evicted);
-                }
-                Ok(path)
+            // Fast skip past an occupied name; publish is no-clobber
+            // regardless, so a stale check can only cost a seq.
+            if std::fs::symlink_metadata(&path).is_ok() || std::fs::symlink_metadata(&tmp).is_ok() {
+                continue;
             }
-            // The staging sibling carries the same secret bytes the
-            // moment it is created: a failure past that point must
-            // not leave the copy at its predictable path.
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                Err(e)
+            match write_staged_credential(&tmp, &path, credential) {
+                Ok(lock) => {
+                    ready.next_grant = seq;
+                    ready.staged.push(StagedFile {
+                        path: path.clone(),
+                        _lock: lock,
+                    });
+                    // Retention: only the newest grants can still have
+                    // a pending mount, so files past the bound are
+                    // stale secret material. A failed unlink still
+                    // drops ownership — and dropping the lock fd
+                    // releases the claim, so the next ensure's sweep
+                    // reclaims the entry (staging-shaped, unclaimed,
+                    // and never configured).
+                    while ready.staged.len() > RETAINED_GRANT_FILES {
+                        let evicted = ready.staged.remove(0);
+                        let _ = std::fs::remove_file(&evicted.path);
+                    }
+                    return Ok(path);
+                }
+                // Occupied means the name — or its `.tmp` sibling —
+                // proved foreign at publish time; nothing of ours was
+                // left behind to remove.
+                Err(StageError::Occupied) => {}
+                // The staging sibling carries the same secret bytes
+                // the moment it is created: a failure past that point
+                // must not leave the copy at its predictable path.
+                Err(StageError::Failed(e)) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(e);
+                }
             }
         }
     }
@@ -342,15 +389,21 @@ impl RuntimeBoundary {
             .collect()
     }
 
-    /// Remove staging files in `runtime_dir` this instance does not
-    /// own — a crashed supervisor's `runtime-auth*` leftovers are
-    /// stale secret material and every resolve sweeps them. Owned
+    /// Remove staging residue in `runtime_dir` no live boundary can
+    /// still own — a crashed supervisor's `runtime-auth*` leftovers
+    /// are stale secret material and every resolve sweeps them. Owned
     /// files are skipped: a grant's file is a live credential surface
-    /// until its launch binds it. Only the exact staging shapes are
-    /// swept (`runtime-auth`, `runtime-auth.<seq>`, and their `.tmp`
-    /// siblings) and a path the resolved configuration names — the
-    /// provider config, a `file:` credential's source — is never
-    /// removed: `.runtime` is operator-writable, the prefix is not
+    /// until its launch binds it. A staging-shaped entry is
+    /// reclaimable only when no live owner claims it: a boundary
+    /// holds an exclusive `flock` on every file it stages from before
+    /// the name is published until its own `Drop` unlinks it, so a
+    /// lock that cannot be taken proves a live owner — in any pid
+    /// namespace — while an acquired lock proves unclaimed residue
+    /// (a dead owner's leftovers, or an unattributed legacy shape
+    /// `runtime-auth` / `runtime-auth.<seq>` a pre-owner-tag binary
+    /// left). A path the resolved configuration names — the provider
+    /// config, a `file:` credential's source — is never removed
+    /// either: `.runtime` is operator-writable, the prefix is not
     /// reserved, and ambiguity always resolves toward keeping the
     /// file. Only regular files and links can hold the secret — a
     /// same-named directory is an obstruction the stage itself
@@ -358,17 +411,13 @@ impl RuntimeBoundary {
     /// an error; a real removal failure refuses the resolve — the
     /// boundary cannot certify a clean staging dir it failed to
     /// clean.
-    fn sweep_foreign_staging(
-        &self,
-        owned: &[PathBuf],
-        protected: &[PathBuf],
-    ) -> Result<(), String> {
+    fn sweep_foreign_staging(&self, owned: &[&Path], protected: &[PathBuf]) -> Result<(), String> {
         let entries = match std::fs::read_dir(&self.config.runtime_dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(format!("credential.unstage_failed: {e}")),
         };
-        let owned: std::collections::HashSet<&Path> = owned.iter().map(PathBuf::as_path).collect();
+        let owned: std::collections::HashSet<&Path> = owned.iter().copied().collect();
         let mut failed = None;
         for entry in entries {
             let entry = entry.map_err(|e| format!("credential.unstage_failed: {e}"))?;
@@ -389,6 +438,12 @@ impl RuntimeBoundary {
                 Ok(t) if t.is_file() || t.is_symlink() => {}
                 Ok(_) => continue,
                 Err(e) => return Err(format!("credential.unstage_failed: {e}")),
+            }
+            // A live owner holds its flock from before publication
+            // until its own Drop — a claimed file is never ours to
+            // remove.
+            if staging_file_is_claimed(&path) {
+                continue;
             }
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
@@ -435,54 +490,147 @@ impl Drop for RuntimeBoundary {
         }
         // The staged credential's lifetime is its grant's — and only
         // this instance's grants: with the boundary gone, its own
-        // staged files are stale secret material.
-        for path in &ready.staged {
-            let _ = std::fs::remove_file(path);
+        // staged files are stale secret material. The owner tag in
+        // each tracked name means the set can never name another
+        // boundary's file, and dropping each lock descriptor after
+        // the unlink releases the claim a neighbour's sweep probes.
+        for staged in &ready.staged {
+            let _ = std::fs::remove_file(&staged.path);
         }
     }
 }
 
-/// Whether a `runtime_dir` entry name is one of the boundary's own
-/// staging shapes — the per-grant `runtime-auth.<seq>` and its
-/// `runtime-auth.<seq>.tmp` sibling, or the pre-per-grant
-/// `runtime-auth` / `runtime-auth.tmp` a crashed older supervisor may
-/// have left. Any other `runtime-auth*` name is operator content the
-/// sweep must never treat as stale staging.
+/// Whether a `runtime_dir` entry name is one of the boundary's
+/// staging shapes — the owner-tagged
+/// `runtime-auth.<pid>.<instance>.<seq>` and its `.tmp` sibling, or
+/// the pre-owner-tag `runtime-auth` / `runtime-auth.<seq>` shapes an
+/// older supervisor may have left. Any other `runtime-auth*` name is
+/// operator content the sweep must never treat as stale staging.
 fn is_staging_name(name: &str) -> bool {
     let base = name.strip_suffix(".tmp").unwrap_or(name);
-    base == "runtime-auth"
-        || base
-            .strip_prefix("runtime-auth.")
-            .is_some_and(|seq| !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()))
+    if base == "runtime-auth" {
+        return true;
+    }
+    let Some(rest) = base.strip_prefix("runtime-auth.") else {
+        return false;
+    };
+    let all_digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    match rest.split('.').count() {
+        // runtime-auth.<seq> — the pre-owner-tag per-grant shape.
+        1 => all_digits(rest),
+        // runtime-auth.<pid>.<instance>.<seq> — owner-tagged.
+        3 => rest.split('.').all(all_digits),
+        _ => false,
+    }
 }
 
-/// Write the credential to `tmp` owner-only, fsync it, and rename it
-/// over `path`. On `Err` the caller owns removing `tmp` — it may
-/// already hold a partial secret copy.
+/// Whether a staging-shaped file is currently claimed by a live
+/// owner. A boundary holds an exclusive `flock` on every file it
+/// stages from before the name is published until its own `Drop`
+/// unlinks it, so a lock that cannot be taken proves a live owner —
+/// in any pid namespace — and an acquired lock proves unclaimed
+/// residue: a dead owner's locks died with it, and unattributed
+/// legacy shapes were never locked at all. The probe fails toward
+/// keeping: a file that cannot be opened — foreign permissions — or
+/// whose lock probe errors is never removed, and a symlink is
+/// unclaimed by definition (it cannot carry our lock), matching how
+/// the sweep has always treated link-shaped residue.
+fn staging_file_is_claimed(path: &Path) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return false,
+        Err(_) => return true,
+    };
+    // A lock we actually took proves the file unclaimed; anything
+    // else — EWOULDBLOCK from a live owner, or a probe error — keeps
+    // it.
+    (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }) != 0
+}
+
+/// Why a stage attempt did not publish: `Occupied` means the name —
+/// or its `.tmp` sibling — proved foreign at publish time (the caller
+/// tries the next seq; nothing of ours was left behind), `Failed`
+/// carries the refusal for a real error.
+enum StageError {
+    Occupied,
+    Failed(String),
+}
+
+/// Write the credential to `tmp` owner-only, fsync it, and publish it
+/// under `path` *without clobbering*, returning the descriptor
+/// holding the ownership claim: the file is `flock`-claimed before it
+/// carries any secret and the caller keeps the descriptor as the
+/// file's live-owner proof until this boundary's `Drop` unlinks it.
+/// Publish is `link` + `unlink`, never `rename` — an existing name
+/// fails `EEXIST` instead of being overwritten, so a same-tagged
+/// neighbour (owner tags can collide across pid namespaces) racing
+/// the publish loses a seq rather than having its live grant swapped
+/// out from under it. On `Err(Failed)` the caller owns removing
+/// `tmp` — it may already hold a partial secret copy.
 fn write_staged_credential(
     tmp: &Path,
     path: &Path,
     credential: &ResolvedCredential,
-) -> Result<(), String> {
+) -> Result<std::fs::File, StageError> {
+    use std::os::unix::io::AsRawFd;
+    let fail = |e: std::io::Error| StageError::Failed(format!("credential.stage_failed: {e}"));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(tmp)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                StageError::Occupied
+            } else {
+                fail(e)
+            }
+        })?;
+    // The claim precedes the content: a neighbour's sweep may only
+    // reclaim an *unclaimed* staging shape, so the lock is taken
+    // before any secret byte lands. A filesystem that cannot carry
+    // the claim cannot carry the ownership guarantee — refuse.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(StageError::Failed(format!(
+            "credential.stage_failed: flock {}: {}",
+            tmp.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
     {
         use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(tmp)
-            .map_err(|e| format!("credential.stage_failed: {e}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| format!("credential.stage_failed: {e}"))?;
+                .map_err(fail)?;
         }
         file.write_all(credential.bytes())
             .and_then(|()| file.sync_all())
-            .map_err(|e| format!("credential.stage_failed: {e}"))?;
+            .map_err(fail)?;
     }
-    std::fs::rename(tmp, path).map_err(|e| format!("credential.stage_failed: {e}"))
+    // No-clobber publish: `hard_link` gives `path` a second name for
+    // this inode atomically, failing EEXIST on any existing entry —
+    // the lock rides the inode's open file description, so the
+    // published name is claimed from its first instant.
+    match std::fs::hard_link(tmp, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(tmp);
+            Ok(file)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(tmp);
+            Err(StageError::Occupied)
+        }
+        Err(e) => Err(fail(e)),
+    }
 }
 
 /// Bounded digest of one file's content: at most the contract's own
@@ -613,6 +761,16 @@ mod tests {
             egress_dir: dir.join("egress"),
             relay_exe: PathBuf::from("/bin/taisan"),
         }
+    }
+
+    /// Claim a file the way a staging boundary does: an exclusive
+    /// `flock` held on the descriptor for the holder's life. Returns
+    /// the descriptor so the caller can hold the claim.
+    fn claim(file: std::fs::File) -> std::fs::File {
+        use std::os::unix::io::AsRawFd;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "the fixture must take the owner lock");
+        file
     }
 
     /// Every `runtime-auth*` entry — staged grants and staging
@@ -877,33 +1035,157 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A resolve carrying no `credential_ref` still owns the staging
-    /// dir: a file a crashed predecessor left behind — or a staging
-    /// sibling a killed stage orphaned — is stale secret material and
-    /// is swept.
+    /// A resolve carrying no `credential_ref` still sweeps the
+    /// staging dir: residue no live owner claims — an unlocked
+    /// owner-tagged file, an orphaned `.tmp` sibling, or an
+    /// unattributed legacy name — is stale secret material and is
+    /// reclaimed, while a file a live owner still holds its flock on
+    /// is another boundary's grant and is kept.
     #[test]
-    fn a_no_credential_resolve_unlinks_an_earlier_grants_file() {
+    fn a_no_credential_resolve_reclaims_dead_owner_residue() {
         let dir = tmp("unstage");
+        let runtime = dir.join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        // An unlocked owner-tagged file is residue: a live owner
+        // holds its flock, so unlocked means its owner is gone.
+        let dead = runtime.join("runtime-auth.1.2.3");
+        std::fs::write(&dead, "stale-secret").unwrap();
+        // An orphaned tmp sibling and an unattributed legacy name are
+        // the same stale secret material.
+        let orphan = runtime.join("runtime-auth.tmp");
+        std::fs::write(&orphan, "partial-secret").unwrap();
+        let legacy = runtime.join("runtime-auth.7");
+        std::fs::write(&legacy, "legacy-secret").unwrap();
+        // A file held under an exclusive lock stands in for a live
+        // neighbour's grant — the test claims it the way a staging
+        // boundary does.
+        let claimed = runtime.join("runtime-auth.4.5.6");
+        let _claimed_lock = claim(std::fs::File::create(&claimed).unwrap());
+        std::fs::write(&claimed, "live-secret").unwrap();
+
+        let boundary = RuntimeBoundary::new(config(&dir));
+        boundary.ensure().unwrap();
+        assert!(!dead.exists(), "a dead owner's staged file is reclaimed");
+        assert!(!orphan.exists(), "the orphaned staging file is unlinked");
+        assert!(!legacy.exists(), "the unattributed legacy name is unlinked");
+        assert!(claimed.exists(), "a live owner's file is never swept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A staging-shaped name that is not one of the boundary's shapes
+    /// is never probed for a claim — a malformed tag or any other
+    /// `runtime-auth.*` name is operator content and stays.
+    #[test]
+    fn a_malformed_or_foreign_staging_name_is_never_ours() {
+        let dir = tmp("foreignnames");
+        let runtime = dir.join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let malformed = runtime.join("runtime-auth.abc");
+        std::fs::write(&malformed, "operator").unwrap();
+        let two_part = runtime.join("runtime-auth.1.2");
+        std::fs::write(&two_part, "operator").unwrap();
+        let boundary = RuntimeBoundary::new(config(&dir));
+        boundary.ensure().unwrap();
+        assert!(
+            malformed.exists() && two_part.exists(),
+            "non-staging-shape names are never swept"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two boundaries sharing the staging dir are different owners:
+    /// the second boundary's ensure never sweeps the first's live
+    /// staged credential — the file is claimed by the holder's flock
+    /// — and dropping the first removes only the files it staged,
+    /// never a name the second boundary published under its own tag.
+    #[test]
+    fn a_second_boundary_never_unlinks_a_live_owners_grant() {
+        let dir = tmp("neighbours");
         // SAFETY: test-only env mutation.
-        unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_TOKEN5", "sekrit5") };
+        unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_TOKEN5", "sekrit10") };
         let mut cfg = config(&dir);
         cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_TOKEN5".into());
-        let boundary = RuntimeBoundary::new(cfg);
-        boundary.ensure().unwrap();
-        let staged = dir.join("runtime/runtime-auth.0");
-        assert!(staged.exists(), "the first grant staged the file");
-        // Forget the boundary so its file survives like a crashed
-        // supervisor's — Drop would remove it. A tmp orphaned
-        // mid-stage is the same stale secret material.
-        std::mem::forget(boundary);
-        let orphan = dir.join("runtime/runtime-auth.tmp");
-        std::fs::write(&orphan, "partial-secret").unwrap();
-        let boundary2 = RuntimeBoundary::new(config(&dir));
-        boundary2.ensure().unwrap();
-        assert!(!staged.exists(), "the stale staged file is unlinked");
-        assert!(!orphan.exists(), "the orphaned staging file is unlinked");
-        assert!(staged_entries(&dir).is_empty());
+        let holder = RuntimeBoundary::new(cfg.clone());
+        let grant = holder.ensure().unwrap();
+        let held = grant.credential_file.expect("the holder staged");
+        assert!(held.exists());
+        // The second boundary's ensure sweeps foreign staging — the
+        // holder's flock-claimed file is its live grant and survives.
+        let neighbour = RuntimeBoundary::new(cfg);
+        let grant2 = neighbour.ensure().unwrap();
+        let neighbours = grant2.credential_file.expect("the neighbour staged");
+        assert!(held.exists(), "a live owner's grant is never swept");
+        assert_ne!(held, neighbours, "each boundary stages its own name");
+        // Dropping the holder removes only the files it staged — the
+        // neighbour's grant outlives it.
+        drop(holder);
+        assert!(!held.exists(), "drop reclaims the holder's own files");
+        assert!(
+            neighbours.exists(),
+            "drop never touches a neighbour's grant"
+        );
         unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN5") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Owner tags are only *usually* unique: two pid namespaces mint
+    /// the same `<pid>.<instance>` tag, so a name collision is a real
+    /// case, not a bug precondition. Publish must still be no-clobber —
+    /// the contender loses a seq, never the holder's file — and neither
+    /// boundary's Drop unlinks a name the other published.
+    #[test]
+    fn a_same_owner_tag_contender_never_clobbers_the_holders_grant() {
+        let dir = tmp("tagcollision");
+        // SAFETY: test-only env mutation; the name is unique to this
+        // test — parallel env-driven tests must never share a variable.
+        unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_TOKEN11", "sekrit11") };
+        let mut cfg = config(&dir);
+        cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_TOKEN11".into());
+        // Force the tag two pid namespaces could both mint.
+        let holder = RuntimeBoundary {
+            config: cfg.clone(),
+            owner_tag: "9.9".into(),
+            state: Mutex::new(BoundaryState::Unresolved),
+        };
+        let held = holder
+            .ensure()
+            .unwrap()
+            .credential_file
+            .expect("holder staged");
+        assert_eq!(
+            held.file_name().unwrap().to_string_lossy(),
+            "runtime-auth.9.9.0"
+        );
+        let contender = RuntimeBoundary {
+            config: cfg,
+            owner_tag: "9.9".into(),
+            state: Mutex::new(BoundaryState::Unresolved),
+        };
+        // The contender sweeps first: the holder's file is claimed, so
+        // it stays — then the contender publishes the next seq rather
+        // than clobbering `runtime-auth.9.9.0`.
+        let published = contender
+            .ensure()
+            .unwrap()
+            .credential_file
+            .expect("contender staged");
+        assert_eq!(
+            published.file_name().unwrap().to_string_lossy(),
+            "runtime-auth.9.9.1",
+            "an occupied same-tag name costs a seq, never the holder's file"
+        );
+        assert!(held.exists() && published.exists());
+        assert_eq!(std::fs::read(&held).unwrap(), b"sekrit11");
+        // Each boundary's Drop removes only the name it published.
+        drop(contender);
+        assert!(!published.exists());
+        assert!(
+            held.exists(),
+            "a same-tagged neighbour's Drop never unlinks the holder's grant"
+        );
+        drop(holder);
+        assert!(!held.exists());
+        unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN11") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -961,13 +1243,14 @@ mod tests {
     /// The stage's rename target is never a path the configuration
     /// named: a provider document or `file:` source sitting on a
     /// staging-shaped name survives the sweep *and* the stage, which
-    /// advances to a free tag instead of overwriting it.
+    /// publishes under its own owner tag instead of overwriting it.
     #[test]
     fn staging_never_overwrites_a_configured_input() {
         let dir = tmp("stageprotect");
         let runtime = dir.join("runtime");
         std::fs::create_dir_all(&runtime).unwrap();
-        // The provider document takes the first staging name.
+        // The provider document takes an unattributed staging name —
+        // unprotected it would be swept; configured it is kept.
         let provider = runtime.join("runtime-auth.0");
         let provider_bytes = "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\"}\n";
         std::fs::write(&provider, provider_bytes).unwrap();
@@ -992,34 +1275,35 @@ mod tests {
         );
         assert_eq!(
             grant.credential_file.expect("credential staged"),
-            runtime.join("runtime-auth.2"),
-            "occupied staging names are skipped"
+            runtime.join(boundary.staging_name(0)),
+            "the grant stages under this boundary's own owner tag"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A staging name that exists after the sweep is never rewritten
-    /// — here a same-named directory, which the sweep deliberately
-    /// leaves — so the stage advances to the next free tag.
+    /// — here a same-named directory at this boundary's own tag,
+    /// which the sweep deliberately leaves — so the stage advances to
+    /// the next free tag.
     #[test]
     fn an_occupied_staging_name_is_skipped_not_rewritten() {
         let dir = tmp("stageskip");
         let runtime = dir.join("runtime");
-        std::fs::create_dir_all(runtime.join("runtime-auth.0")).unwrap();
         // SAFETY: test-only env mutation.
         unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_TOKEN8", "sekrit8") };
         let mut cfg = config(&dir);
         cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_TOKEN8".into());
         let boundary = RuntimeBoundary::new(cfg);
+        std::fs::create_dir_all(runtime.join(boundary.staging_name(0))).unwrap();
         let grant = boundary.ensure().unwrap();
         unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN8") };
         assert!(
-            runtime.join("runtime-auth.0").is_dir(),
+            runtime.join(boundary.staging_name(0)).is_dir(),
             "an existing staging-named entry is never rewritten"
         );
         assert_eq!(
             grant.credential_file.expect("credential staged"),
-            runtime.join("runtime-auth.1"),
+            runtime.join(boundary.staging_name(1)),
             "the stage advances to a free staging name"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -1161,11 +1445,12 @@ mod tests {
         // The oldest grants' files — every mount they could serve is
         // long past — are unlinked; the newest files stay for their
         // still-pending consumers.
-        assert!(!dir.join("runtime/runtime-auth.0").exists());
-        assert!(!dir.join("runtime/runtime-auth.1").exists());
+        let runtime = dir.join("runtime");
+        assert!(!runtime.join(boundary.staging_name(0)).exists());
+        assert!(!runtime.join(boundary.staging_name(1)).exists());
         for seq in 2..RETAINED_GRANT_FILES + 2 {
             assert!(
-                dir.join(format!("runtime/runtime-auth.{seq}")).exists(),
+                runtime.join(boundary.staging_name(seq as u64)).exists(),
                 "the newest grant files are retained: {seq}"
             );
         }

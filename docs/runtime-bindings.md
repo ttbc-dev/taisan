@@ -69,21 +69,32 @@ The credential is configured only as a provider *reference*
 staged fresh at every contained launch and `describe` probe: the
 latest provider value is what the next Invocation observes. Each
 grant stages its own `0600` supervisor-owned file under a unique
-per-grant name, bound read-only at `/taisan/runtime-auth` — a later
-grant can never rewrite the path a pending launch is about to bind,
-and a refused re-resolve never unlinks it. Retention is bounded:
-only the newest staged grants are kept — a staged file is live until
-its launch mounts it, a window every caller completes promptly after
-the grant — so older grant files are unlinked as stale secret
-material rather than accumulating for the supervisor's life. A
-boundary removes only the files it staged: a boundary that was
-constructed but never resolved (a `run` that lost the lease) removes
-nothing at the shared
-staging dir, while every resolve sweeps only the boundary's own
-staging shapes (`runtime-auth`, `runtime-auth.<seq>`, and their
-`.tmp` siblings) a crashed predecessor left behind as stale secret
-material — a path the resolved configuration names, or any other
-file under the shared staging dir, is never removed.
+per-grant name carrying the staging boundary's owner tag —
+`runtime-auth.<pid>.<instance>.<seq>` — bound read-only at
+`/taisan/runtime-auth` — a later grant can never rewrite the path a
+pending launch is about to bind, and a refused re-resolve never
+unlinks it. Retention is bounded: only the newest staged grants are
+kept — a staged file is live until its launch mounts it, a window
+every caller completes promptly after the grant — so older grant
+files are unlinked as stale secret material rather than accumulating
+for the supervisor's life — a failed unlink instead releases the
+file's ownership claim, so a later sweep reclaims it as residue.
+Dropping a boundary removes only the files it staged: a boundary
+that was constructed but never resolved (a `run` that lost the
+lease) removes nothing at the shared staging dir, and the tracked
+set can never name another boundary's file: names carry the staging
+boundary's owner tag, and because tags can collide across pid
+namespaces a publish never overwrites an existing name — a colliding
+neighbour takes the next seq — so two boundaries sharing the staging
+dir can never unlink each other's live grant. Every resolve also
+sweeps stale staging residue no live owner claims: a boundary holds
+an exclusive `flock` on every file it stages from before the name is
+published until its own drop unlinks it, so an unlocked staging
+shape — a dead owner's leftovers or an unattributed legacy name
+(`runtime-auth`, `runtime-auth.<seq>`) — is reclaimable, while a
+file a live boundary still holds is another boundary's grant and is
+never removed. A path the resolved configuration names, or any other
+file under the shared staging dir, is never removed either.
 
 The credential value never enters argv, the request body,
 `runtime.log`, the report, evidence, the provider contract document,
@@ -154,7 +165,7 @@ location inside the sandbox is ephemeral — the tmpfs the sandbox root
 is assembled on (which carries only the generated mount points) and
 the fresh filesystems the isolation profile mounts for the child:
 `HOME` (tmpfs `/home`), `TMPDIR` (tmpfs `/tmp`), `/run` (tmpfs), and
-`/dev` (devtmpfs). See
+`/dev` (the minimal device view bwrap's `--dev` builds). See
 [examples/managed-worker](examples/managed-worker/README.md)
 for a concrete packaged layout.
 
