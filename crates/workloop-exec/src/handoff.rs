@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use workloop_core::domain::*;
+use workloop_core::placement::PlacementTarget;
 use workloop_core::ports::{ProcessControlPort, WorkerEnv};
 use workloop_core::store::{Effect, Store, StoreError};
 use workloop_core::worker::IsolationProfile;
@@ -86,6 +87,17 @@ pub struct HandoffLayout {
     /// The §14.5 verification sandbox; `None` is the recorded
     /// hygiene-only runner.
     pub verification: Option<VerificationSandbox>,
+    /// The separate verification placement (#379,
+    /// `docs/remote-executor.md` §2.2). `Local` is the recorded v0.3
+    /// runner; `Remote` never runs the local runner — each declared
+    /// requirement records one bounded `Inconclusive` naming the bound
+    /// executor and stays unproven until remote verification
+    /// machinery (#383) dispatches it.
+    pub verification_placement: PlacementTarget,
+    /// The bound remote executor identity deferred verification
+    /// evidence names — `Some` exactly when
+    /// `verification_placement == Remote`.
+    pub remote_verification_executor: Option<String>,
 }
 
 impl HandoffLayout {
@@ -110,6 +122,22 @@ impl HandoffLayout {
         self.out_root
             .join(&handoff.execution_id.0)
             .join(&handoff.invocation_id.0)
+    }
+
+    /// The verification placement this layout currently resolves. It is
+    /// copied onto a new handoff row and never consulted again for that
+    /// artifact — the durable pin decides every later run (#506).
+    fn pin_verification_placement(&self) -> VerificationPlacement {
+        VerificationPlacement {
+            target: self.verification_placement,
+            executor: match self.verification_placement {
+                PlacementTarget::Remote => self
+                    .remote_verification_executor
+                    .clone()
+                    .unwrap_or_else(|| "remote".to_string()),
+                PlacementTarget::Local => "local".to_string(),
+            },
+        }
     }
 }
 
@@ -291,6 +319,7 @@ pub fn drive(
                 state: HandoffState::ExportStarted,
                 invalid_reason: None,
                 attempt: 0,
+                verification_placement: Some(layout.pin_verification_placement()),
                 recorded_seq: 0,
             };
             match store.transact(|tx| {
@@ -323,9 +352,49 @@ pub fn drive(
         return Err(e);
     }
     if handoff.state == HandoffState::Acknowledged {
-        run_verifications(store, layout, &handoff, seed, credential_source, clock)?;
+        run_verifications(store, layout, &mut handoff, seed, credential_source, clock)?;
     }
     Ok(handoff)
+}
+
+/// Resolve the handoff row's pinned verification placement, binding a
+/// pre-pin row exactly once. A row that already carries remote-pending
+/// markers must resolve to the same remote placement and executor — a
+/// changed config is refused rather than reinterpret the recorded
+/// marker under a new placement (and never silently run local).
+fn resolve_verification_placement(
+    store: &impl Store,
+    handoff: &mut ArtifactHandoff,
+    layout: &HandoffLayout,
+    recorded: &std::collections::HashMap<String, VerificationResult>,
+) -> Result<VerificationPlacement, HandoffError> {
+    let resolved = match &handoff.verification_placement {
+        Some(pinned) => pinned.clone(),
+        None => layout.pin_verification_placement(),
+    };
+    let pending: Vec<&VerificationResult> = recorded
+        .values()
+        .filter(|r| is_placement_bound_marker(&r.environment_digest))
+        .collect();
+    if !pending.is_empty() {
+        let expected = (resolved.target == PlacementTarget::Remote)
+            .then(|| placement_bound_marker(&resolved.executor));
+        if expected.as_deref().is_none()
+            || pending
+                .iter()
+                .any(|r| Some(r.environment_digest.as_str()) != expected.as_deref())
+        {
+            return Err(HandoffError::Transport(format!(
+                "verification placement changed for artifact {}: recorded remote-pending markers do not match the {:?} placement (executor '{}')",
+                handoff.artifact_id, resolved.target, resolved.executor
+            )));
+        }
+    }
+    if handoff.verification_placement.is_none() {
+        handoff.verification_placement = Some(resolved.clone());
+        persist(store, handoff)?;
+    }
+    Ok(resolved)
 }
 
 /// Each declared verification argv runs once per artifact on the exact
@@ -335,7 +404,7 @@ pub fn drive(
 fn run_verifications(
     store: &impl Store,
     layout: &HandoffLayout,
-    handoff: &ArtifactHandoff,
+    handoff: &mut ArtifactHandoff,
     seed: &HandoffSeed,
     credential_source: &CredentialMaskSource,
     clock: &mut dyn FnMut() -> i64,
@@ -354,6 +423,59 @@ fn run_verifications(
         .into_iter()
         .map(|r| (r.requirement.clone(), r))
         .collect();
+    // The placement is the one pinned on the handoff row, never the live
+    // layout (#506): a config reload after the row exists cannot flip a
+    // pending run or retarget its executor. A pre-pin row is bound once
+    // here — and refused outright when it already carries remote-pending
+    // markers under a different placement.
+    let placement = resolve_verification_placement(store, handoff, layout, &recorded)?;
+    // The separate verification placement (#379): remote-placed
+    // verification never runs the local runner — the one remote
+    // executor is owed the run, and local verification under a remote
+    // placement would read as proof it never was. Each requirement
+    // records one bounded `Inconclusive` whose marker names the bound
+    // executor — written exactly once per
+    // (artifact, requirement, produced, executor), retried by
+    // nothing, unproven until #383 dispatches the remote run.
+    if placement.target == PlacementTarget::Remote {
+        let executor = placement.executor.as_str();
+        let marker = placement_bound_marker(executor);
+        let produced = handoff.produced.clone().unwrap_or_default();
+        for (i, argv) in seed.verification_argv.iter().enumerate() {
+            if argv.is_empty() {
+                continue;
+            }
+            let requirement = format!("verification_argv[{i}]");
+            if recorded.get(&requirement).is_some_and(|r| {
+                r.environment_digest == marker && r.argv == *argv && r.produced == produced
+            }) {
+                continue;
+            }
+            let mut result = VerificationResult {
+                id: String::new(),
+                artifact_id: handoff.artifact_id.clone(),
+                requirement,
+                argv: argv.clone(),
+                produced: produced.clone(),
+                environment_digest: marker.clone(),
+                result: VerificationOutcome::Inconclusive,
+                output: format!(
+                    "verification is remote-placed on executor '{executor}' — \
+                     the run is deferred to remote verification machinery, \
+                     never silently local"
+                ),
+                recorded_seq: 0,
+            };
+            store.transact(|tx| {
+                result.recorded_seq = tx.alloc_seq()?;
+                result.id = tx.alloc_id("verify")?;
+                tx.apply(&Effect::InsertVerificationResult {
+                    result: result.clone(),
+                })
+            })?;
+        }
+        return Ok(());
+    }
     let scratch = layout.out_dir_of(handoff);
     for (i, argv) in seed.verification_argv.iter().enumerate() {
         if argv.is_empty() {
@@ -805,6 +927,32 @@ pub fn deadline_bound_marker() -> String {
 /// mislabelling a marker as an environment identity.
 pub fn is_bound_marker(digest: &str) -> bool {
     digest.starts_with(BOUND_MARKER_PREFIX)
+}
+
+/// Whether a recorded digest is a remote-placement deferral marker
+/// rather than an environment identity or another bound marker.
+pub fn is_placement_bound_marker(digest: &str) -> bool {
+    digest.starts_with(&format!("{BOUND_MARKER_PREFIX}placement:"))
+}
+
+/// The marker recorded when verification is remote-placed but the
+/// remote verification machinery (#383) has not run it. No command
+/// ran, so the evidence identifies the deferred executor instead of a
+/// fabricated environment: SHA-256 over the canonical
+/// `{"kind":"placement","executor":…}` structure under the
+/// `verification-bound-marker-v1` tag. The executor identity binds the
+/// deferral to *which* endpoint was owed the run.
+pub fn placement_bound_marker(executor: &str) -> String {
+    format!(
+        "{BOUND_MARKER_PREFIX}placement:{}",
+        sha256_hex(
+            "verification-bound-marker-v1",
+            &canonical_json(&serde_json::json!({
+                "kind": "placement",
+                "executor": executor,
+            })),
+        )
+    )
 }
 
 enum VerificationRun {

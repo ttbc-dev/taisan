@@ -204,6 +204,30 @@ pub struct CoordinatorEndpoint {
 }
 
 impl CoordinatorEndpoint {
+    /// Resolve a request's bound endpoint descriptor into the session
+    /// binding (`docs/remote-executor.md` §2.2, #379): the two opaque
+    /// credential *references* are read through their providers at
+    /// use — the durable record, logs, and inspect output carry the
+    /// references only. An unresolvable provider is an
+    /// endpoint-unavailable detail naming the provider rule, never
+    /// the reference itself.
+    pub fn resolve(binding: &workloop_core::placement::BoundEndpoint) -> Result<Self, String> {
+        let endpoint_credential =
+            workloop_exec::credentials::resolve(&binding.endpoint_credential_ref)
+                .map_err(|e| format!("endpoint credential reference does not resolve: {e}"))?;
+        let coordinator_credential =
+            workloop_exec::credentials::resolve(&binding.coordinator_credential_ref)
+                .map_err(|e| format!("coordinator credential reference does not resolve: {e}"))?;
+        Ok(Self {
+            installation_id: binding.installation_id.clone(),
+            endpoint_id: binding.endpoint_id.clone(),
+            expected_identity_digest: binding.expected_identity_digest.clone(),
+            endpoint_credential: endpoint_credential.bytes().to_vec(),
+            coordinator_credential: coordinator_credential.bytes().to_vec(),
+            allowed_protocols: binding.allowed_protocols.clone(),
+        })
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.expected_identity_digest.len() != 64
             || !self
@@ -217,5 +241,85 @@ impl CoordinatorEndpoint {
             return Err("session credentials are empty".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CoordinatorEndpoint;
+    use workloop_core::placement::BoundEndpoint;
+
+    /// A mode-0600 credential file — the shape `file:` resolution
+    /// requires (owner-only permissions, effective-user owned).
+    fn credential_file(dir: &std::path::Path, name: &str, bytes: &[u8]) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        format!("file:{}", path.display())
+    }
+
+    fn binding(endpoint_ref: String, coordinator_ref: String) -> BoundEndpoint {
+        BoundEndpoint {
+            installation_id: "inst-1".into(),
+            endpoint_id: "edge-1".into(),
+            kind: "ssh".into(),
+            host: "edge-1.internal".into(),
+            port: 2222,
+            expected_identity_digest: "ab".repeat(32),
+            endpoint_credential_ref: endpoint_ref,
+            coordinator_credential_ref: coordinator_ref,
+            allowed_protocols: vec!["taisan.executor/1".into()],
+        }
+    }
+
+    /// Credential references resolve at use, into session bytes —
+    /// never a literal in the binding, never on a command line.
+    #[test]
+    fn resolve_binds_the_endpoint_and_resolves_the_references() {
+        let dir = std::env::temp_dir().join(format!("wl-exec-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let endpoint_ref = credential_file(&dir, "endpoint.key", b"endpoint-secret");
+        let coordinator_ref = credential_file(&dir, "coordinator.key", b"coordinator-secret");
+
+        let ep = CoordinatorEndpoint::resolve(&binding(endpoint_ref, coordinator_ref)).unwrap();
+        assert_eq!(ep.installation_id, "inst-1");
+        assert_eq!(ep.endpoint_id, "edge-1");
+        assert_eq!(ep.expected_identity_digest, "ab".repeat(32));
+        assert_eq!(ep.endpoint_credential, b"endpoint-secret");
+        assert_eq!(ep.coordinator_credential, b"coordinator-secret");
+        assert_eq!(ep.allowed_protocols, vec!["taisan.executor/1"]);
+        ep.validate().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unresolvable reference fails closed at the same boundary —
+    /// the error names the slot (endpoint vs coordinator), never the
+    /// reference value.
+    #[test]
+    fn resolve_refuses_an_unresolvable_reference_fail_closed() {
+        let missing = "file:/nonexistent-workloop-test-credential";
+        let err = CoordinatorEndpoint::resolve(&binding(missing.into(), "command:echo ok".into()))
+            .unwrap_err();
+        assert!(
+            err.contains("endpoint credential reference"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.contains("nonexistent-workloop-test-credential"),
+            "the reference value is never echoed: {err}"
+        );
+
+        let dir = std::env::temp_dir().join(format!("wl-exec-resolve2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let endpoint_ref = credential_file(&dir, "endpoint.key", b"endpoint-secret");
+        let err = CoordinatorEndpoint::resolve(&binding(endpoint_ref, missing.into())).unwrap_err();
+        assert!(err.contains("coordinator credential reference"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

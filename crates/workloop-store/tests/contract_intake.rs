@@ -1528,6 +1528,7 @@ fn config() -> WorkloopConfig {
     use std::collections::BTreeSet;
     use workloop_core::identity::{ActorRole, AdapterId, HostCapability, RoleBinding};
     WorkloopConfig {
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),

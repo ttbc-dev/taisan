@@ -21,6 +21,9 @@ use workloop_core::identity::{
     ActorRole, AdapterId, CredentialRef, HostActorId, HostActorRef, HostCapability, HostInstanceId,
     IssueId, IssueRef, RepositoryId, RepositoryRef, RoleBinding, canonical_host_instance,
 };
+use workloop_core::placement::{
+    BoundEndpoint, PLACEMENT_SCHEMA_VERSION, PlacementPolicy, PlacementTarget, TRANSPORT_KINDS,
+};
 use workloop_core::work::{HostTemplate, WorkloopConfig};
 use workloop_selector::SelectionPolicy;
 
@@ -220,6 +223,17 @@ pub struct Installation {
     /// authority and its absence blocks nothing.
     #[serde(default)]
     pub selector: Option<serde_json::Value>,
+    /// Executor placement (`docs/remote-executor.md` §2.2, #379):
+    /// per-role `local`/`remote` targets, the separate verification
+    /// placement, and the one static endpoint descriptor. Held as raw
+    /// JSON like `selector`: `executor_placement` parses and validates
+    /// the shape and the outcome rides `WorkloopConfig` as a `Result`,
+    /// so a structurally malformed block is a bounded config error at
+    /// the dispatch boundary — never a load or `workloop_config`
+    /// failure that blocks every other command. Absent means the
+    /// v0.3 all-local placement — no new mandatory configuration.
+    #[serde(default)]
+    pub placement: Option<serde_json::Value>,
 }
 
 /// The validated Worker credential/egress surface returned by
@@ -357,6 +371,90 @@ pub struct SelectorSection {
 
 fn default_max_proposals() -> usize {
     10
+}
+
+/// The executor placement section of the installation record
+/// (`docs/remote-executor.md` §2.2, #379). The version is explicit and
+/// required — an absent or unknown `schema_version` is a hard
+/// configuration error, never a silent default. Unknown keys are
+/// refused: a misspelled role or endpoint field must surface as the
+/// bounded error, never silently degrade the policy. The block is
+/// parsed from the record's raw JSON inside `executor_placement`, so a
+/// structurally malformed section fails the run path only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementSection {
+    /// The placement schema version this section was written under.
+    /// Required: serde refuses the whole section when it is absent.
+    pub schema_version: u32,
+    /// The one static remote endpoint descriptor. Absent means the
+    /// installation is local-only; a `remote` target without the
+    /// descriptor is a configuration error.
+    #[serde(default)]
+    pub endpoint: Option<PlacementEndpointSection>,
+    /// Per-role targets; an absent role names `local`.
+    #[serde(default)]
+    pub roles: PlacementRolesSection,
+    /// The separate verification placement; absent names `local`.
+    /// `remote` never runs the local verification runner — remote
+    /// verification machinery is #383's.
+    #[serde(default)]
+    pub verification: Option<PlacementTarget>,
+}
+
+/// The per-role placement map inside [`PlacementSection`]. The role
+/// set is closed — an unlisted key is refused as an unknown field, so
+/// a misspelled role can never silently bind nothing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementRolesSection {
+    #[serde(default)]
+    pub coding: Option<PlacementTarget>,
+    #[serde(default)]
+    pub fix: Option<PlacementTarget>,
+    #[serde(default)]
+    pub invariant_check: Option<PlacementTarget>,
+    #[serde(default)]
+    pub review: Option<PlacementTarget>,
+}
+
+/// The one static remote endpoint descriptor inside
+/// [`PlacementSection`]: the versioned static address plus the
+/// authentication binding (`docs/executor-transport-contract.md` §2).
+/// Credential values never appear — only the opaque provider
+/// references resolved at session use.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementEndpointSection {
+    /// The installation identity the session challenge presents —
+    /// the same value the endpoint's own configuration pins.
+    pub installation_id: String,
+    /// The configured endpoint identity the session binds.
+    pub endpoint_id: String,
+    /// Transport kind (`ssh`).
+    pub kind: String,
+    /// Bare host name or IP literal the transport dials.
+    pub host: String,
+    pub port: u16,
+    /// The pinned `endpoint_identity_digest` — the authenticated
+    /// principal the installation expects (64 lowercase hex; a digest,
+    /// never a secret).
+    pub expected_identity_digest: String,
+    /// `env:`/`file:`/`command:` provider reference the endpoint
+    /// credential resolves through at session use — never a value.
+    pub endpoint_credential_ref: String,
+    /// `env:`/`file:`/`command:` provider reference the coordinator
+    /// credential resolves through at session use — never a value.
+    pub coordinator_credential_ref: String,
+    /// Executor protocol versions the installation accepts; absent
+    /// defaults to the reference `taisan.executor/1` — the same
+    /// default the endpoint configuration applies.
+    #[serde(default = "default_allowed_protocols")]
+    pub allowed_protocols: Vec<String>,
+}
+
+fn default_allowed_protocols() -> Vec<String> {
+    vec![workloop_core::executor::EXECUTOR_PROTOCOL_V1.to_string()]
 }
 
 fn default_host_instance() -> String {
@@ -645,6 +743,7 @@ fn load_or_create_with(
         loop_config: None,
         retention: None,
         selector: None,
+        placement: None,
     };
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("config dir: {e}"))?;
@@ -911,6 +1010,154 @@ impl Installation {
         }))
     }
 
+    /// The validated executor-placement policy (`docs/remote-executor.md`
+    /// §2.2, #379) every admitted request binds at dispatch. An absent
+    /// section resolves to the implicit all-local policy — the v0.3
+    /// behavior with no new mandatory configuration. A present section
+    /// is fail-closed: the raw JSON must parse under
+    /// `deny_unknown_fields`, `schema_version` must name the version
+    /// this build reads, every credential reference must resolve
+    /// through a known provider shape, and a `remote` target requires
+    /// both the endpoint descriptor and `worker_dispatch` — the
+    /// complete bound-request transport is the only remote dispatch
+    /// path. Validation happens here, never at file load or
+    /// `workloop_config` resolution: a malformed section's bounded
+    /// error rides the config to the dispatch boundary — admission
+    /// refuses to bind under it — instead of failing every command.
+    pub fn executor_placement(&self) -> Result<PlacementPolicy, String> {
+        let Some(raw) = &self.placement else {
+            return Ok(PlacementPolicy::default());
+        };
+        let section: PlacementSection = serde_json::from_value(raw.clone())
+            .map_err(|e| format!("installation placement: {e}"))?;
+        if section.schema_version != PLACEMENT_SCHEMA_VERSION {
+            return Err(format!(
+                "installation placement.schema_version: unsupported {} — \
+                 this build reads {PLACEMENT_SCHEMA_VERSION}",
+                section.schema_version
+            ));
+        }
+        let roles = section.roles;
+        let targets = [
+            ("coding", roles.coding.unwrap_or(PlacementTarget::Local)),
+            ("fix", roles.fix.unwrap_or(PlacementTarget::Local)),
+            (
+                "invariant_check",
+                roles.invariant_check.unwrap_or(PlacementTarget::Local),
+            ),
+            ("review", roles.review.unwrap_or(PlacementTarget::Local)),
+            (
+                "verification",
+                section.verification.unwrap_or(PlacementTarget::Local),
+            ),
+        ];
+        let endpoint = match &section.endpoint {
+            None => None,
+            Some(e) => Some(self.placement_endpoint(e)?),
+        };
+        if targets.iter().any(|(_, t)| *t == PlacementTarget::Remote) {
+            if endpoint.is_none() {
+                return Err("installation placement: a remote target requires the \
+                     endpoint descriptor"
+                    .into());
+            }
+            if self.worker_dispatch.is_none() {
+                return Err("installation placement: a remote target requires \
+                     worker_dispatch — the complete bound-request transport \
+                     is the only remote dispatch path"
+                    .into());
+            }
+        }
+        let mut policy = PlacementPolicy {
+            schema_version: section.schema_version,
+            config_digest: String::new(),
+            endpoint,
+            coding: targets[0].1,
+            fix: targets[1].1,
+            invariant_check: targets[2].1,
+            review: targets[3].1,
+            verification: targets[4].1,
+        };
+        policy.config_digest = policy.digest();
+        Ok(policy)
+    }
+
+    /// Validate one configured endpoint descriptor into the
+    /// self-contained [`BoundEndpoint`] the policy — and every remote
+    /// binding — carries. Every field is checked at this boundary: a
+    /// malformed value is a hard configuration error, never a
+    /// partially bound endpoint that fails later in the dispatch seam.
+    /// Credential references are shape-checked as provider references
+    /// only — never resolved, never echoed on a refusal.
+    fn placement_endpoint(
+        &self,
+        section: &PlacementEndpointSection,
+    ) -> Result<BoundEndpoint, String> {
+        if !TRANSPORT_KINDS.contains(&section.kind.as_str()) {
+            return Err(format!(
+                "installation placement.endpoint.kind: unknown transport \
+                 '{}' — expected one of {}",
+                section.kind,
+                TRANSPORT_KINDS.join(", ")
+            ));
+        }
+        let installation_id = check_dispatch_token(
+            "placement.endpoint.installation_id",
+            &section.installation_id,
+            256,
+        )?
+        .to_string();
+        let endpoint_id =
+            check_dispatch_token("placement.endpoint.endpoint_id", &section.endpoint_id, 256)?
+                .to_string();
+        let host = section.host.trim().to_lowercase();
+        if !crate::profile::is_bare_host_name(&host) {
+            return Err("installation placement.endpoint.host: is not a bare host name".into());
+        }
+        if section.port == 0 {
+            return Err("installation placement.endpoint.port: 0 is not a port".into());
+        }
+        let digest = &section.expected_identity_digest;
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err("installation placement.endpoint.expected_identity_digest: \
+                 is not 64 lowercase hex"
+                .into());
+        }
+        CredentialProvider::parse_str(&section.endpoint_credential_ref).map_err(|rule| {
+            format!("installation placement.endpoint.endpoint_credential_ref: {rule}")
+        })?;
+        CredentialProvider::parse_str(&section.coordinator_credential_ref).map_err(|rule| {
+            format!("installation placement.endpoint.coordinator_credential_ref: {rule}")
+        })?;
+        let mut allowed_protocols = Vec::with_capacity(section.allowed_protocols.len());
+        for entry in &section.allowed_protocols {
+            let entry = check_dispatch_token("placement.endpoint.allowed_protocols", entry, 128)?;
+            if !allowed_protocols.iter().any(|p: &String| p == entry) {
+                allowed_protocols.push(entry.to_string());
+            }
+        }
+        if allowed_protocols.is_empty() {
+            return Err("installation placement.endpoint.allowed_protocols: must \
+                 accept at least one executor protocol version"
+                .into());
+        }
+        Ok(BoundEndpoint {
+            installation_id,
+            endpoint_id,
+            kind: section.kind.clone(),
+            host,
+            port: section.port,
+            expected_identity_digest: digest.clone(),
+            endpoint_credential_ref: section.endpoint_credential_ref.clone(),
+            coordinator_credential_ref: section.coordinator_credential_ref.clone(),
+            allowed_protocols,
+        })
+    }
+
     /// The bound host instance identity: the configured `host_instance`
     /// reduced to its canonical host-instance form, so an endpoint
     /// spelling and the bare host name one identity — the same
@@ -925,7 +1172,11 @@ impl Installation {
     /// The installation file is external input: every identity string,
     /// role name, and capability name is validated at this boundary —
     /// an unparseable value is a hard error, never a silently degraded
-    /// or mis-bound configuration.
+    /// or mis-bound configuration. The `placement` section is the one
+    /// deliberate exception: its validation *outcome* rides
+    /// `WorkloopConfig.placement` as a `Result`, so a malformed block
+    /// gates the dispatch paths that consume it instead of failing
+    /// config resolution for every command.
     pub fn workloop_config(&self) -> Result<WorkloopConfig, String> {
         let host = self.host_instance_id()?;
         let repository_id = RepositoryId::new(self.repository.clone())
@@ -1020,6 +1271,7 @@ impl Installation {
             }),
             budget: self.budget.clone().unwrap_or_default(),
             policy: self.policy.clone().unwrap_or_default(),
+            placement: self.executor_placement(),
         })
     }
 

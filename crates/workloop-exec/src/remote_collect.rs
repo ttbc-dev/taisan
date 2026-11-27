@@ -846,6 +846,7 @@ fn validate_produced(
             state: HandoffState::Acknowledged,
             invalid_reason: None,
             attempt: 0,
+            verification_placement: None,
             recorded_seq: 0,
         };
         let upsert = store.transact(|tx| {

@@ -871,6 +871,14 @@ pub struct InvocationRequest {
     /// and is the only selection that may spawn this request.
     #[serde(default)]
     pub adapter_binding: Option<WorkerAdapterBinding>,
+    /// The executor-placement decision bound at admission (#379):
+    /// executor identity, resolved target, and the schema
+    /// version/config digest the decision was made under. `None` is a
+    /// request recorded before placement existed — its executor is the
+    /// coordinator host's local one. Once set it is immutable and is
+    /// never retargeted, including while the request stays pending.
+    #[serde(default)]
+    pub placement: Option<crate::placement::PlacementBinding>,
 }
 
 /// A resource a writer may change.
@@ -967,6 +975,21 @@ pub enum HandoffState {
     Invalid,
 }
 
+/// The separate verification placement pinned on the durable handoff
+/// record when the handoff is created (#379, #506). A configuration
+/// reload after the row exists binds only handoffs created after it:
+/// the pinned target and executor decide every later verification run,
+/// so a pending remote-placed requirement can never flip to a local
+/// run (or another executor) between handoff and verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationPlacement {
+    pub target: crate::placement::PlacementTarget,
+    /// The bound executor identity: `local` for a local target, the
+    /// endpoint's identity for a remote target. Recorded even for local
+    /// so the durable decision names the executor it was made under.
+    pub executor: String,
+}
+
 /// One durable artifact-handoff record. `attempt` counts export/import
 /// recovery attempts against the artifact-recovery bound — separate
 /// from `max_invocations`.
@@ -988,6 +1011,12 @@ pub struct ArtifactHandoff {
     /// `stale_base`, `digest_mismatch`, `recovery_exhausted`, ...).
     pub invalid_reason: Option<String>,
     pub attempt: u32,
+    /// The verification placement bound when this handoff was created.
+    /// `None` only on a row written before the pin existed; the first
+    /// verification pass backfills it and refuses to reinterpret an
+    /// existing remote-pending marker under a changed placement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_placement: Option<VerificationPlacement>,
     pub recorded_seq: EventSequence,
 }
 

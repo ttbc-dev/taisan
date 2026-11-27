@@ -2234,6 +2234,12 @@ fn build_supervisor(
     // covers them — otherwise `/usr/local/taisan`-style layouts would hand
     // every worker the store, the handoff repository, and the staged
     // runtime credential read-only (§14.3).
+    // The placement resolution is deferred to the dispatch boundary
+    // (#379): `workloop_config` carries the section's validation outcome
+    // so a malformed block fails only the paths that consume it. `run`
+    // is that path — the bounded error surfaces here, never inside a
+    // store-backed command that never dispatches.
+    let placement = config.placement.as_ref().map_err(Clone::clone)?;
     Ok(Some(
         supervisor
             .with_sandbox_mask_roots(vec![state_root.to_path_buf(), workspace_root.clone()])
@@ -2243,6 +2249,14 @@ fn build_supervisor(
                 out_root: handoff_root.join("out"),
                 state_root: Some(state_root.to_path_buf()),
                 verification,
+                // The separate verification placement (#379): a
+                // remote target defers every declared requirement to
+                // the bound endpoint — never a silent local run.
+                verification_placement: placement.verification,
+                remote_verification_executor: (placement.verification
+                    == workloop_core::placement::PlacementTarget::Remote)
+                    .then(|| placement.endpoint.as_ref().map(|e| e.endpoint_id.clone()))
+                    .flatten(),
             }),
     ))
 }
@@ -2303,6 +2317,7 @@ mod tests {
 
     fn config() -> WorkloopConfig {
         WorkloopConfig {
+            placement: Ok(workloop_core::placement::PlacementPolicy::default()),
             host: HostTemplate {
                 adapter: AdapterId::trusted("fixture"),
                 repository: repository(),

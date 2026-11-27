@@ -37,6 +37,7 @@ fn tmp(tag: &str) -> PathBuf {
 fn config() -> WorkloopConfig {
     let host = HostInstanceId::trusted("fixture");
     WorkloopConfig {
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: RepositoryRef::new(host.clone(), RepositoryId::trusted("repo")),

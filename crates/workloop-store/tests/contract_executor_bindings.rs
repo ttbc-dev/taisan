@@ -31,6 +31,7 @@ fn repo() -> RepositoryRef {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),
@@ -116,6 +117,7 @@ fn seeded_request(store: &SqliteStore, key: &str) -> String {
         store,
         &[Effect::InsertRequest {
             request: InvocationRequest {
+                placement: None,
                 request_id: request_id.clone(),
                 work_id,
                 execution_id,
@@ -870,7 +872,7 @@ fn a_v13_store_gains_the_executor_tables() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 16, "the upgrade lands on the current format");
+    assert_eq!(version, 18, "the upgrade lands on the current format");
     assert!(
         store
             .transact(|tx| tx.request(&request_id))

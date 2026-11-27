@@ -898,6 +898,12 @@ pub enum DispatchRefusal {
     /// execution, spec, or role/task disagreement) — the request
     /// cannot be built at all.
     RequestInvalid { detail: String },
+    /// The request's recorded placement binds a remote executor the
+    /// coordinator cannot reach or bind — no dispatch port, a refused
+    /// session, or an incomplete binding. The refusal is terminal for
+    /// this `request_id` (#379): an unavailable endpoint is never a
+    /// silent local re-dispatch under the same request identity.
+    PlacementUnavailable { detail: String },
 }
 
 impl DispatchRefusal {
@@ -923,6 +929,7 @@ impl DispatchRefusal {
             Self::BodyOversize { .. } => "request.body_oversize",
             Self::BodyCorrupt { .. } => "request.body_corrupt",
             Self::RequestInvalid { .. } => "request.invalid",
+            Self::PlacementUnavailable { .. } => "request.placement_unavailable",
         }
     }
 
@@ -947,7 +954,8 @@ impl DispatchRefusal {
             | Self::ContinuationMissing { detail }
             | Self::BodyOversize { detail }
             | Self::BodyCorrupt { detail }
-            | Self::RequestInvalid { detail } => detail.as_str(),
+            | Self::RequestInvalid { detail }
+            | Self::PlacementUnavailable { detail } => detail.as_str(),
         }
     }
 }

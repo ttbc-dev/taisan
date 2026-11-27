@@ -157,6 +157,7 @@ fn populate(db: &Path) {
         },
         Effect::InsertRequest {
             request: InvocationRequest {
+                placement: None,
                 request_id: "req-c1".into(),
                 work_id: work.id.clone(),
                 execution_id: execution.id.clone(),
@@ -192,6 +193,7 @@ fn populate(db: &Path) {
                 state: HandoffState::Acknowledged,
                 invalid_reason: None,
                 attempt: 0,
+                verification_placement: None,
                 recorded_seq: 0,
             },
             expected_seq: 0,
@@ -245,6 +247,7 @@ fn populate(db: &Path) {
         },
         Effect::InsertRequest {
             request: InvocationRequest {
+                placement: None,
                 request_id: "req-f1".into(),
                 work_id: work.id.clone(),
                 execution_id: execution.id.clone(),
@@ -267,6 +270,7 @@ fn populate(db: &Path) {
                 state: HandoffState::Acknowledged,
                 invalid_reason: None,
                 attempt: 0,
+                verification_placement: None,
                 recorded_seq: 0,
             },
             expected_seq: 0,

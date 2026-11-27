@@ -109,6 +109,7 @@ fn source_repo(root: &Path) -> (RepositoryRef, PathBuf, String) {
 
 fn config(repository: &RepositoryRef) -> WorkloopConfig {
     WorkloopConfig {
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repository.clone(),
@@ -287,6 +288,7 @@ fn seed_remote_request(
         .transact(|tx| {
             tx.apply(&Effect::InsertRequest {
                 request: InvocationRequest {
+                    placement: None,
                     request_id: request_id.clone(),
                     work_id: work_id.clone(),
                     execution_id: execution_id.clone(),
@@ -630,6 +632,7 @@ fn seed_review_request(
         .transact(|tx| {
             tx.apply(&Effect::InsertRequest {
                 request: InvocationRequest {
+                    placement: None,
                     request_id: request_id.clone(),
                     work_id: work_id.clone(),
                     execution_id: execution_id.clone(),
@@ -2687,6 +2690,7 @@ fn an_existing_handoff_row_for_another_produced_is_invalid() {
                 state: HandoffState::Acknowledged,
                 invalid_reason: None,
                 attempt: 0,
+                verification_placement: None,
                 recorded_seq: tx.alloc_seq()?,
             };
             tx.apply(&Effect::UpsertHandoff {
@@ -3009,6 +3013,7 @@ fn seed_fix_request(
         .transact(|tx| {
             tx.apply(&Effect::InsertRequest {
                 request: InvocationRequest {
+                    placement: None,
                     request_id: request_id.clone(),
                     work_id: work_id.clone(),
                     execution_id: execution_id.clone(),
@@ -3454,6 +3459,7 @@ fn an_identity_mismatch_is_a_terminal_refusal() {
         .transact(|tx| {
             tx.apply(&Effect::InsertRequest {
                 request: InvocationRequest {
+                    placement: None,
                     request_id: other_request.into(),
                     work_id: seeded.work_id.clone(),
                     execution_id: ExecutionId(seeded.request.execution_id.clone()),

@@ -51,6 +51,7 @@ fn repo() -> RepositoryRef {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),
@@ -215,6 +216,8 @@ fn layout(root: &Path, work_id: &WorkId) -> (HandoffLayout, PathBuf) {
             out_root,
             state_root: None,
             verification: None,
+            verification_placement: workloop_core::placement::PlacementTarget::Local,
+            remote_verification_executor: None,
         },
         ws_root.join(format!("ws-{}", work_id.0)),
     )
@@ -287,6 +290,7 @@ fn seed_export_started(store: &SqliteStore, invocation: &Invocation, w: &WorkId,
                     state: HandoffState::ExportStarted,
                     invalid_reason: None,
                     attempt: 1,
+                    verification_placement: None,
                     recorded_seq: seq,
                 },
                 expected_seq: 0,
@@ -741,6 +745,8 @@ fn only_a_proven_dead_invocation_exports() {
         out_root: root.join("out"),
         state_root: None,
         verification: None,
+        verification_placement: workloop_core::placement::PlacementTarget::Local,
+        remote_verification_executor: None,
     };
     let sup = Supervisor::new(PosixProcessControl, ws_root.clone(), vec![], config())
         .with_handoff(layout);
@@ -1472,6 +1478,8 @@ fn a_source_bound_work_derives_base_from_the_workspace() {
         out_root: root.join("out"),
         state_root: None,
         verification: None,
+        verification_placement: workloop_core::placement::PlacementTarget::Local,
+        remote_verification_executor: None,
     };
     let sup = Supervisor::new(PosixProcessControl, ws_root.clone(), vec![], cfg)
         .with_handoff(layout.clone());
@@ -1538,6 +1546,8 @@ fn an_unreadable_workspace_base_wedges_the_recovery_bound() {
         out_root: root.join("out"),
         state_root: None,
         verification: None,
+        verification_placement: workloop_core::placement::PlacementTarget::Local,
+        remote_verification_executor: None,
     };
     let sup = Supervisor::new(PosixProcessControl, ws_root, vec![], config()).with_handoff(layout);
     let invocation = done_invocation(&e, "inv-badbase");
@@ -2307,6 +2317,251 @@ fn contained_verification_refuses_when_the_containment_gate_fails() {
     assert!(
         !bwrap_log.exists(),
         "the declared argv never ran under a failed gate"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The separate verification placement (#379): a remote-placed
+/// verification never runs the local runner — each declared
+/// requirement records one bounded `Inconclusive` naming the bound
+/// executor's marker, written exactly once, unproven until the remote
+/// verification machinery (#383) dispatches the run.
+#[test]
+fn remote_placed_verification_records_the_bound_marker_without_running() {
+    let root = tmp_root("verify-remote");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-vremote");
+    let (mut layout, ws_dir) = layout(&root, &w);
+    layout.verification_placement = workloop_core::placement::PlacementTarget::Remote;
+    layout.remote_verification_executor = Some("edge-1".into());
+    let (base, produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-vremote");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let mut s = seed(&invocation, &w, &base);
+    // An argv that would pass locally — a passing local run would be
+    // silent-local proof under a remote placement.
+    s.verification_argv = vec![
+        vec!["git".into(), "rev-parse".into(), "HEAD".into()],
+        vec!["true".into()],
+    ];
+
+    let h = handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    assert_eq!(h.state, HandoffState::Acknowledged);
+
+    let marker = handoff::placement_bound_marker("edge-1");
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 2, "one bounded record per requirement");
+    for (i, r) in results.iter().enumerate() {
+        assert_eq!(r.requirement, format!("verification_argv[{i}]"));
+        assert_eq!(r.result, VerificationOutcome::Inconclusive);
+        assert_eq!(r.environment_digest, marker);
+        assert_eq!(r.produced, produced);
+        assert_eq!(r.argv, s.verification_argv[i]);
+        assert!(
+            r.output.contains("edge-1"),
+            "the marker names the bound executor: {}",
+            r.output
+        );
+    }
+
+    // Re-driving records nothing twice — the bound is exactly once
+    // per (artifact, requirement, produced, executor).
+    handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    assert_eq!(
+        store
+            .transact(|tx| tx.verification_results(&aid))
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // A produced-commit change is a new evidence basis: the markers
+    // re-record under the new produced value, still never running.
+    let mut s2 = s.clone();
+    s2.verification_argv = vec![vec!["true".into()]];
+    handoff::drive(&store, &layout, &aid, &s2, 3, &Ok(None), &mut || 0).unwrap();
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert!(
+        results.iter().all(
+            |r| r.result == VerificationOutcome::Inconclusive && r.environment_digest == marker
+        ),
+        "no local run ever produced a terminal result"
+    );
+}
+
+/// The placement and bound executor are pinned on the handoff row
+/// (#506): a config reload after the row exists cannot retarget the
+/// pending remote verification to local or another executor.
+#[test]
+fn remote_placement_pin_survives_config_reload_and_executor_change() {
+    let root = tmp_root("verify-remote-pin");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-vremote-pin");
+    let (mut layout, ws_dir) = layout(&root, &w);
+    layout.verification_placement = workloop_core::placement::PlacementTarget::Remote;
+    layout.remote_verification_executor = Some("edge-1".into());
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-vremote-pin");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let mut s = seed(&invocation, &w, &base);
+    s.verification_argv = vec![vec!["true".into()]];
+
+    let h = handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    assert_eq!(h.state, HandoffState::Acknowledged);
+    assert_eq!(
+        h.verification_placement,
+        Some(VerificationPlacement {
+            target: workloop_core::placement::PlacementTarget::Remote,
+            executor: "edge-1".into(),
+        })
+    );
+    let marker = handoff::placement_bound_marker("edge-1");
+    assert_eq!(
+        store.transact(|tx| tx.verification_results(&aid)).unwrap()[0].environment_digest,
+        marker
+    );
+
+    // A reload to local must not run the argv locally or replace the
+    // pending remote evidence.
+    layout.verification_placement = workloop_core::placement::PlacementTarget::Local;
+    layout.remote_verification_executor = None;
+    let h = handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    assert_eq!(
+        h.verification_placement
+            .as_ref()
+            .map(|p| p.executor.as_str()),
+        Some("edge-1"),
+        "the durable pin is unchanged by the reload"
+    );
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].environment_digest, marker);
+    assert_eq!(results[0].result, VerificationOutcome::Inconclusive);
+
+    // A reload to a different executor must not re-record under the
+    // new executor's marker either.
+    layout.verification_placement = workloop_core::placement::PlacementTarget::Remote;
+    layout.remote_verification_executor = Some("edge-2".into());
+    handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].environment_digest, marker);
+    assert!(
+        results
+            .iter()
+            .all(|r| r.environment_digest != handoff::placement_bound_marker("edge-2")),
+        "the second executor's marker never replaces the pinned one"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A local placement pinned at handoff creation is equally durable:
+/// a later remote config cannot turn an already-bound local run into a
+/// deferred remote marker.
+#[test]
+fn local_placement_pin_does_not_follow_later_remote_config() {
+    let root = tmp_root("verify-local-pin");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-vlocal-pin");
+    let (mut layout, ws_dir) = layout(&root, &w);
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-vlocal-pin");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let mut s = seed(&invocation, &w, &base);
+    s.verification_argv = vec![vec!["true".into()]];
+
+    let h = handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    assert_eq!(
+        h.verification_placement,
+        Some(VerificationPlacement {
+            target: workloop_core::placement::PlacementTarget::Local,
+            executor: "local".into(),
+        })
+    );
+    assert_eq!(
+        store.transact(|tx| tx.verification_results(&aid)).unwrap()[0].result,
+        VerificationOutcome::Pass
+    );
+
+    layout.verification_placement = workloop_core::placement::PlacementTarget::Remote;
+    layout.remote_verification_executor = Some("edge-2".into());
+    handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].result, VerificationOutcome::Pass);
+    assert!(
+        !handoff::is_placement_bound_marker(&results[0].environment_digest),
+        "a pinned local run never becomes a remote-pending marker"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A pre-pin row that already carries remote-pending evidence refuses
+/// a changed placement instead of reinterpreting those markers under a
+/// new executor or silently running local. The same placement may
+/// still be re-bound.
+#[test]
+fn legacy_remote_pending_row_refuses_a_changed_placement() {
+    let root = tmp_root("verify-legacy-pin");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-vlegacy-pin");
+    let (mut layout, ws_dir) = layout(&root, &w);
+    layout.verification_placement = workloop_core::placement::PlacementTarget::Remote;
+    layout.remote_verification_executor = Some("edge-1".into());
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-vlegacy-pin");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let mut s = seed(&invocation, &w, &base);
+    s.verification_argv = vec![vec!["true".into()]];
+
+    handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    let marker = handoff::placement_bound_marker("edge-1");
+
+    // Simulate a row written before the pin existed.
+    let mut legacy = row(&store, &aid).unwrap();
+    legacy.verification_placement = None;
+    persist(&store, &legacy);
+
+    // The same placement re-binds the pin without recording anything.
+    handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    let rebound = row(&store, &aid).unwrap();
+    assert_eq!(
+        rebound
+            .verification_placement
+            .as_ref()
+            .map(|p| p.executor.as_str()),
+        Some("edge-1")
+    );
+
+    // A changed placement refuses before any local run.
+    let mut changed = rebound;
+    changed.verification_placement = None;
+    persist(&store, &changed);
+    layout.verification_placement = workloop_core::placement::PlacementTarget::Local;
+    layout.remote_verification_executor = None;
+    let err = handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0)
+        .expect_err("a changed placement over remote-pending evidence is refused");
+    match err {
+        handoff::HandoffError::Transport(detail) => {
+            assert!(
+                detail.contains("verification placement changed"),
+                "{detail}"
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].environment_digest, marker);
+    assert!(
+        results
+            .iter()
+            .all(|r| r.result == VerificationOutcome::Inconclusive),
+        "no local result was recorded"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

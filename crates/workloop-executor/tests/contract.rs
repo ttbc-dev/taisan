@@ -797,24 +797,22 @@ fn tampered_item_body_is_refused_before_staging() {
 #[test]
 fn start_with_drifting_worker_binding_is_refused() {
     let fx = fixture("drift");
-    let mut config = launch_config(now_seconds() + 3600);
-    config["worker_binding"]["runtime_version"] = json!("fixture-9.9.9");
+    // Prepare and start must name the same launch configuration bytes:
+    // a second `now_seconds()` call can cross a second boundary and
+    // turn this binding-drift test into a request-identity mismatch.
+    let deadline = now_seconds() + 3600;
+    let mut drifted = launch_config(deadline);
+    drifted["worker_binding"]["runtime_version"] = json!("fixture-9.9.9");
     let receipt = issue(
         &fx.service,
         "op-prepare",
         OperationKind::Prepare,
-        prepare_payload(&config),
+        prepare_payload(&drifted),
     )
     .expect("receipt");
     assert_eq!(receipt.result["status"], "prepared");
 
     fx.port.push_plan(SpawnPlan::Resident);
-    let deadline = now_seconds() + 3600;
-    let drifted = {
-        let mut c = launch_config(deadline);
-        c["worker_binding"]["runtime_version"] = json!("fixture-9.9.9");
-        c
-    };
     let receipt = issue(
         &fx.service,
         "op-start",

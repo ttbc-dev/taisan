@@ -215,6 +215,7 @@ fn config_for(fixture: &dyn OutboxHost) -> WorkloopConfig {
 
 fn config_with(declared: BTreeSet<HostCapability>, host_write: bool) -> WorkloopConfig {
     WorkloopConfig {
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("conformance-host"),
             repository: repo(),

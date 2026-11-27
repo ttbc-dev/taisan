@@ -1980,6 +1980,7 @@ mod tests {
         Ctx {
             store: SqliteStore::in_memory(1).unwrap(),
             config: WorkloopConfig {
+                placement: Ok(workloop_core::placement::PlacementPolicy::default()),
                 host: HostTemplate {
                     adapter: AdapterId::trusted("s1-bridge"),
                     repository: repository.clone(),
