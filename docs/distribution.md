@@ -97,8 +97,10 @@ reads them as shell variables (with `${TAG_FLAG:+$TAG_FLAG}` where the
 flag is absent on pull_request runs). The patch also replaces the
 `publish-homebrew-formula` job's git identity — dist's default
 `axo bot`/`admin+bot@axo.dev` — with `github-actions[bot]`, so commits
-to the owner's tap are attributed to CI. cargo-dist 0.34.0 cannot
-express permissions for its built-in jobs
+to the owner's tap are attributed to CI. Every `uses:` ref is pinned
+to a full commit SHA (each carrying a `# vX.Y.Z` comment naming the
+tag it replaces) so no workflow step runs a movable ref.
+cargo-dist 0.34.0 cannot express permissions for its built-in jobs
 (`github-custom-job-permissions` covers only user-defined custom
 jobs), so `[workspace.metadata.dist].allow-dirty = ["ci"]` keeps `dist
 generate` from silently reverting the patch.
@@ -109,8 +111,10 @@ regenerate it. To resync after editing `[workspace.metadata.dist]`,
 temporarily remove `allow-dirty`, run `dist generate --mode=ci`,
 restore the `LOCAL MODIFICATION` header, re-apply the permissions
 patch (read at workflow level, write on `host` only), the env-var tag
-hardening, and the `github-actions[bot]` commit identity, then
-restore `allow-dirty`.
+hardening, the `github-actions[bot]` commit identity, and the
+SHA-pinned `uses:` refs (dist emits movable `@vN` tags; each pin's
+`# vX.Y.Z` comment records the version it replaces), then restore
+`allow-dirty`.
 
 ## Install routes
 

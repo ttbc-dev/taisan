@@ -14,10 +14,13 @@
 # could otherwise inject shell commands). The `publish-homebrew-formula`
 # job's git identity is overridden from dist's "axo bot" default to
 # github-actions[bot] so commits to the owner's tap are attributed to
-# CI, not a third-party name. cargo-dist 0.34.0 cannot express
-# permissions for its built-in jobs, so
-# `[workspace.metadata.dist].allow-dirty = ["ci"]` keeps `dist generate`
-# from clobbering this patch.
+# CI, not a third-party name. Every `uses:` ref is pinned to a full
+# commit SHA (the `# vX.Y.Z` comment records the tag it replaces);
+# `dist generate` emits movable tags, so the pins are part of this
+# patch and must be re-applied on resync. cargo-dist 0.34.0 cannot
+# express permissions for its built-in jobs, so
+# `[workspace.metadata.dist].allow-dirty = ["ci"]` keeps
+# `dist generate` from clobbering this patch.
 # See docs/distribution.md "Release flow".
 #
 # Copyright 2022-2024, axodotdev
