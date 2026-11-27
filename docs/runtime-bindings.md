@@ -166,11 +166,18 @@ lapse the guard; a path strictly beneath the home still binds only
 the named path while the tmpfs `/home` keeps the rest invisible),
 and any own-path source that is not a regular file or directory — a
 host socket, device, or fifo grants an IPC endpoint, never file
-content — including a directory source holding such an entry
-anywhere in its tree, so an argv-named container-runtime socket
-cannot be mounted. The directory scan is bounded and fails closed:
-a tree that cannot be read or cannot be fully certified within the
-entry bound is refused rather than admitted uninspected.
+content — including a declared directory source holding such an
+entry anywhere in its tree, so an argv-named container-runtime
+socket cannot be mounted. The directory scan is bounded and fails
+closed: a tree that cannot be read or cannot be fully certified
+within the entry bound is refused rather than admitted uninspected.
+The scan certifies declared sources — binds spelled from worker
+argv, profile, or installation config; trees the supervisor itself
+produced, such as the verification worktree and the installation
+bare repository, are admitted without it: no declared text reaches
+their spelling and their content is git-produced, so a repository
+larger than the entry bound must not fail verification on a
+certification nobody needed.
 Nothing packaged is bound writable. The only writable host paths are
 `/workspace` (role-dependent) and `/taisan/out`; every other writable
 location inside the sandbox is ephemeral — the tmpfs the sandbox root

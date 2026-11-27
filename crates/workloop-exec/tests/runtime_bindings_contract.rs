@@ -538,6 +538,7 @@ fn packaged_runtime_files_stay_under_the_narrow_read_only_binds() {
         ca_bundles: vec![],
         extra_binds: binds,
         extra_rw_binds: vec![],
+        supervised_binds: vec![],
         worker: Some(worker),
         mask_roots: vec![],
         masked_files: vec![],

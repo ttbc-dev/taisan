@@ -165,6 +165,24 @@ pub struct MountPlan {
     /// another artifact's refs because it names exactly one
     /// worktree's metadata directory.
     pub extra_rw_binds: Vec<PathBuf>,
+    /// Host trees the supervisor itself produced or manages, bound
+    /// read-only at their own path — the verification worktree and
+    /// the installation bare repository. Unlike `extra_binds` no
+    /// declared text (argv, profile, config) reaches their spelling
+    /// and their content comes from git operations that cannot
+    /// materialize a special file, so `plan_denial` does not run the
+    /// deep tree certification on them: a repository with vendored
+    /// dependencies or many loose objects would exceed the scan's
+    /// entry bound and refuse a verification nobody asked the scan to
+    /// protect. Only `handoff::run_verification` populates this
+    /// field — a declared path spelled here would bypass the
+    /// certification, so nothing from argv, profile, or config may
+    /// reach it; a single resolved file (the relay executable) is
+    /// declared-class and stays in `extra_binds` where the launch
+    /// plans keep it. The host-root, owner-home, sandbox-shadow, and
+    /// top-level file/directory checks still apply — a supervised
+    /// bind that is itself a special file is never mounted.
+    pub supervised_binds: Vec<PathBuf>,
     /// The resolved host path of the worker executable, bound
     /// read-only at its own absolute path. `None` for sandboxes whose
     /// inner argv is not a single resolved executable (verification
@@ -367,10 +385,17 @@ pub fn ca_trust_binds(profile: &IsolationProfile) -> Vec<PathBuf> {
 /// `/home` — and no own-path source is a socket, device, fifo, or
 /// other special file, which would grant a host IPC endpoint rather
 /// than file content (the fixed-destination `/taisan/proxy.sock`
-/// bind is a socket by contract and exempt) — and a directory
-/// source holding such an entry anywhere in its tree is refused
-/// too, since the bind would carry the endpoint in with it — as is
-/// a directory the bounded tree scan cannot fully certify. The
+/// bind is a socket by contract and exempt). The deep tree
+/// certification — a directory source holding such an entry anywhere
+/// in its tree is refused too, since the bind would carry the
+/// endpoint in with it, as is a directory the bounded tree scan
+/// cannot fully certify — runs only on declared sources: binds
+/// spelled from worker argv, profile, or installation config.
+/// `supervised_binds` (trees the supervisor produced itself) are
+/// exempt from it: no declared text reaches their spelling, their
+/// content is supervisor/git-produced, and a repository larger than
+/// the scan's entry bound must not fail verification — they still
+/// take the root, home, shadow, and top-level type checks. The
 /// sealed/covered
 /// destination check applies only to binds spelled at their own
 /// path: a fixed-destination source like the workspace mounts under
@@ -396,7 +421,13 @@ pub fn plan_denial(plan: &MountPlan) -> Option<String> {
             ));
         }
     }
-    let own_path_binds = || {
+    // Declared own-path sources — spelled by worker argv, profile,
+    // or installation config — get the deep tree certification;
+    // supervisor-produced trees (`supervised_binds`) skip it: their
+    // spelling names no declared text and their content is
+    // supervisor/git-produced, so scanning them only refuses trees
+    // nobody needed certified.
+    let declared_binds = || {
         plan.toolchain
             .iter()
             .chain(plan.caches.iter())
@@ -405,6 +436,7 @@ pub fn plan_denial(plan: &MountPlan) -> Option<String> {
             .chain(plan.extra_rw_binds.iter())
             .chain(plan.worker.iter())
     };
+    let own_path_binds = || declared_binds().chain(plan.supervised_binds.iter());
     // The owner's home directories, canonicalized once: a bind
     // spelled at the home directory itself — or an ancestor of it —
     // would expose the whole tree, so the comparison is made on the
@@ -440,7 +472,10 @@ pub fn plan_denial(plan: &MountPlan) -> Option<String> {
             ));
         }
     }
-    for bind in own_path_binds() {
+    for (bind, declared) in declared_binds()
+        .map(|bind| (bind, true))
+        .chain(plan.supervised_binds.iter().map(|bind| (bind, false)))
+    {
         let resolved = bind.canonicalize().unwrap_or_else(|_| bind.clone());
         if shadows_sandbox_mount(bind) || shadows_sandbox_mount(&resolved) {
             return Some(format!(
@@ -466,8 +501,10 @@ pub fn plan_denial(plan: &MountPlan) -> Option<String> {
         // type cannot be determined, or a tree past the entry bound
         // is refused rather than admitted uncertified — and a
         // symlinked entry is left to resolve inside the sandbox where
-        // its target is the sandbox's own tree.
-        if metadata.is_dir() {
+        // its target is the sandbox's own tree. Only declared sources
+        // are walked: a supervisor-produced tree is trusted content
+        // the scan cannot refuse on size alone.
+        if declared && metadata.is_dir() {
             match scan_dir_bind_tree(&resolved) {
                 DirBindScan::Clean => {}
                 DirBindScan::SpecialEntry => {
@@ -779,6 +816,9 @@ pub fn bwrap_args(
     for extra in &plan.extra_binds {
         args.extend(["--ro-bind".to_string(), s(extra), s(extra)]);
     }
+    for extra in &plan.supervised_binds {
+        args.extend(["--ro-bind".to_string(), s(extra), s(extra)]);
+    }
     for extra in &plan.extra_rw_binds {
         args.extend(["--bind".to_string(), s(extra), s(extra)]);
     }
@@ -1061,6 +1101,7 @@ fn invisible_canary(workspace_root: &Path, plan: &MountPlan) -> PathBuf {
     .chain(plan.ca_bundles.iter().cloned())
     .chain(plan.extra_binds.iter().cloned())
     .chain(plan.extra_rw_binds.iter().cloned())
+    .chain(plan.supervised_binds.iter().cloned())
     .collect();
     let covered = |candidate: &Path| {
         let resolved = candidate
@@ -1140,6 +1181,7 @@ fn run_battery(
         ca_bundles: ca_trust_binds(profile),
         extra_binds: vec![],
         extra_rw_binds: vec![],
+        supervised_binds: vec![],
         worker: worker.map(Path::to_path_buf),
         mask_roots: vec![workspace_root.to_path_buf()],
         masked_files: vec![],
@@ -1571,6 +1613,7 @@ mod tests {
             ca_bundles: vec![],
             extra_binds: vec![PathBuf::from("/opt/worker.py")],
             extra_rw_binds: vec![],
+            supervised_binds: vec![],
             worker: Some(PathBuf::from("/opt/worker")),
             mask_roots: vec![],
             masked_files: vec![],
@@ -2113,6 +2156,92 @@ mod tests {
             DirBindScan::Clean
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A supervisor-produced tree — the verification worktree, the
+    /// installation bare repository — is trusted content the
+    /// certification was never meant to cover: no declared text
+    /// reaches its spelling, so `plan_denial` admits it without the
+    /// bounded walk and a repository larger than the entry bound
+    /// cannot refuse the verification it serves. The same tree
+    /// spelled in `extra_binds` — a declared source — still refuses.
+    #[test]
+    fn plan_denial_skips_the_tree_scan_for_supervised_binds() {
+        let dir = tmp("supbind");
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        std::fs::write(dir.join("file"), "x").unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(dir.join("daemon.sock")).unwrap();
+        let mut plan = plan_fixture();
+        plan.supervised_binds = vec![dir.clone()];
+        assert!(
+            plan_denial(&plan).is_none(),
+            "a supervisor-produced tree is not deep-certified"
+        );
+        plan.supervised_binds = vec![];
+        plan.extra_binds = vec![dir.join("nested"), dir.clone()];
+        let reason = plan_denial(&plan).expect("the declared tree still refuses");
+        assert!(reason.contains("directory holding"), "{reason}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Exempting the walk must not exempt the rest: a supervised
+    /// bind spelled at a covered mount still shadows the sandbox,
+    /// and one that is itself a special file is still a host IPC
+    /// endpoint, never file content.
+    #[test]
+    fn plan_denial_still_guards_a_supervised_binds_spelling() {
+        let mut plan = plan_fixture();
+        plan.supervised_binds = vec![PathBuf::from("/run")];
+        let reason = plan_denial(&plan).expect("a covered-mount spelling refuses");
+        assert!(reason.contains("covers a supervisor-owned"), "{reason}");
+        let dir = tmp("supsock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("s");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        plan.supervised_binds = vec![sock];
+        let reason = plan_denial(&plan).expect("a special-file source refuses");
+        assert!(
+            reason.contains("not a regular file or directory"),
+            "{reason}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A supervised bind renders exactly like an argv-derived one —
+    /// read-only at its own host path — so the sandbox sees the
+    /// supervisor's tree where the host keeps it.
+    #[test]
+    fn supervised_binds_render_as_own_path_read_only_binds() {
+        let mut plan = plan_fixture();
+        plan.supervised_binds = vec![PathBuf::from("/host/repo.git"), PathBuf::from("/host/wt")];
+        let argv = bwrap_args(Path::new("/bwrap"), &plan, &["/bin/sh".to_string()], "/tmp");
+        let joined = argv.join(" ");
+        assert!(
+            joined.contains("--ro-bind /host/repo.git /host/repo.git")
+                && joined.contains("--ro-bind /host/wt /host/wt"),
+            "{joined}"
+        );
+    }
+
+    /// The invisibility canary counts a supervised bind like any
+    /// other mount source: a candidate beneath one is visible inside
+    /// the sandbox, so the pick falls through to a path the argv
+    /// provably never mounts.
+    #[test]
+    fn the_canary_never_sits_under_a_supervised_bind() {
+        let mut plan = plan_fixture();
+        let bound = tmp("supcanary");
+        std::fs::create_dir_all(&bound).unwrap();
+        // The coverage check canonicalizes the bound source — spell
+        // it resolved so /var→/private/var cannot split the match.
+        let bound = bound.canonicalize().unwrap();
+        plan.supervised_binds = vec![bound.clone()];
+        let picked = invisible_canary(&bound.join("ws-root"), &plan);
+        assert!(
+            !picked.starts_with(&bound),
+            "the canary is never under a supervised bind: {picked:?}"
+        );
+        let _ = std::fs::remove_dir_all(&bound);
     }
 
     /// A fixed-destination source mounts under its sandbox spelling

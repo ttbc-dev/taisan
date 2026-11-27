@@ -1114,6 +1114,7 @@ fn prove_verification_mounts(
         ca_bundles: containment::ca_trust_binds(&ctx.profile),
         extra_binds: vec![],
         extra_rw_binds: vec![],
+        supervised_binds: vec![],
         worker: None,
         mask_roots: layout.mask_roots(),
         masked_files: vec![],
@@ -1250,8 +1251,15 @@ fn run_verification_contained(
     // absolute-path element here names a host file the submission
     // cannot be allowed to read — nothing is derived from it, so a
     // missing path fails honestly inside the sandbox and the captured
-    // output can never carry host bytes.
-    let mut extra_binds = vec![worktree.to_path_buf(), layout.repository.clone()];
+    // output can never carry host bytes. The worktree and repository
+    // binds go in `supervised_binds`, not `extra_binds`: the
+    // supervisor produced the trees (a clean worktree, git-managed
+    // objects and refs), so the deep tree certification `plan_denial`
+    // runs on declared sources does not apply — a repository larger
+    // than the scan's entry bound must still verify. The relay is a
+    // single resolved file, not a supervisor-produced tree: it stays
+    // a declared-class bind like the launch plans keep it.
+    let mut extra_binds = Vec::new();
     if proxy.is_some() {
         let relay = ctx.relay_exe.clone();
         if relay.is_absolute() && relay.exists() && !extra_binds.contains(&relay) {
@@ -1272,6 +1280,7 @@ fn run_verification_contained(
         ca_bundles: containment::ca_trust_binds(&ctx.profile),
         extra_binds,
         extra_rw_binds: vec![gitdir.to_path_buf()],
+        supervised_binds: vec![worktree.to_path_buf(), layout.repository.clone()],
         worker: worker.clone(),
         mask_roots: layout.mask_roots(),
         masked_files: vec![],
