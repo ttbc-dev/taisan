@@ -826,6 +826,232 @@ fn a_coding_request_roundtrips_coordinator_to_executor_and_back() {
     assert_eq!(record.artifact_ids, vec![artifact_id]);
 }
 
+/// A zero-byte required artifact proves no bytes: remote verification
+/// reports it `Missing`, exactly as the local supervisor does, and
+/// establishes no artifact ref or acknowledged handoff row. An empty
+/// blob must never become `Present` just because its declared size and
+/// claimed digest agree at zero.
+#[test]
+fn an_empty_required_artifact_is_missing_not_present() {
+    let (rig, base) = rig("empty-artifact");
+    let required = vec![RequiredArtifact {
+        kind: "result".into(),
+        path: "dist/result.json".into(),
+        expected_digest: None,
+    }];
+    let seeded = seed_remote_request(
+        &rig.store,
+        &rig.bodies,
+        &rig.source.repository,
+        &base,
+        required.clone(),
+        1 << 20,
+        1 << 20,
+    );
+    let (prepared, _exported) = prepare_side(&rig, &seeded, "tr-in-1");
+    // The Worker commits an empty artifact and honestly describes its
+    // zero size and empty digest — the claim is internally consistent,
+    // yet there is no artifact evidence.
+    let produced = worker_produce(&rig, &prepared, "dist/result.json", b"");
+    assert_ne!(produced, base, "the work branch moved past its start");
+    let collection_id = format!("col-{}", seeded.request_id);
+    let assembled = remote_custody::assemble_collection(
+        &rig.custody,
+        &prepared.request,
+        &prepared.io_dir,
+        "tr-out-1",
+        &collection_id,
+        CHUNK,
+    )
+    .unwrap();
+    let dir = ship_collection(&assembled, &rig.coord_transfers);
+    let collected = remote_collect::collect_remote(
+        &rig.store,
+        &rig.collect_layout,
+        &dir,
+        &assembled.manifest,
+        &limits(),
+        &seeded.request_id,
+        &collection_id,
+        "stop-proof",
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(
+        collected.collection.state,
+        ExecutorCollectionState::Collected,
+        "invalid_reason: {:?}",
+        collected.collection.invalid_reason
+    );
+    assert_eq!(
+        collected.artifacts,
+        vec![(required[0].clone(), ArtifactFact::Missing)],
+        "an empty blob is Missing, never Present"
+    );
+    assert!(
+        collected
+            .collection
+            .record()
+            .unwrap()
+            .artifact_ids
+            .is_empty(),
+        "no artifact id is recorded for empty bytes"
+    );
+    let artifact_id = format!("{}/result", seeded.invocation_id);
+    let ref_status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&rig.handoff_repo)
+        .args([
+            "rev-parse",
+            "--verify",
+            &handoff::artifact_ref(&artifact_id),
+        ])
+        .output()
+        .unwrap()
+        .status;
+    assert!(
+        !ref_status.success(),
+        "an empty artifact establishes no artifact ref"
+    );
+    assert!(
+        rig.store
+            .transact(|tx| tx.artifact_handoff(&artifact_id))
+            .unwrap()
+            .is_none(),
+        "an empty artifact records no acknowledged handoff row"
+    );
+}
+
+/// A zero-byte blob is only `Missing` when its descriptor honestly
+/// declares zero bytes and the empty digest. A descriptor claiming a
+/// non-zero size or different bytes is the remote-only claim check
+/// failing: it stays `Corrupt` and never downgrades to `Missing`.
+#[test]
+fn an_empty_blob_with_an_inconsistent_descriptor_is_corrupt() {
+    let cases = [
+        (
+            "empty-size-mismatch",
+            6_u64,
+            sha256_hex("artifact-v1", b""),
+            "declared size disagrees with the produced blob",
+        ),
+        (
+            "empty-digest-mismatch",
+            0_u64,
+            sha256_hex("artifact-v1", b"RESULT"),
+            "claimed digest disagrees with the produced blob",
+        ),
+    ];
+    for (tag, bytes, claimed_sha256, expected_reason) in cases {
+        let (rig, base) = rig(tag);
+        let required = vec![RequiredArtifact {
+            kind: "result".into(),
+            path: "dist/result.json".into(),
+            expected_digest: None,
+        }];
+        let seeded = seed_remote_request(
+            &rig.store,
+            &rig.bodies,
+            &rig.source.repository,
+            &base,
+            required.clone(),
+            1 << 20,
+            1 << 20,
+        );
+        let (prepared, _exported) = prepare_side(&rig, &seeded, "tr-in-1");
+        let produced = worker_produce(&rig, &prepared, "dist/result.json", b"");
+        // The produced blob is empty, but the descriptor claims bytes
+        // it cannot prove — the remote size/digest checks still decide
+        // `Corrupt` before the empty-blob `Missing` rule runs.
+        let forged = RemoteHandoffV1 {
+            format_version: workloop_core::executor::REMOTE_HANDOFF_V1_FORMAT.into(),
+            request_id: seeded.request_id.clone(),
+            invocation_id: seeded.invocation_id.clone(),
+            repository: workloop_core::executor::HandoffRepository {
+                host: prepared.request.repository.host.clone(),
+                repository: prepared.request.repository.repository.clone(),
+            },
+            base_commit: base.clone(),
+            produced_commit: produced,
+            artifacts: vec![workloop_core::executor::HandoffArtifact {
+                path: "dist/result.json".into(),
+                bytes,
+                claimed_sha256,
+            }],
+        };
+        std::fs::write(
+            prepared.out_dir.join("handoff.json"),
+            serde_json::to_vec(&forged).unwrap(),
+        )
+        .unwrap();
+        let collection_id = format!("col-{}", seeded.request_id);
+        let assembled = remote_custody::assemble_collection(
+            &rig.custody,
+            &prepared.request,
+            &prepared.io_dir,
+            "tr-out-1",
+            &collection_id,
+            CHUNK,
+        )
+        .unwrap();
+        let dir = ship_collection(&assembled, &rig.coord_transfers);
+        let collected = remote_collect::collect_remote(
+            &rig.store,
+            &rig.collect_layout,
+            &dir,
+            &assembled.manifest,
+            &limits(),
+            &seeded.request_id,
+            &collection_id,
+            "stop-proof",
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(
+            collected.artifacts,
+            vec![(
+                required[0].clone(),
+                ArtifactFact::Corrupt {
+                    reason: Some(expected_reason.into()),
+                }
+            )],
+            "case {tag}: an inconsistent empty claim is Corrupt, not Missing"
+        );
+        assert!(
+            collected
+                .collection
+                .record()
+                .unwrap()
+                .artifact_ids
+                .is_empty(),
+            "case {tag}: corrupt evidence records no artifact id"
+        );
+        let artifact_id = format!("{}/result", seeded.invocation_id);
+        let ref_status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&rig.handoff_repo)
+            .args([
+                "rev-parse",
+                "--verify",
+                &handoff::artifact_ref(&artifact_id),
+            ])
+            .output()
+            .unwrap()
+            .status;
+        assert!(
+            !ref_status.success(),
+            "case {tag}: corrupt evidence establishes no artifact ref"
+        );
+        assert!(
+            rig.store
+                .transact(|tx| tx.artifact_handoff(&artifact_id))
+                .unwrap()
+                .is_none(),
+            "case {tag}: corrupt evidence records no acknowledged handoff row"
+        );
+    }
+}
+
 /// An interrupted transfer resumes at the journaled offset; a chunk
 /// replayed identically is idempotent and a different digest at the
 /// occupied offset is `conflicting_replay`.

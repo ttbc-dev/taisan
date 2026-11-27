@@ -718,6 +718,16 @@ fn validate_produced(
                         ArtifactFact::Corrupt {
                             reason: Some("claimed digest disagrees with the produced blob".into()),
                         }
+                    } else if blob.is_empty() {
+                        // An internally consistent empty blob proves no
+                        // artifact bytes — the same rule the local
+                        // supervisor's `artifact_fact` applies before
+                        // digest evidence. A zero-byte required
+                        // artifact is `Missing`, never `Present`. An
+                        // inconsistent descriptor was already decided
+                        // `Corrupt` above, so this never downgrades a
+                        // rejected claim.
+                        ArtifactFact::Missing
                     } else if required
                         .expected_digest
                         .as_ref()
