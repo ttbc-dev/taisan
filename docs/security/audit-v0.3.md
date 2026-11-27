@@ -115,12 +115,24 @@ supervisor-side sibling already learned this lesson —
 `unstage_credential` removes both `runtime-auth` and `runtime-auth.tmp`
 (`workloop-exec/src/boundary.rs`).
 
-**Scenario:** endpoint process is SIGKILLed mid-`stage_credential` after
-bytes land in the tmp file; the request later completes, gets collected
-and acknowledged — `reclaim_bodies` reports bodies reclaimed while a
-credential fragment still sits in the request dir. The defect is the
-violated retention contract — a false reclamation report — independent
-of who might read the residue.
+**Scenario:** a credential delivery is retried while the request is
+still `prepared` — a lost ack, a coordinator-side re-send
+(`stage_credential` refuses any later state, so a retry can only land
+before start). The retry's `write_atomic_private` fails after the tmp
+file is created but before rename (I/O error, full disk): the first
+delivery's `runtime-auth` is intact, `runtime-auth.tmp-partial` now
+holds the torn second write, and the retry's refused ack is invisible
+to the start gate — `has_credential` checks only the `runtime-auth`
+name, so `start` proceeds on the staged credential. The request runs,
+stops, is collected and acknowledged — `release_credential` clears
+`runtime-auth` at stop proof and `reclaim_bodies` reports bodies
+reclaimed, while a credential fragment still sits in the request dir.
+(A crash mid-stage leaves the same residue but strands the request on
+its dead incarnation — under F8, no stop proof can ever be produced,
+so collect and acknowledge never run; only the in-incarnation write
+failure reaches a false reclaim report.) The defect is the violated
+retention contract — a false reclamation report — independent of who
+might read the residue.
 
 **Direction:** add `runtime-auth.tmp-partial` to the `reclaim_bodies`
 list and to `release_credential`; or have `stage_credential` sweep the
