@@ -27,7 +27,9 @@
 //!                               present — the sandbox mount point)
 //!   --provider-config <path>    JSON provider config (default
 //!                               /taisan/provider-config when present):
-//!                               {"model": "...", "endpoint": "...",
+//!                               {"format_version":
+//!                                "taisan.worker.bindings/1",
+//!                                "model": "...", "endpoint": "...",
 //!                                "proxy_endpoint": "..."}
 //!
 //! `describe` is effect-free and bounded: it probes the runtime's

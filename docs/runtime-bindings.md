@@ -93,8 +93,14 @@ published until its own drop unlinks it, so an unlocked staging
 shape — a dead owner's leftovers or an unattributed legacy name
 (`runtime-auth`, `runtime-auth.<seq>`) — is reclaimable, while a
 file a live boundary still holds is another boundary's grant and is
-never removed. A path the resolved configuration names, or any other
-file under the shared staging dir, is never removed either.
+never removed. A path the resolved configuration names is never
+removed either, and neither is an entry that is not one of the
+staging shapes — the sweep only ever unlinks a `runtime-auth`,
+`runtime-auth.<seq>`, or owner-tagged
+`runtime-auth.p<pid>.i<instance>.<seq>` name, or its `.tmp` sibling,
+that it can prove unclaimed. A stage whose in-progress `.tmp` sibling a
+concurrent sweep reclaimed before its claim was observable loses the
+race the same way an occupied name does: it takes the next seq.
 
 The credential value never enters argv, the request body,
 `runtime.log`, the report, evidence, the provider contract document,

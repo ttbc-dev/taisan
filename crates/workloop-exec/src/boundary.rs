@@ -312,9 +312,12 @@ impl RuntimeBoundary {
         // renames over an existing name) and an occupied name — whether
         // found here or raced past the check — costs a seq, never a
         // neighbour's file. The `.tmp` sibling carries the same secret
-        // bytes the moment it is created, so it is checked as well.
-        // Past a bounded run of collisions the stage refuses rather
-        // than scan forever.
+        // bytes the moment it is created, so it is checked as well —
+        // and a sibling a concurrent sweep reclaimed before this
+        // stage's claim was observable loses the race the same way:
+        // publish then finds the `.tmp` gone, also a seq, never a
+        // launch failure. Past a bounded run of collisions the stage
+        // refuses rather than scan forever.
         let mut seq = ready.next_grant;
         loop {
             let name = self.staging_name(seq);
@@ -568,10 +571,11 @@ fn staging_file_is_claimed(path: &Path) -> bool {
     (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }) != 0
 }
 
-/// Why a stage attempt did not publish: `Occupied` means the name —
-/// or its `.tmp` sibling — proved foreign at publish time (the caller
-/// tries the next seq; nothing of ours was left behind), `Failed`
-/// carries the refusal for a real error.
+/// Why a stage attempt did not publish: `Occupied` means the name
+/// proved foreign at publish time — or its `.tmp` sibling was
+/// reclaimed by a neighbour's sweep in the create→flock window (the
+/// caller tries the next seq; nothing of ours was published or left
+/// behind), `Failed` carries the refusal for a real error.
 enum StageError {
     Occupied,
     Failed(String),
@@ -586,8 +590,12 @@ enum StageError {
 /// fails `EEXIST` instead of being overwritten, so a same-tagged
 /// neighbour (owner tags can collide across pid namespaces) racing
 /// the publish loses a seq rather than having its live grant swapped
-/// out from under it. On `Err(Failed)` the caller owns removing
-/// `tmp` — it may already hold a partial secret copy.
+/// out from under it. A neighbour's sweep can also reclaim `tmp`
+/// itself in the window before this file's flock is observable, so
+/// publish treats a vanished sibling as the same lost race
+/// (`Occupied`), never as a stage failure. On `Err(Failed)` the
+/// caller owns removing `tmp` — it may already hold a partial secret
+/// copy.
 fn write_staged_credential(
     tmp: &Path,
     path: &Path,
@@ -630,20 +638,34 @@ fn write_staged_credential(
             .and_then(|()| file.sync_all())
             .map_err(fail)?;
     }
-    // No-clobber publish: `hard_link` gives `path` a second name for
-    // this inode atomically, failing EEXIST on any existing entry —
-    // the lock rides the inode's open file description, so the
-    // published name is claimed from its first instant.
+    publish_staged(tmp, path).map(|()| file)
+}
+
+/// Publish `tmp` under `path` *without clobbering*: `hard_link` gives
+/// `path` a second name for the same inode atomically, failing EEXIST
+/// on any existing entry — the owner's lock rides the inode's open
+/// file description, so the published name is claimed from its first
+/// instant. ENOENT is the same lost race from the other side: a
+/// neighbour's sweep reclaimed the still-unclaimed sibling in the
+/// window between `create_new` and the flock that made the claim
+/// observable (a sweep that probed in the window may unlink the name
+/// later), so nothing of ours was published — `Occupied`, a seq, not
+/// a stage failure. `tmp` is removed on every non-`Failed` outcome;
+/// on `Failed` the caller owns the removal.
+fn publish_staged(tmp: &Path, path: &Path) -> Result<(), StageError> {
     match std::fs::hard_link(tmp, path) {
         Ok(()) => {
             let _ = std::fs::remove_file(tmp);
-            Ok(file)
+            Ok(())
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+        Err(e)
+            if e.kind() == std::io::ErrorKind::AlreadyExists
+                || e.kind() == std::io::ErrorKind::NotFound =>
+        {
             let _ = std::fs::remove_file(tmp);
             Err(StageError::Occupied)
         }
-        Err(e) => Err(fail(e)),
+        Err(e) => Err(StageError::Failed(format!("credential.stage_failed: {e}"))),
     }
 }
 
@@ -1326,6 +1348,41 @@ mod tests {
             runtime.join(boundary.staging_name(1)),
             "the stage advances to a free staging name"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A neighbour's sweep can reclaim the staging sibling in the
+    /// window between `create_new` and the flock that makes the
+    /// stage's claim observable — publish then finds the `.tmp` gone.
+    /// That lost race is the same collision class as an occupied
+    /// name: it costs a seq (`Occupied`), never fails the launch, and
+    /// the swept inode dies with the stager's descriptor. The
+    /// `Occupied` → next-seq advance is pinned end-to-end by
+    /// `a_same_owner_tag_contender_never_clobbers_the_holders_grant`.
+    #[test]
+    fn a_swept_staging_sibling_costs_a_seq() {
+        let dir = tmp("sweptsib");
+        let runtime = dir.join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let tmp = runtime.join("runtime-auth.p3.i3.0.tmp");
+        let path = runtime.join("runtime-auth.p3.i3.0");
+        // The sibling a neighbour's sweep reclaimed mid-stage:
+        // publish reports the lost race, not a stage failure.
+        assert!(matches!(
+            publish_staged(&tmp, &path),
+            Err(StageError::Occupied)
+        ));
+        assert!(!path.exists(), "a swept publish never creates the name");
+        // An occupied publish name is the same class — and still
+        // never clobbers the file that took the name.
+        std::fs::write(&tmp, b"staged").unwrap();
+        std::fs::write(&path, b"neighbour").unwrap();
+        assert!(matches!(
+            publish_staged(&tmp, &path),
+            Err(StageError::Occupied)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"neighbour");
+        assert!(!tmp.exists(), "the losing sibling is removed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
