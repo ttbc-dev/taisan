@@ -102,6 +102,7 @@ fn live_repo(env: &LiveEnv) -> RepositoryRef {
 
 fn live_config(env: &LiveEnv) -> WorkloopConfig {
     WorkloopConfig {
+        placement: workloop_core::placement::PlacementPolicy::default(),
         host: HostTemplate {
             adapter: AdapterId::trusted("github"),
             repository: live_repo(env),

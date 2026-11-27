@@ -39,6 +39,7 @@ fn publisher() -> HostActorRef {
 fn config() -> WorkloopConfig {
     use std::collections::BTreeSet;
     WorkloopConfig {
+        placement: workloop_core::placement::PlacementPolicy::default(),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),

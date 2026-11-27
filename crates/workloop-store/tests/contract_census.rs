@@ -60,6 +60,7 @@ fn publisher() -> HostActorRef {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
+        placement: workloop_core::placement::PlacementPolicy::default(),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),

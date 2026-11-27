@@ -583,6 +583,7 @@ mod tests {
 
     fn workloop_config() -> WorkloopConfig {
         WorkloopConfig {
+            placement: workloop_core::placement::PlacementPolicy::default(),
             host: HostTemplate {
                 adapter: AdapterId::trusted("fixture"),
                 repository: RepositoryRef::new(

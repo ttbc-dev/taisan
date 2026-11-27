@@ -88,7 +88,56 @@ pub struct ExecutionView {
     /// `uncertain` while ownership of a writer is unproven.
     pub ownership: String,
     pub invocation_ids: Vec<InvocationId>,
+    /// The execution's durable request rows explained for inspection
+    /// (#379): role, executor identity, liveness class, and any
+    /// dispatch-refusal code.
+    pub requests: Vec<RequestView>,
     pub outcome: Option<Outcome>,
+}
+
+/// The bound endpoint's public descriptor — transport kind/host/port
+/// and the authenticated identity digest. Credential references are
+/// opaque provider names and never appear in inspect output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestEndpointView {
+    pub endpoint_id: String,
+    pub kind: String,
+    pub host: String,
+    pub port: u16,
+    pub expected_identity_digest: String,
+}
+
+/// One durable request row the inspect surface explains (#379): which
+/// executor it is bound to, its role, whether it is still pending /
+/// launched / refused, and the refusal code when it is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestView {
+    pub request_id: String,
+    pub role: InvocationRole,
+    /// The recorded executor identity — `local` or the bound
+    /// endpoint's id. A row recorded before placement existed carries
+    /// no binding; its executor is the coordinator host's local one.
+    pub executor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<RequestEndpointView>,
+    /// The placement schema version + resolved-policy digest the
+    /// binding was stamped with at admission; `None` on a
+    /// pre-placement row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_schema_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_config_digest: Option<String>,
+    /// `pending` while unconsumed, `launched` once an Invocation
+    /// exists for the request, `refused` once a durable
+    /// dispatch-refusal fact names it.
+    pub liveness: String,
+    /// The closed `request.*` refusal code when refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_id: Option<InvocationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation_state: Option<InvocationState>,
 }
 
 /// One finding the detail pane displays: the occurrence id a
@@ -444,6 +493,46 @@ pub fn work_list(
     })
 }
 
+/// Shape one durable request row for inspection. `liveness` is the
+/// caller-classified state (`pending`/`launched`/`refused`); the
+/// recorded binding supplies the executor identity and audit anchor.
+/// Credential references are deliberately not carried — the endpoint
+/// view is the public descriptor only.
+fn request_view(
+    request: &InvocationRequest,
+    liveness: &str,
+    invocation: Option<&Invocation>,
+    refusal: Option<String>,
+) -> RequestView {
+    let (executor, endpoint, schema_version, digest) = match &request.placement {
+        Some(binding) => (
+            binding.executor.clone(),
+            binding.endpoint.as_ref().map(|ep| RequestEndpointView {
+                endpoint_id: ep.endpoint_id.clone(),
+                kind: ep.kind.clone(),
+                host: ep.host.clone(),
+                port: ep.port,
+                expected_identity_digest: ep.expected_identity_digest.clone(),
+            }),
+            Some(binding.schema_version),
+            Some(binding.config_digest.clone()),
+        ),
+        None => ("local".into(), None, None, None),
+    };
+    RequestView {
+        request_id: request.request_id.clone(),
+        role: request.role.clone(),
+        executor,
+        endpoint,
+        placement_schema_version: schema_version,
+        placement_config_digest: digest,
+        liveness: liveness.into(),
+        refusal,
+        invocation_id: invocation.map(|i| i.id.clone()),
+        invocation_state: invocation.map(|i| i.state.clone()),
+    }
+}
+
 pub fn work_detail(
     tx: &dyn ReadView,
     work_id: &WorkId,
@@ -452,14 +541,42 @@ pub fn work_detail(
     let Some(work) = tx.work(work_id)? else {
         return Ok(QueryResult::NotFound);
     };
+    let pending = tx.pending_requests()?;
     let executions = tx
         .executions_for_work(work_id)?
         .into_iter()
         .map(|e| {
-            let ids = tx
-                .invocations_for_execution(&e.id)
-                .map(|v| v.into_iter().map(|i| i.id).collect())
-                .unwrap_or_default();
+            let invs = tx.invocations_for_execution(&e.id).unwrap_or_default();
+            let ids = invs.iter().map(|i| i.id.clone()).collect();
+            // Every durable request row for the execution, classified:
+            // still-pending rows come from the pending set, launched
+            // rows behind each Invocation, refused rows behind the
+            // dispatch-refusal facts. A refused request is consumed
+            // without an Invocation, so the refusal facts are the only
+            // index onto it.
+            let mut requests: Vec<RequestView> = pending
+                .iter()
+                .filter(|r| r.execution_id == e.id)
+                .map(|r| request_view(r, "pending", None, None))
+                .collect();
+            for inv in &invs {
+                if let Ok(Some(r)) = tx.request(&inv.request_id) {
+                    requests.push(request_view(&r, "launched", Some(inv), None));
+                }
+            }
+            if let Ok(obs) = tx.observations_for_execution(&e.id) {
+                for fact in obs.iter().filter_map(|o| match &o.fact {
+                    ObservationFact::DispatchRefused {
+                        request_id, code, ..
+                    } => Some((request_id.clone(), code.clone())),
+                    _ => None,
+                }) {
+                    if let Ok(Some(r)) = tx.request(&fact.0) {
+                        requests.push(request_view(&r, "refused", None, Some(fact.1)));
+                    }
+                }
+            }
+            requests.sort_by(|a, b| a.request_id.cmp(&b.request_id));
             ExecutionView {
                 ownership: if e.state == ExecutionState::Uncertain {
                     "uncertain".into()
@@ -469,6 +586,7 @@ pub fn work_detail(
                 execution_id: e.id,
                 state: e.state,
                 invocation_ids: ids,
+                requests,
                 outcome: e.outcome,
             }
         })

@@ -10,8 +10,8 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `16` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1` through `15`
+//! `PRAGMA user_version` is the format gate: `17` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1` through `16`
 //! must carry the complete recognized schema of its version and
 //! upgrades additively at open; a stamped file whose schema is foreign
 //! or incomplete, an unversioned database with user tables (a slice-0
@@ -56,8 +56,11 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// record (`docs/executor-transport-contract.md` §6, #376);
 /// `16` adds the usage row's per-pair `merge_check_services` cursor,
 /// which replaces the merge-check service record's observation rows.
+/// `17` adds the `invocation_requests.placement_binding` column —
+/// the immutable executor-placement record every request carries at
+/// admission (`docs/remote-executor.md` §2.2, #379).
 /// Older files upgrade additively at open.
-pub(crate) const FORMAT_VERSION: i64 = 16;
+pub(crate) const FORMAT_VERSION: i64 = 17;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -363,8 +366,8 @@ impl SqliteStore {
             // and a v8 file everything except the v9 addition, a
             // v9–v13 file everything except the v13 and v14
             // additions, a v14 file everything except v15's
-            // collection table, and a v15 file everything (v16 adds
-            // a column, not a table). A
+            // collection table, and a v15 or v16 file everything
+            // (v16 and v17 each add a column, not a table). A
             // foreign or
             // truncated stamped file fails this check untouched, and
             // the accepted difference is a previous release's store: it
@@ -456,8 +459,8 @@ impl SqliteStore {
                     .filter(|t| !V14_ADDED_TABLES.contains(t))
                     .all(|t| present.contains(*t))
             } else {
-                // A v15 file holds every table; v16 adds a column,
-                // not a table.
+                // A v15 or v16 file holds every table; v16 and v17
+                // each add a column, not a table.
                 EXPECTED_TABLES.iter().all(|t| present.contains(*t))
             };
             if !required_complete {
@@ -579,6 +582,20 @@ impl SqliteStore {
             if !has_merge_check_services {
                 tx.execute_batch("ALTER TABLE work_usage ADD COLUMN merge_check_services TEXT")
                     .map_err(internal)?;
+            }
+            let has_placement_binding: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('invocation_requests') \
+                     WHERE name='placement_binding')",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(internal)?;
+            if !has_placement_binding {
+                tx.execute_batch(
+                    "ALTER TABLE invocation_requests ADD COLUMN placement_binding TEXT",
+                )
+                .map_err(internal)?;
             }
             // A pre-ledger store recorded protection as the bare
             // `pinned` boolean. Reconstruct the ledger row under the
@@ -1352,6 +1369,7 @@ fn request_from_row(row: &rusqlite::Row<'_>) -> Result<InvocationRequest, rusqli
         spec_revision: row.get(4)?,
         payload: de_row(&row.get::<_, String>(5)?)?,
         adapter_binding: opt_de_row(row.get::<_, Option<String>>(6)?)?,
+        placement: opt_de_row(row.get::<_, Option<String>>(7)?)?,
     })
 }
 
@@ -1877,7 +1895,7 @@ impl ReadView for Tx<'_> {
     fn pending_requests(&self) -> Result<Vec<InvocationRequest>, StoreError> {
         self.query_all(
             "SELECT request_id, work_id, execution_id, role, spec_revision, \
-             payload, adapter_binding FROM invocation_requests \
+             payload, adapter_binding, placement_binding FROM invocation_requests \
              WHERE consumed=0 ORDER BY rowid",
             [],
             request_from_row,
@@ -1887,7 +1905,7 @@ impl ReadView for Tx<'_> {
     fn request(&self, request_id: &str) -> Result<Option<InvocationRequest>, StoreError> {
         self.query_opt(
             "SELECT request_id, work_id, execution_id, role, spec_revision, \
-             payload, adapter_binding FROM invocation_requests WHERE request_id=?1",
+             payload, adapter_binding, placement_binding FROM invocation_requests WHERE request_id=?1",
             params![request_id],
             request_from_row,
         )
@@ -2908,8 +2926,9 @@ impl TxView for Tx<'_> {
             Effect::InsertRequest { request } => {
                 self.exec(
                     "INSERT INTO invocation_requests (request_id, work_id, \
-                     execution_id, role, spec_revision, payload, adapter_binding) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                     execution_id, role, spec_revision, payload, adapter_binding, \
+                     placement_binding) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                     params![
                         request.request_id,
                         request.work_id.0,
@@ -2918,6 +2937,7 @@ impl TxView for Tx<'_> {
                         request.spec_revision,
                         json(&request.payload)?,
                         request.adapter_binding.as_ref().map(json).transpose()?,
+                        request.placement.as_ref().map(json).transpose()?,
                     ],
                 )?;
             }

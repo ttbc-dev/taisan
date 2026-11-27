@@ -157,6 +157,7 @@ fn populate(db: &Path) {
         },
         Effect::InsertRequest {
             request: InvocationRequest {
+                placement: None,
                 request_id: "req-c1".into(),
                 work_id: work.id.clone(),
                 execution_id: execution.id.clone(),
@@ -245,6 +246,7 @@ fn populate(db: &Path) {
         },
         Effect::InsertRequest {
             request: InvocationRequest {
+                placement: None,
                 request_id: "req-f1".into(),
                 work_id: work.id.clone(),
                 execution_id: execution.id.clone(),

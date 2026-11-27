@@ -53,6 +53,7 @@ fn publisher() -> HostActorRef {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
+        placement: workloop_core::placement::PlacementPolicy::default(),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),
@@ -759,6 +760,7 @@ fn dispatch_conflict_defers_that_item_and_later_items_still_admit() {
     // InsertRequest trips the uniqueness constraint — the shape of a
     // lost request-ID race with another process.
     let seeded = InvocationRequest {
+        placement: None,
         request_id: format!("{}:inv:0", e1.0),
         work_id: w1,
         execution_id: e1.clone(),
@@ -2132,6 +2134,7 @@ fn admission_rolls_back_on_request_persistence_failure() {
         &store,
         &[Effect::InsertRequest {
             request: InvocationRequest {
+                placement: None,
                 request_id: format!("{}:inv:0", e1.0),
                 work_id: work_id.clone(),
                 execution_id: e1.clone(),
@@ -4837,6 +4840,7 @@ fn bind_check_request_body(
             // wrote it at mint and consumed it at spawn.
             Effect::InsertRequest {
                 request: InvocationRequest {
+                    placement: None,
                     request_id: request.request_id.clone(),
                     work_id: w.clone(),
                     execution_id: eid.clone(),
@@ -5623,7 +5627,7 @@ fn a_v2_store_upgrades_to_the_current_format_preserving_rows() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 16, "the upgrade lands on the current format");
+        assert_eq!(version, 17, "the upgrade lands on the current format");
     }
     // A second open must not re-migrate — the schema is already current.
     let _ = SqliteStore::open(&db, 1).unwrap();
@@ -5688,7 +5692,7 @@ fn a_v9_store_gains_the_retirement_generation_column() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 16, "the upgrade lands on the current format");
+        assert_eq!(version, 17, "the upgrade lands on the current format");
     }
     drop(store);
     // Re-opening after the upgrade is a no-op, not a second migration.
@@ -5740,8 +5744,89 @@ fn a_v12_store_gains_the_observation_execution_index() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 16, "the upgrade lands on the current format");
+        assert_eq!(version, 17, "the upgrade lands on the current format");
     }
+    drop(store);
+    // Re-opening after the upgrade is a no-op, not a second migration.
+    let _ = SqliteStore::open(&db, 1).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Regression (#379): a v16 store's `invocation_requests` lacks the
+/// v17 `placement_binding` column; opening it adds the column inside
+/// the idempotent upgrade transaction, request rows survive and read
+/// back as pre-placement rows (`placement: None` — their executor is
+/// the coordinator host's local one).
+#[test]
+fn a_v16_store_gains_the_placement_binding_column() {
+    let root = temp_root("upgrade-v16");
+    let db = root.join("store.db");
+    let request_id = {
+        let store = SqliteStore::open(&db, 1).unwrap();
+        let request = submit("k-upgrade-v16");
+        let (work_id, execution_id) =
+            accepted_with_execution(&handle_command(&store, &config(), &request, NOW).unwrap());
+        store
+            .transact(|tx| {
+                tx.apply(&Effect::InsertRequest {
+                    request: InvocationRequest {
+                        request_id: format!("{}:inv:0", execution_id.0),
+                        work_id: work_id.clone(),
+                        execution_id: execution_id.clone(),
+                        role: InvocationRole::Coding,
+                        spec_revision: 1,
+                        payload: serde_json::json!({}),
+                        adapter_binding: None,
+                        placement: None,
+                    },
+                })?;
+                Ok(())
+            })
+            .unwrap();
+        format!("{}:inv:0", execution_id.0)
+    };
+    // Reshape into a faithful v16 file: the column absent, stamp 16.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE invocation_requests DROP COLUMN placement_binding; \
+             PRAGMA user_version=16;",
+        )
+        .unwrap();
+        let has: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('invocation_requests') \
+                 WHERE name='placement_binding')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!has, "the reshaped file is a real v16 table");
+    }
+    let store = SqliteStore::open(&db, 1).expect("a v16 store upgrades in place");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let has: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('invocation_requests') \
+                 WHERE name='placement_binding')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(has, "the v16->v17 migration adds placement_binding");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 17, "the upgrade lands on the current format");
+    }
+    // The pre-placement request row reads back unbound — its executor
+    // is the coordinator host's local one, never a retarget.
+    let request = store
+        .transact(|tx| tx.request(&request_id))
+        .unwrap()
+        .expect("the v16 request row survives the upgrade");
+    assert!(request.placement.is_none());
     drop(store);
     // Re-opening after the upgrade is a no-op, not a second migration.
     let _ = SqliteStore::open(&db, 1).unwrap();
@@ -6624,6 +6709,7 @@ fn a_v2_finish_before_the_handoff_row_records_no_push_intent() {
         &[
             Effect::InsertRequest {
                 request: InvocationRequest {
+                    placement: None,
                     request_id: invocation.request_id.clone(),
                     work_id: w.clone(),
                     execution_id: e1.clone(),
@@ -7811,7 +7897,7 @@ fn a_previous_release_v1_store_is_upgraded_in_place() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 16, "the upgrade lands on the current format");
+        assert_eq!(version, 17, "the upgrade lands on the current format");
     }
     // Re-opening after the upgrade is a no-op, not a second migration.
     drop(store);

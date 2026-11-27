@@ -85,6 +85,7 @@ fn fixture_sup<P: ProcessControlPort>(
 
 fn config_with(host_write: bool) -> WorkloopConfig {
     WorkloopConfig {
+        placement: workloop_core::placement::PlacementPolicy::default(),
         host: HostTemplate {
             adapter: AdapterId::trusted("worker-contract"),
             repository: repo(),

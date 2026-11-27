@@ -2243,6 +2243,20 @@ fn build_supervisor(
                 out_root: handoff_root.join("out"),
                 state_root: Some(state_root.to_path_buf()),
                 verification,
+                // The separate verification placement (#379): a
+                // remote target defers every declared requirement to
+                // the bound endpoint — never a silent local run.
+                verification_placement: config.placement.verification,
+                remote_verification_executor: (config.placement.verification
+                    == workloop_core::placement::PlacementTarget::Remote)
+                    .then(|| {
+                        config
+                            .placement
+                            .endpoint
+                            .as_ref()
+                            .map(|e| e.endpoint_id.clone())
+                    })
+                    .flatten(),
             }),
     ))
 }
@@ -2303,6 +2317,7 @@ mod tests {
 
     fn config() -> WorkloopConfig {
         WorkloopConfig {
+            placement: workloop_core::placement::PlacementPolicy::default(),
             host: HostTemplate {
                 adapter: AdapterId::trusted("fixture"),
                 repository: repository(),

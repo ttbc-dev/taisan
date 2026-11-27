@@ -69,6 +69,11 @@ pub struct WorkloopConfig {
     pub budget: ExecutionBudget,
     /// The Work-wide recovery policy stamped at acceptance.
     pub policy: WorkPolicy,
+    /// The validated per-role executor-placement policy (#379) every
+    /// admitted request binds at dispatch. Defaults to all-local; a
+    /// configured `placement` section arrives already validated — the
+    /// loader is fail-closed on any unknown key or version.
+    pub placement: crate::placement::PlacementPolicy,
 }
 
 /// The capability set every publishable Work needs, plus `issue_read`
@@ -2314,6 +2319,12 @@ pub fn admit_queued_role(
         // the admission scan, or by `execution` immediately before the
         // first launch. It is never inferred from configuration.
         adapter_binding: None,
+        // Bound at admission (#379): the executor placement — executor
+        // identity, resolved target, endpoint descriptor, and the
+        // schema version/config digest the decision resolved under —
+        // records with the request and is immutable. A configuration
+        // reload binds only requests admitted after it.
+        placement: Some(config.placement.binding_for(&role)),
     };
     let mut next = execution.clone();
     next.state = ExecutionState::Ready;
@@ -2370,7 +2381,6 @@ pub fn admit_queued_role(
     tx.apply(&Effect::ClearDeferral {
         execution_id: execution_id.clone(),
     })?;
-    let _ = config;
     Ok(Some(next))
 }
 

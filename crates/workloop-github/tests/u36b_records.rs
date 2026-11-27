@@ -91,6 +91,7 @@ fn declared_set(adapter_id: &str) -> BTreeSet<HostCapability> {
 
 fn config(adapter_id: &str) -> WorkloopConfig {
     WorkloopConfig {
+        placement: workloop_core::placement::PlacementPolicy::default(),
         host: HostTemplate {
             adapter: AdapterId::trusted(adapter_id),
             repository: repo(),

@@ -43,6 +43,7 @@ fn tmp_root(tag: &str) -> PathBuf {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
+        placement: workloop_core::placement::PlacementPolicy::default(),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),
@@ -1596,6 +1597,7 @@ fn a_v1_review_launch_mounts_the_workspace_read_only() {
         .transact(|tx| {
             tx.apply(&Effect::InsertRequest {
                 request: InvocationRequest {
+                    placement: None,
                     request_id: format!("{}:inv:7", eid.0),
                     work_id: w.clone(),
                     execution_id: eid.clone(),
@@ -1788,6 +1790,7 @@ fn a_contained_assessment_binds_the_workspace_read_only() {
             })?;
             tx.apply(&Effect::InsertRequest {
                 request: InvocationRequest {
+                    placement: None,
                     request_id: format!("{}:inv:check", check_eid.0),
                     work_id: check_work.clone(),
                     execution_id: check_eid.clone(),

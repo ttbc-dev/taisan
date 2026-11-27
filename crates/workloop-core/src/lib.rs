@@ -6,6 +6,7 @@ pub mod executor;
 pub mod identity;
 pub mod mergeability;
 pub mod observation;
+pub mod placement;
 pub mod ports;
 pub mod projection;
 pub mod review;

@@ -83,6 +83,7 @@ fn repo() -> RepositoryRef {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
+        placement: workloop_core::placement::PlacementPolicy::default(),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),
@@ -903,6 +904,8 @@ fn u46c_interrupted_export_import_recovers_under_changed_config_without_duplicat
         out_root: out_root.clone(),
         state_root: None,
         verification: None,
+        verification_placement: workloop_core::placement::PlacementTarget::Local,
+        remote_verification_executor: None,
     };
     let spawns = Rc::new(Cell::new(0usize));
     let prior_argv = vec![fixture_bin(), "clean-exit".into()];
@@ -1288,6 +1291,8 @@ fn u46c_recollection_acknowledges_and_retains_git_objects_under_changed_config()
         out_root: out_root.clone(),
         state_root: None,
         verification: None,
+        verification_placement: workloop_core::placement::PlacementTarget::Local,
+        remote_verification_executor: None,
     };
     let spawns = Rc::new(Cell::new(0usize));
     let prior_argv = vec![fixture_bin(), "clean-exit".into()];

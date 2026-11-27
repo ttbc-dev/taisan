@@ -26,6 +26,7 @@ fn host_instance() -> HostInstanceId {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
+        placement: workloop_core::placement::PlacementPolicy::default(),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: RepositoryRef::new(host_instance(), RepositoryId::trusted("local-repo")),

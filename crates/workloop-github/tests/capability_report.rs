@@ -40,6 +40,7 @@ type Adapter = GitHubAdapter<InMemoryGitHub>;
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
+        placement: workloop_core::placement::PlacementPolicy::default(),
         host: HostTemplate {
             adapter: AdapterId::trusted("github"),
             repository: repo(),

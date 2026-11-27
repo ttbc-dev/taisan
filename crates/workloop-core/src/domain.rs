@@ -780,6 +780,14 @@ pub struct InvocationRequest {
     /// and is the only selection that may spawn this request.
     #[serde(default)]
     pub adapter_binding: Option<WorkerAdapterBinding>,
+    /// The executor-placement decision bound at admission (#379):
+    /// executor identity, resolved target, and the schema
+    /// version/config digest the decision was made under. `None` is a
+    /// request recorded before placement existed — its executor is the
+    /// coordinator host's local one. Once set it is immutable and is
+    /// never retargeted, including while the request stays pending.
+    #[serde(default)]
+    pub placement: Option<crate::placement::PlacementBinding>,
 }
 
 /// A resource a writer may change.
