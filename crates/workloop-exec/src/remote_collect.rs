@@ -708,6 +708,12 @@ fn validate_produced(
         let fact = match handoff.artifacts.iter().find(|d| d.path == required.path) {
             None => ArtifactFact::Missing,
             Some(descriptor) => match blob_at(&layout.repository, &produced, &descriptor.path) {
+                // An empty blob proves no artifact bytes — the same
+                // rule the local supervisor's `artifact_fact` applies
+                // before digest evidence. A zero-byte required
+                // artifact is `Missing`, never `Present`, even when
+                // the descriptor honestly declares size and digest 0.
+                Ok(Some(blob)) if blob.is_empty() => ArtifactFact::Missing,
                 Ok(Some(blob)) => {
                     let digest = sha256_hex(ARTIFACT_DIGEST_TAG, &blob);
                     if blob.len() as u64 != descriptor.bytes {
