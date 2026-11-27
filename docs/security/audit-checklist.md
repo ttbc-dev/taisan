@@ -80,13 +80,13 @@ claim.
 
 - `crates/workloop-executor/src/runner.rs` — `stage_credential`
   (prepared-state gate, launch-config-digest binding, 4 KiB bound),
-  `has_credential` start gate, `release_credential` at stop proof;
-  every code path that creates, reads, or removes `runtime-auth` — and
-  its `*.tmp-partial` sibling.
+  `has_credential` start gate, `release_credential` at stop proof,
+  `clear_torn_prepare` removal of a torn `prepared/` set; every code
+  path that creates, reads, or removes `runtime-auth` — and its
+  `*.tmp-partial` sibling.
 - `crates/workloop-executor/src/state.rs` — `write_atomic_private`
   (mode 0600 at creation, pre-existing tmp clamp, fsync+rename);
-  `reclaim_bodies` and `clear_torn_prepare` coverage of every
-  credential-bearing filename.
+  `reclaim_bodies` coverage of every credential-bearing filename.
 - Retention: what removes a staged credential when a prepared request is
   never started, never stopped, never acknowledged, or the incarnation
   restarts?
@@ -110,7 +110,9 @@ claim.
 
 - `crates/workloop-executor/src/runner.rs` — `OUT_WHITELIST` membership,
   `read_bounded_file` (`symlink_metadata`, regular-file refusal, byte
-  cap), `copy_tree` symlink/unsafe-path refusal, `RemoteHandoffV1`
+  cap), `copy_tree` symlink/unsafe-path refusal, `RemoteHandoffV1::parse`
+  consumption of the collected `handoff.json`.
+- `crates/workloop-core/src/executor.rs` — `RemoteHandoffV1`
   bound+strict+closed fields, `path_is_valid` grammar.
 - `bundle_objects`/`run_git`/`git_env` — `git` invoked inside a
   Worker-controlled repository: which git config surface is still read

@@ -78,29 +78,10 @@
 
 ## Findings
 
-### F1 — MEDIUM: bootstrap credential files accepted without ownership/mode checks
-
-`crates/workloop-executor/src/config.rs:154-186` (`read_credential`).
-
-The endpoint and coordinator session credentials — the root secrets of
-the entire transport-auth chain — are read with only a 4096-byte bound
-and a whitespace trim. No euid check, no `mode & 0o077 == 0` check, no
-regular-file check. Both `file:` provider implementations enforce all
-three on the resolved secret paths
-(`workloop-exec/src/credentials.rs:155-197`,
-`workloop-github/src/credential.rs:176-204`); the module docstring even
-claims the bootstrap stages them "mode-0600" — nothing verifies that
-claim.
-
-**Scenario:** an operator stages `coordinator_credential_file` with
-default perms (0644), or the bootstrap tooling writes it umask-default.
-The endpoint accepts it silently; any local user reads the secret and
-forges a coordinator session (`SessionOpen` MAC, `channel.rs:177-190`)
-to command the endpoint: arbitrary `prepare`/`start`/`collect`.
-
-**Direction:** apply the same euid + `mode & 0o077` + regular-file
-checks as `resolve_file` — share the helper rather than re-implement.
-**Coverage:** none found.
+F1, F7, and F11 were reclassified into Accepted risks — their concrete
+harms require declared non-goals (a multi-tenant endpoint host,
+platform-level denial of service, trusted operator configuration).
+Numbering of the remaining findings is preserved.
 
 ### F2 — MEDIUM: `CoordinatorEndpoint` derives `Debug` over raw session credentials
 
@@ -136,7 +117,9 @@ supervisor-side sibling already learned this lesson —
 **Scenario:** endpoint process is SIGKILLed mid-`stage_credential` after
 bytes land in the tmp file; the request later completes, gets collected
 and acknowledged — `reclaim_bodies` reports bodies reclaimed while a
-credential fragment still sits in the request dir.
+credential fragment still sits in the request dir. The defect is the
+violated retention contract — a false reclamation report — independent
+of who might read the residue.
 
 **Direction:** add `runtime-auth.tmp-partial` to the `reclaim_bodies`
 list and to `release_credential`; or have `stage_credential` sweep the
@@ -225,32 +208,6 @@ nothing is logged.
 `Result<record, Corrupt>` items, skip-and-report), or at minimum surface
 the failure instead of `let ... else return`. **Coverage:** none.
 
-### F7 — MEDIUM: unix listener has no handshake deadline, no peer check, and spawns unbounded pre-auth threads
-
-`crates/workloop-executor/src/service.rs:1284-1333` (`serve_unix`);
-`crates/workloop-executor/src/channel.rs:85-92` (`read_frame` blocks on
-`read_exact`).
-
-- `UnixListener::bind` leaves socket permissions to umask — commonly
-  world-connectable — and no `SO_PEERCRED`/peer-uid gate exists, so any
-  local user may open a session attempt.
-- Each `accept` spawns a thread (`:1320`) that blocks inside
-  `endpoint_handshake`'s blocking `read_frame`. There is no handshake
-  deadline: a client that connects and sends nothing parks the thread
-  forever. Threads are unbounded → unauthenticated local thread
-  exhaustion → the endpoint stops serving the legitimate coordinator.
-- `std::fs::remove_file(socket_path)` (`:1289`) unconditionally unlinks
-  whatever exists at the configured path — a mispointed `socket_path`
-  deletes a non-socket file.
-
-**Scenario:** any local process loops `connect()` to the socket;
-hundreds of threads park in `read_frame`, consuming memory and fds until
-the endpoint is unusable.
-
-**Direction:** set socket file permissions (0600/0660) after bind;
-impose a handshake deadline and a bounded connection pool; refuse to
-unlink a non-socket `socket_path`. **Coverage:** none.
-
 ### F8 — MEDIUM: a service restart orphans deadline enforcement for still-running workers
 
 `crates/workloop-executor/src/runner.rs:1056`:
@@ -286,13 +243,7 @@ Under a profile with `sandbox_primitive: None` (the registry's
 `fixture-worker-v0.1`, `worker.rs:115`), a `runtime_auth_mount: true`
 prepare is accepted and the credential is staged — but it is never
 delivered through the contract's read-only mount, and the secret file
-sits at a predictable host path the same-UID worker can read anyway.
-Under the accepted-risk uncontained deployment the exposure compounds:
-the worker shares the host filesystem — it can read *every* request's
-staged `runtime-auth`, the endpoint's own
-`endpoint_credential_file`/`coordinator_credential_file` (mode 0600 is
-no barrier to the same UID), and forge `stop-intent`/`binding` records —
-the sealed digest is an unkeyed self-check, recomputable by the writer.
+sits at a predictable host path.
 
 The honest-capability convention (`BASE` vs `CONTAINED_CAPABILITIES`)
 exists exactly to prevent this overstated claim — `runtime_auth_delivery`
@@ -307,11 +258,10 @@ Prepare succeeds, the credential is staged, and start passes the
 the contract §7 read-only delivery never happens, the secret sits at a
 predictable host path, and nothing reports the degrade. The endpoint
 advertised a delivery channel it did not provide. The further
-escalation — a same-UID Worker reading the staged secret and the
-endpoint's own session credentials, then impersonating the coordinator
-(`coordinator_handshake` from `channel.rs:119`) — rides on the
-same-UID / fixture-profile deployments already listed in Accepted
-risks; the capability misdeclaration above does not.
+escalation — a same-UID Worker harvesting the staged and endpoint
+credentials to impersonate the coordinator — rides on the
+uncontained-deployment accepted risk below; the capability
+misdeclaration above does not.
 
 **Direction:** move `runtime_auth_delivery` into the contained
 capability set or refuse the mount under uncontained launch.
@@ -321,40 +271,36 @@ capability set or refuse the mount under uncontained launch.
 
 `crates/workloop-exec/src/credentials.rs:129-141` (`resolve_env` echoes
 the variable `'{name}'`); `crates/workloop-github/src/credential.rs:179,
-183,187,196,201` (`read_credential_file` echoes `path.display()` at five
+184,189,198,202` (`read_credential_file` echoes `path.display()` at five
 sites) and `:232,238` (`run_credential_command` echoes `{program}`).
 
 The documented rule is that the reference may be a mispasted secret and
 must not be echoed. The exec-side `file:` provider carefully returns
-generic strings (`:155-192` — no path in any error); the github side
-echoes the full path, and both sides' env/command errors echo
-name/program. A `file:ghp_<secret>` paste on the github side, or an
-`env:ghp_<secret>` paste on either side, lands the secret in
+generic strings (`:155-192` — no path in any error) while the github
+side echoes the full path; the github-side `command:` provider echoes
+`{program}` on spawn and exit failures (`:232,238`) while the exec-side
+`resolve_command_bounded` (`:210-308`) never carries argv in a refusal.
+Both sides' `env:` refusals echo the variable name (exec `:129-141`,
+github `:156`). A `file:ghp_<secret>` paste on the github side, an
+`env:ghp_<secret>` paste on either side, or a github-side `command:`
+reference whose argv[0] is a pasted secret lands the secret in
 `credential.unresolvable` → diagnostics/evidence.
 
 **Direction:** apply the exec-side convention — name the provider kind
 and the failed property, never the user-supplied value.
 **Coverage:** none.
 
-### F11 — LOW: state tree and non-secret records use umask-default permissions
-
-`crates/workloop-executor/src/state.rs:369-373`
-(`EndpointState::open` → `create_dir_all` on root + `requests/`), and
-`write_atomic` (`:80-86`) for `binding.json`, `ops/*`, `prepared/*`
-bodies. Only `runtime-auth` gets the private write. Under a permissive
-umask the state root and request contents (staged inputs, request
-bodies, `out/` bodies) are world-readable; the `runtime-auth` files
-themselves stay 0600, so this is work-content disclosure, not a
-credential leak.
-
-**Direction:** tighten the state root to 0700 at `open` (and refuse or
-warn if it pre-exists laxer). **Coverage:** none.
-
 ### F12 — LOW: hand-rolled `hmac_sha256`
 
 `crates/workloop-executor/src/auth.rs:39-63` — a textbook RFC 2104
 implementation, covered by RFC 4231 vectors (`auth.rs` tests). Correct
 as written; the exposure is future edits to a bespoke primitive.
+
+**Scenario:** a later edit to `hmac_sha256` — key normalization, pad
+constants, or block handling — subtly breaks the primitive; session
+MACs keep being produced and compared while no longer matching RFC
+2104, and only the RFC 4231 vectors catch it, only while they keep
+running against the edited code.
 
 **Direction:** adopt the `hmac` crate (already in the `sha2` ecosystem)
 or add a comment pointing at the vector tests. **Coverage:** RFC 4231
@@ -376,7 +322,8 @@ vectors.
   only by `config.rs`, `adapter.rs`, and the contract tests — the
   coordinator-side loader that populates it from installation config
   was not located in this pass; confirm whether it exists elsewhere and
-  whether it reuses the unchecked `read_credential` (F1).
+  whether it reuses the unchecked `read_credential` (the
+  bootstrap-credential accepted-risk entry below).
 - **Delivery-vs-incarnation binding.** `handle_credential`
   (`service.rs:1192-1209`) checks `request_id` + `invocation_id` but
   not `bound_incarnation_id` (the delivery vocabulary has no incarnation
@@ -411,8 +358,52 @@ Recorded so future audits do not re-raise them:
   profile boundary is namespace-level, not a security boundary against
   malicious in-sandbox code beyond what it bounds.
 - `fixture-worker-v0.1` (`sandbox_primitive: None`) exists for contract
-  tests; deploying it drops isolation entirely (see F9 for the
-  capability-honesty gap this exposes).
+  tests; deploying it drops isolation entirely — the worker shares the
+  host filesystem, so a same-UID worker can read *every* request's
+  staged `runtime-auth` and the endpoint's own
+  `endpoint_credential_file`/`coordinator_credential_file` (mode 0600 is
+  no barrier to the same UID), forge `stop-intent`/`binding`
+  records — the sealed digest is an unkeyed self-check, recomputable by
+  the writer — or impersonate the coordinator with the harvested
+  session credentials (`coordinator_handshake`, `channel.rs:119`)
+  (see F9 for the capability-honesty gap this exposes).
+- Bootstrap credential files are read without the `file:` providers'
+  ownership/mode checks: `read_credential` (`config.rs:154-186`)
+  applies only a 4096-byte bound and a whitespace trim — no euid,
+  `mode & 0o077`, or regular-file check, despite the module
+  docstring's "mode-0600" staging claim. The concrete harm — a
+  co-tenant reading a lax-permissioned bootstrap secret and forging
+  coordinator sessions (`SessionOpen` MAC, `channel.rs:177-190`) —
+  requires a multi-tenant endpoint host, a declared non-goal; the host
+  account boundary is the accepted defense. (Raised as F1 in this
+  audit's first pass; reclassified. Sharing the provider-side
+  euid/`mode & 0o077`/regular-file checks so a mis-staged file is
+  refused rather than silently accepted remains cheap fail-closed
+  hardening, not a finding.)
+- The unix listener trusts the local host account boundary
+  (`serve_unix`, `service.rs:1284-1333`): socket permissions follow
+  umask with no `SO_PEERCRED`/peer-uid gate, each `accept` spawns a
+  thread that blocks in `read_frame` with no handshake deadline and no
+  bound on pre-auth connections, and startup unconditionally unlinks
+  whatever sits at `socket_path` (`:1289`). The harms — a co-tenant's
+  session attempts and unauthenticated thread exhaustion — are
+  multi-tenant-host and platform-level-DoS non-goals; the
+  `remove_file` hazard rides on trusted operator configuration.
+  (Raised as F7 in this audit's first pass; reclassified. Socket
+  permissions, a handshake deadline, a bounded connection pool, and a
+  socket-type check before unlink remain available hardening.)
+- The state tree and non-secret records use umask-default permissions:
+  `EndpointState::open` (`state.rs:369-373`, `create_dir_all` on root +
+  `requests/`) and `write_atomic` (`:80-86`) tighten nothing, so under
+  a permissive umask the state root and request contents (staged
+  inputs, request bodies, `out/` bodies) are world-readable —
+  work-content disclosure, not a credential leak (`runtime-auth`
+  itself stays 0600). The harm requires a co-tenant on the endpoint
+  host, a declared non-goal; the host account boundary is the accepted
+  defense. (Raised as F11 in this audit's first pass; reclassified.
+  Tightening the state root to 0700 at `open` — and refusing or
+  warning if it pre-exists laxer — remains cheap hardening, not a
+  finding.)
 - Transport confidentiality is delegated below the framed channel (SSH
   forced-command bridge / local socket); the MAC authenticates but does
   not encrypt.
