@@ -51,6 +51,7 @@
 | Invariant | Status | Settling code |
 | --- | --- | --- |
 | `credential_ref` names a slot, never a value; grammar refusals don't echo it | upheld | `workloop-core/src/credential.rs` parse + tests |
+| Provider-resolution refusals never echo the reference's identifying fields | violated on some sides | finding F10 |
 | `file:` provider: regular file, euid-owned, `mode & 0o077 == 0`, symlink resolved before checks | upheld | `workloop-exec/src/credentials.rs:155-197`; `workloop-github/src/credential.rs:176-204` |
 | `command:` provider: argv no-shell | upheld (both impls) | `workloop-exec/src/credentials.rs:206+`; `workloop-github/src/credential.rs:222-246` |
 | `command:` provider: bounded wall clock + bounded output | violated on github side | finding F4 |
@@ -213,13 +214,22 @@ the failure instead of `let ... else return`. **Coverage:** none.
 `crates/workloop-executor/src/runner.rs:1056`:
 `record.bound_incarnation_id != current_incarnation → continue`.
 
-`boot` mints a fresh incarnation (`service.rs:65-95`). Every operation
-refuses old-incarnation requests (`incarnation_mismatch`,
-`service.rs:797-803`, `runner.rs:1126-1133`), and the deadline sweep
-skips them — but the worker process the old incarnation spawned may
-still be running. After a restart, such a process exceeds its
-authorized-runtime bound with no enforcement: the sweep won't touch it,
-`request_stop` returns `incarnation_mismatch`, and nothing reaps it.
+`boot` mints a fresh incarnation (`service.rs:65-95`). Prepare and start
+refuse commands whose incarnation is not the live one, and stop returns
+`incarnation_mismatch` for a record bound to a dead incarnation
+(`service.rs:497-505`, `:797-803`, `runner.rs:1126-1133`). Collect and
+acknowledge, however, dispatch through `bound_request`
+(`service.rs:447-491`, `:1032-1035`, `:1113-1117`), which matches the
+command's incarnation to the *stored record's* binding — not the live
+incarnation — so an old-incarnation request is still accepted there: a
+record whose stop proof predates the restart can still be collected and
+acknowledged, while a still-running worker can never be stopped, hence
+never produces a proof and never becomes collectable. The deadline
+sweep also skips old-incarnation records — but the worker process the
+old incarnation spawned may still be running. After a restart, such a
+process exceeds its authorized-runtime bound with no enforcement: the
+sweep won't touch it, `request_stop` returns `incarnation_mismatch`,
+and nothing reaps it.
 
 **Scenario:** endpoint restarts mid-Invocation; the spawned worker's
 process group survives; its deadline passes — it runs indefinitely,
@@ -250,18 +260,22 @@ exists exactly to prevent this overstated claim — `runtime_auth_delivery`
 should sit on the contained side, or prepare should refuse
 `runtime_auth_mount` when the gate is `Uncontained`.
 
-**Scenario:** an operator runs an uncontained profile
-(`fixture-worker-v0.1`) and a coordinator — trusting the declared
-`runtime_auth_delivery` — prepares with `runtime_auth_mount: true`.
-Prepare succeeds, the credential is staged, and start passes the
-`has_credential` gate, but the uncontained launch arm mounts nothing:
-the contract §7 read-only delivery never happens, the secret sits at a
-predictable host path, and nothing reports the degrade. The endpoint
-advertised a delivery channel it did not provide. The further
+**Scenario:** `fixture-worker-v0.1` is an approved entry in the closed
+profile registry, so an operator running it holds a sanctioned
+configuration — the accepted risk below accepts that the deployment
+*drops isolation*, not that the endpoint may misreport what it
+delivers. A coordinator trusting the declared `runtime_auth_delivery`
+prepares with `runtime_auth_mount: true`; prepare succeeds, the
+credential is staged, and start passes the `has_credential` gate — then
+the uncontained launch arm mounts nothing: the promised §7 read-only
+delivery never happens — the worker is launched with no
+`--runtime-auth` mount — and nothing reports the degrade. The harm
+needs no attacker and no malicious worker: the endpoint advertises a
+delivery channel it does not provide for an approved profile. The further
 escalation — a same-UID Worker harvesting the staged and endpoint
 credentials to impersonate the coordinator — rides on the
-uncontained-deployment accepted risk below; the capability
-misdeclaration above does not.
+uncontained-deployment accepted risk below and is not the finding; the
+capability misdeclaration above is.
 
 **Direction:** move `runtime_auth_delivery` into the contained
 capability set or refuse the mount under uncontained launch.

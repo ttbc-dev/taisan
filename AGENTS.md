@@ -91,21 +91,25 @@ and `docs/worker-protocol.md`; when prose and contract differ, the contract
 is right.
 
 - `credential_ref` names a provider slot (`env:`/`file:`/`command:`), never
-  a value. Refusals never echo the reference.
+  a value. Refusals never echo the reference (audit v0.3 F10 records
+  provider-resolution refusals echoing slot fields on some sides — a
+  tracked defect).
 - Resolved credentials never appear in argv, env, request bodies, receipts,
   evidence, logs, or error messages. `ResolvedCredential` is unformattable
   or redacted at each boundary: `workloop-exec`'s has no `Display` and a
   redacted `Debug`; `workloop-github`'s `Display`/`Debug` render
   `<redacted>`; `ExecutorService` has no `Debug` at all (audit v0.3 F2
-  records `CoordinatorEndpoint` deriving `Debug` over raw credentials —
-  a tracked defect).
+  records `CoordinatorEndpoint` deriving `Debug` over raw credentials,
+  and F4 records the github-side `command:` provider interpolating
+  bounded helper stderr into the typed error — tracked defects).
 - `file:` providers require an absolute path resolving to a regular file
   owned by the effective user with `mode & 0o077 == 0`, checked after
   symlink resolution (`crates/workloop-exec/src/credentials.rs`,
   `crates/workloop-github/src/credential.rs`).
 - `command:` providers run argv directly — no shell — with a bounded wall
   clock, process-group kill on timeout, and bounded output
-  (`crates/workloop-exec/src/credentials.rs`).
+  (`crates/workloop-exec/src/credentials.rs`; audit v0.3 F4 records the
+  github-side provider missing all three bounds — a tracked defect).
 - The session handshake is mutual: fresh nonces per session, directional
   MAC tags, constant-time MAC comparison, and nonce/identity echo-binding
   on both sides (`crates/workloop-executor/src/auth.rs`,
@@ -126,7 +130,10 @@ is right.
   `runtime_auth_mount` without a staged file; the file is removed after
   stop proof and at acknowledge reclaim
   (`crates/workloop-executor/src/runner.rs`,
-  `crates/workloop-executor/src/state.rs`).
+  `crates/workloop-executor/src/state.rs`; audit v0.3 F3 records
+  `runtime-auth.tmp-partial` residue surviving both removal points, and
+  F5 records an abandoned `prepared` request having no removal path —
+  tracked defects).
 - Worker environment is an allowlist, never inheritance: `env_clear` at
   spawn plus `ENV_PASSTHROUGH`/`SELECTOR_ENV_PASSTHROUGH` containing no
   credential-bearing names (`crates/workloop-exec/src/supervisor.rs`,
@@ -145,7 +152,10 @@ is right.
 - Deadline enforcement is monotonic and conservative: measured clock
   offset, uncertainty, and one-way delay are subtracted — skew can consume
   authorized runtime, never extend it. The sweep runs on the endpoint's
-  clock independent of coordinator liveness.
+  clock independent of coordinator liveness (audit v0.3 F6 records one
+  corrupt binding record silently disabling the sweep, and F8 records a
+  service restart orphaning enforcement for still-running workers —
+  tracked defects).
 - Declared capabilities are honest: contained capabilities are only
   advertised when the configured profile carries a sandbox primitive;
   a `read_only` workspace grant without enforceable containment refuses at
