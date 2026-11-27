@@ -98,9 +98,12 @@ removed either, and neither is an entry that is not one of the
 staging shapes — the sweep only ever unlinks a `runtime-auth`,
 `runtime-auth.<seq>`, or owner-tagged
 `runtime-auth.p<pid>.i<instance>.<seq>` name, or its `.tmp` sibling,
-that it can prove unclaimed. A stage whose in-progress `.tmp` sibling a
-concurrent sweep reclaimed before its claim was observable loses the
-race the same way an occupied name does: it takes the next seq.
+that it can prove unclaimed. A stage whose in-progress `.tmp` sibling
+loses the create→flock window to a concurrent sweep — the sibling
+reclaimed outright, or the sweep's transient claim probe still holding
+its lock when the stage's claim tries to land — loses the race the
+same way an occupied name does: it takes the next seq, never the
+launch.
 
 The credential value never enters argv, the request body,
 `runtime.log`, the report, evidence, the provider contract document,
@@ -163,8 +166,11 @@ lapse the guard; a path strictly beneath the home still binds only
 the named path while the tmpfs `/home` keeps the rest invisible),
 and any own-path source that is not a regular file or directory — a
 host socket, device, or fifo grants an IPC endpoint, never file
-content — including a directory source directly holding such an
-entry, so an argv-named container-runtime socket cannot be mounted.
+content — including a directory source holding such an entry
+anywhere in its tree, so an argv-named container-runtime socket
+cannot be mounted. The directory scan is bounded and fails closed:
+a tree that cannot be read or cannot be fully certified within the
+entry bound is refused rather than admitted uninspected.
 Nothing packaged is bound writable. The only writable host paths are
 `/workspace` (role-dependent) and `/taisan/out`; every other writable
 location inside the sandbox is ephemeral — the tmpfs the sandbox root

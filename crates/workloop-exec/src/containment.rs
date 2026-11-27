@@ -368,8 +368,10 @@ pub fn ca_trust_binds(profile: &IsolationProfile) -> Vec<PathBuf> {
 /// other special file, which would grant a host IPC endpoint rather
 /// than file content (the fixed-destination `/taisan/proxy.sock`
 /// bind is a socket by contract and exempt) — and a directory
-/// source directly holding such an entry is refused too, since the
-/// bind would carry the endpoint in with it. The sealed/covered
+/// source holding such an entry anywhere in its tree is refused
+/// too, since the bind would carry the endpoint in with it — as is
+/// a directory the bounded tree scan cannot fully certify. The
+/// sealed/covered
 /// destination check applies only to binds spelled at their own
 /// path: a fixed-destination source like the workspace mounts under
 /// `/workspace` whatever its host spelling, so a host path beneath
@@ -456,32 +458,101 @@ pub fn plan_denial(plan: &MountPlan) -> Option<String> {
                 bind.display()
             ));
         }
-        // A directory bind carries its entries with it: a source
-        // spelled as the socket's parent directory would expose the
-        // endpoint inside even though the directory itself is
-        // regular. The scan stays shallow — one streaming readdir
-        // per plan, proportional to the top-level entry count — and
-        // a symlinked entry is left to resolve inside the sandbox
-        // where its target is the sandbox's own tree. An entry whose
-        // type cannot be determined is refused rather than skipped.
-        if metadata.is_dir()
-            && std::fs::read_dir(&resolved).is_ok_and(|mut entries| {
-                entries.any(|entry| {
-                    entry
-                        .and_then(|entry| entry.file_type())
-                        .map(|kind| !(kind.is_file() || kind.is_dir() || kind.is_symlink()))
-                        .unwrap_or(true)
-                })
-            })
-        {
-            return Some(format!(
-                "mount plan bind '{}' is a directory holding a socket, device, or fifo — \
-                 the bind would expose a host IPC endpoint inside the sandbox",
-                bind.display()
-            ));
+        // A directory bind carries its whole tree with it: a special
+        // file anywhere beneath the source mounts the endpoint inside
+        // the sandbox, so the bounded walk descends every member
+        // directory rather than stopping at the top level. It fails
+        // closed — a directory that cannot be read, an entry whose
+        // type cannot be determined, or a tree past the entry bound
+        // is refused rather than admitted uncertified — and a
+        // symlinked entry is left to resolve inside the sandbox where
+        // its target is the sandbox's own tree.
+        if metadata.is_dir() {
+            match scan_dir_bind_tree(&resolved) {
+                DirBindScan::Clean => {}
+                DirBindScan::SpecialEntry => {
+                    return Some(format!(
+                        "mount plan bind '{}' is a directory holding a socket, device, or fifo — \
+                         the bind would expose a host IPC endpoint inside the sandbox",
+                        bind.display()
+                    ));
+                }
+                DirBindScan::Uncertifiable => {
+                    return Some(format!(
+                        "mount plan bind '{}' is a directory that cannot be proven free of a \
+                         socket, device, or fifo — the bind would expose a host IPC endpoint \
+                         inside the sandbox",
+                        bind.display()
+                    ));
+                }
+            }
         }
     }
     None
+}
+
+/// How many entries a bind-source directory scan visits before it
+/// stops certifying: the walk covers real directory trees — runtime
+/// packages, toolchains, caches — while staying bounded per plan. A
+/// tree the scan cannot fully certify inside the bound is refused
+/// rather than admitted uninspected.
+const MAX_BIND_TREE_SCAN_ENTRIES: usize = 65_536;
+
+/// The verdict of a bounded walk over a bind-source directory tree.
+enum DirBindScan {
+    /// Every visited entry is a regular file, directory, or symlink.
+    Clean,
+    /// A socket, device, fifo, or other special file lives in the
+    /// tree — a live host IPC endpoint the mount would carry inside.
+    SpecialEntry,
+    /// The tree could not be fully certified — a read failed, an
+    /// entry's type was undeterminable, or the entry bound ran out.
+    Uncertifiable,
+}
+
+/// Walk a bind-source directory tree and report whether it is free
+/// of special files. A directory bind mounts every entry beneath the
+/// source — nesting is no hiding place — so the walk descends real
+/// directories until it proves the tree clean, finds an endpoint, or
+/// runs out of certifiable room. Member links are never followed: a
+/// symlink resolves inside the sandbox against the sandbox's own
+/// tree. The scan fails closed — any doubt is `Uncertifiable`, which
+/// the caller refuses like a found endpoint.
+fn scan_dir_bind_tree(root: &Path) -> DirBindScan {
+    scan_dir_bind_tree_bounded(root, MAX_BIND_TREE_SCAN_ENTRIES)
+}
+
+/// The bounded walk behind `scan_dir_bind_tree`, with the entry cap
+/// passed in so a test can reach the exhaustion branch without
+/// building a 65k-entry tree.
+fn scan_dir_bind_tree_bounded(root: &Path, max_entries: usize) -> DirBindScan {
+    let mut remaining = max_entries;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return DirBindScan::Uncertifiable;
+        };
+        for entry in entries {
+            if remaining == 0 {
+                return DirBindScan::Uncertifiable;
+            }
+            remaining -= 1;
+            let Ok(entry) = entry else {
+                return DirBindScan::Uncertifiable;
+            };
+            let Ok(kind) = entry.file_type() else {
+                return DirBindScan::Uncertifiable;
+            };
+            if kind.is_file() || kind.is_symlink() {
+                continue;
+            }
+            if !kind.is_dir() {
+                return DirBindScan::SpecialEntry;
+            }
+            pending.push(entry.path());
+        }
+    }
+    DirBindScan::Clean
 }
 
 /// The launching uid's home directories: `$HOME` when it names a
@@ -1962,6 +2033,82 @@ mod tests {
             plan_denial(&plan).is_none(),
             "a directory of regular entries still binds"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The directory guard reaches the whole tree: a socket nested
+    /// beneath a member subdirectory mounts inside the sandbox too,
+    /// so depth is no hiding place for the endpoint.
+    #[test]
+    fn plan_denial_refuses_a_nested_socket_in_a_directory_bind() {
+        let dir = tmp("sockdeep");
+        let nested = dir.join("outer/inner");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(dir.join("outer/file"), "x").unwrap();
+        let sock = nested.join("s");
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let mut plan = plan_fixture();
+        plan.extra_binds = vec![dir.clone()];
+        let reason = plan_denial(&plan).expect("a nested socket still refuses");
+        assert!(reason.contains("directory holding"), "{reason}");
+        // Once the endpoint is gone the same tree binds.
+        std::fs::remove_file(&sock).unwrap();
+        drop(_listener);
+        assert!(
+            plan_denial(&plan).is_none(),
+            "a clean nested tree still binds"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A directory the bounded scan cannot certify is refused rather
+    /// than admitted uninspected: an execute-only member the
+    /// supervisor cannot list may hide the endpoint the guard exists
+    /// to refuse.
+    #[test]
+    fn plan_denial_refuses_a_directory_bind_it_cannot_scan() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp("unlistable");
+        let hidden = dir.join("hidden");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(hidden.join("file"), "x").unwrap();
+        let saved = std::fs::metadata(&hidden).unwrap().permissions();
+        let mut unlistable = saved.clone();
+        unlistable.set_mode(0o111);
+        std::fs::set_permissions(&hidden, unlistable).unwrap();
+        // A privileged runner ignores the mode bits — probe for that
+        // and skip rather than assert a guarantee this environment
+        // lacks.
+        if std::fs::read_dir(&hidden).is_ok() {
+            std::fs::set_permissions(&hidden, saved).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let mut plan = plan_fixture();
+        plan.extra_binds = vec![dir.clone()];
+        let reason = plan_denial(&plan).expect("an unlistable tree refuses");
+        assert!(reason.contains("cannot be proven free"), "{reason}");
+        std::fs::set_permissions(&hidden, saved).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The scan's entry bound fails closed too: a tree it cannot
+    /// finish certifying inside the cap is `Uncertifiable`, refused
+    /// like a found endpoint rather than admitted half-inspected.
+    #[test]
+    fn the_scan_bound_fails_closed_on_an_uncertified_tree() {
+        let dir = tmp("scanbound");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), "x").unwrap();
+        std::fs::write(dir.join("b"), "x").unwrap();
+        assert!(matches!(
+            scan_dir_bind_tree_bounded(&dir, 1),
+            DirBindScan::Uncertifiable
+        ));
+        assert!(matches!(
+            scan_dir_bind_tree_bounded(&dir, 2),
+            DirBindScan::Clean
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

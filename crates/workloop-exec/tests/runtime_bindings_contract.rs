@@ -93,6 +93,15 @@ fn write_secret_file(dir: &Path, name: &str, value: &str) -> PathBuf {
     path
 }
 
+/// Whether an argv bind source is the owner's home directory or an
+/// ancestor of it — the contract refuses exactly that. A path
+/// strictly beneath the home binds only the named path while the
+/// tmpfs `/home` keeps the rest invisible, so the comparison is a
+/// component-wise ancestor check, never a string prefix.
+fn bind_source_is_home_or_ancestor(source: &str, home: &Path) -> bool {
+    home.starts_with(source)
+}
+
 /// A contained probe launch through the real supervisor boundary
 /// path: the same grant → mount plan → outer argv → contained env the
 /// dispatch path produces.
@@ -335,11 +344,49 @@ fn generated_argv_matches_the_fixed_mount_surface() {
     }
     let home = std::env::var("HOME").unwrap_or_default();
     assert!(
-        home.is_empty() || !sources.iter().any(|s| s.starts_with(&home)),
+        home.is_empty()
+            || !sources
+                .iter()
+                .any(|s| bind_source_is_home_or_ancestor(s, Path::new(&home))),
         "the owner's home must never be a bind source:\n{joined}"
     );
     unsafe { std::env::remove_var("TAISAN_BINDINGS_DUMMY_CRED") };
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The home-guard assertion in the mount-surface test mirrors the
+/// contract exactly: only the home directory itself or an ancestor
+/// of it is a forbidden source — a path strictly beneath it is
+/// admissible, so a HOME that happens to prefix the fixture's temp
+/// dir (e.g. HOME=/tmp) must not fail the suite.
+#[test]
+fn bind_source_home_ancestry_matches_the_contract() {
+    let home = Path::new("/home/owner");
+    for forbidden in ["/home/owner", "/home", "/"] {
+        assert!(
+            bind_source_is_home_or_ancestor(forbidden, home),
+            "{forbidden} must be refused"
+        );
+    }
+    for admissible in [
+        "/home/owner/sub",
+        "/home/owner2",
+        "/tmp/workloop-bindings-fixture",
+        "/var/folders/t",
+    ] {
+        assert!(
+            !bind_source_is_home_or_ancestor(admissible, home),
+            "{admissible} must stay admissible"
+        );
+    }
+    // The reported environment: HOME is a strict prefix of the temp
+    // dir the fixtures build under — every fixture source sits
+    // strictly beneath it and stays admissible.
+    let home = Path::new("/tmp");
+    assert!(
+        !bind_source_is_home_or_ancestor("/tmp/workloop-bindings-surface-1/worker-bin", home),
+        "a source beneath HOME stays admissible"
+    );
 }
 
 /// No allowlist means no proxy capability and no proxy environment:

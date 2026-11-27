@@ -315,9 +315,10 @@ impl RuntimeBoundary {
         // bytes the moment it is created, so it is checked as well —
         // and a sibling a concurrent sweep reclaimed before this
         // stage's claim was observable loses the race the same way:
-        // publish then finds the `.tmp` gone, also a seq, never a
-        // launch failure. Past a bounded run of collisions the stage
-        // refuses rather than scan forever.
+        // publish then finds the `.tmp` gone — or the claim itself
+        // meets the sweep's still-held transient probe lock — also a
+        // seq, never a launch failure. Past a bounded run of
+        // collisions the stage refuses rather than scan forever.
         let mut seq = ready.next_grant;
         loop {
             let name = self.staging_name(seq);
@@ -353,8 +354,10 @@ impl RuntimeBoundary {
                     return Ok(path);
                 }
                 // Occupied means the name — or its `.tmp` sibling —
-                // proved foreign at publish time; nothing of ours was
-                // left behind to remove.
+                // proved foreign, or lost the create→flock window to
+                // a sweep's claim probe; any still-empty sibling left
+                // behind is unclaimed residue the sweep owns, never
+                // ours to unlink.
                 Err(StageError::Occupied) => {}
                 // The staging sibling carries the same secret bytes
                 // the moment it is created: a failure past that point
@@ -572,13 +575,39 @@ fn staging_file_is_claimed(path: &Path) -> bool {
 }
 
 /// Why a stage attempt did not publish: `Occupied` means the name
-/// proved foreign at publish time — or its `.tmp` sibling was
-/// reclaimed by a neighbour's sweep in the create→flock window (the
+/// proved foreign at publish time — or its `.tmp` sibling lost the
+/// create→flock window to a neighbour's sweep, whether the sweep
+/// unlinked the sibling outright or its transient claim-probe still
+/// held the sibling's lock when the stage tried to claim it (the
 /// caller tries the next seq; nothing of ours was published or left
 /// behind), `Failed` carries the refusal for a real error.
 enum StageError {
     Occupied,
     Failed(String),
+}
+
+/// Take the ownership claim on the freshly-created staging sibling:
+/// the lock lands before any secret byte so a sweep's claim probe
+/// always finds the file owned once the claim is observable.
+/// `EWOULDBLOCK` on a name `create_new` just made can come only from
+/// a concurrent sweep's transient probe holding the inode's lock in
+/// the create→flock window — the same lost race as a sibling the
+/// sweep unlinked outright, so it is `Occupied` (a seq), never a
+/// stage failure. Any other error is a real refusal: a filesystem
+/// that cannot carry the claim cannot carry the ownership guarantee.
+fn claim_staged_file(file: &std::fs::File, tmp: &Path) -> Result<(), StageError> {
+    use std::os::unix::io::AsRawFd;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        return Err(StageError::Occupied);
+    }
+    Err(StageError::Failed(format!(
+        "credential.stage_failed: flock {}: {err}",
+        tmp.display()
+    )))
 }
 
 /// Write the credential to `tmp` owner-only, fsync it, and publish it
@@ -590,20 +619,26 @@ enum StageError {
 /// fails `EEXIST` instead of being overwritten, so a same-tagged
 /// neighbour (owner tags can collide across pid namespaces) racing
 /// the publish loses a seq rather than having its live grant swapped
-/// out from under it. A neighbour's sweep can also reclaim `tmp`
-/// itself in the window before this file's flock is observable, so
-/// publish treats a vanished sibling as the same lost race
-/// (`Occupied`), never as a stage failure. On `Err(Failed)` the
+/// out from under it. A neighbour's sweep can also race `tmp` itself
+/// in the window before this file's flock is observable — reclaiming
+/// the sibling outright, or still holding its transient claim-probe
+/// lock when this stage's claim tries to land — so both a vanished
+/// sibling and a probe-blocked claim are the same lost race
+/// (`Occupied`), never a stage failure. On `Err(Failed)` the
 /// caller owns removing `tmp` — it may already hold a partial secret
-/// copy.
+/// copy. On `Err(Occupied)` the contested name is left exactly as
+/// found: the sweep that probed the still-unclaimed sibling reclaims
+/// the name itself — and unlinking here could instead remove a
+/// sibling a neighbour recreated under the same name, which is never
+/// ours — while a sweeper that dies first leaves residue the next
+/// sweep reclaims.
 fn write_staged_credential(
     tmp: &Path,
     path: &Path,
     credential: &ResolvedCredential,
 ) -> Result<std::fs::File, StageError> {
-    use std::os::unix::io::AsRawFd;
     let fail = |e: std::io::Error| StageError::Failed(format!("credential.stage_failed: {e}"));
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
@@ -615,17 +650,26 @@ fn write_staged_credential(
                 fail(e)
             }
         })?;
+    claim_and_write(file, tmp, path, credential)
+}
+
+/// Claim `file` and carry it from fresh sibling to published grant:
+/// flock before the first secret byte, then write, fsync, and
+/// publish. Split from `write_staged_credential` so a test can drive
+/// the create→flock window directly. An `Occupied` claim never
+/// unlinks `tmp` — the name may already belong to a recreated
+/// sibling that is not ours.
+fn claim_and_write(
+    mut file: std::fs::File,
+    tmp: &Path,
+    path: &Path,
+    credential: &ResolvedCredential,
+) -> Result<std::fs::File, StageError> {
+    let fail = |e: std::io::Error| StageError::Failed(format!("credential.stage_failed: {e}"));
     // The claim precedes the content: a neighbour's sweep may only
     // reclaim an *unclaimed* staging shape, so the lock is taken
-    // before any secret byte lands. A filesystem that cannot carry
-    // the claim cannot carry the ownership guarantee — refuse.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(StageError::Failed(format!(
-            "credential.stage_failed: flock {}: {}",
-            tmp.display(),
-            std::io::Error::last_os_error()
-        )));
-    }
+    // before any secret byte lands.
+    claim_staged_file(&file, tmp)?;
     {
         use std::io::Write;
         #[cfg(unix)]
@@ -1228,6 +1272,76 @@ mod tests {
         drop(holder);
         assert!(!held.exists());
         unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_TOKEN11") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A concurrent sweep's claim probe holds a transient lock on the
+    /// staging sibling in the stage's create→flock window: the
+    /// stage's own claim then loses the race the same way a sibling
+    /// the sweep unlinked does — `Occupied`, a seq, never the launch.
+    /// The contested name is left alone: the sweep that holds the
+    /// probe lock reclaims it, and an unlink here could instead
+    /// remove a sibling a neighbour recreated — never ours.
+    #[test]
+    fn a_probe_claim_on_the_staging_sibling_costs_a_seq_not_the_launch() {
+        let dir = tmp("proberace");
+        let sibling = dir.join("runtime-auth.p1.i1.0.tmp");
+        let published = dir.join("runtime-auth.p1.i1.0");
+        // The sweep's transient probe: a second descriptor holds the
+        // sibling's lock — exactly the state the stage's flock meets
+        // when the probe lands in the create→flock window.
+        let stager = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&sibling)
+            .unwrap();
+        let _probe = claim(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&sibling)
+                .unwrap(),
+        );
+        unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_PROBERACE", "secret") };
+        let credential = credentials::resolve("env:TAISAN_BOUNDARY_TEST_PROBERACE").unwrap();
+        assert!(
+            matches!(
+                claim_and_write(stager, &sibling, &published, &credential),
+                Err(StageError::Occupied)
+            ),
+            "a probe-blocked claim is the swept race — Occupied, never a stage failure"
+        );
+        assert!(
+            sibling.exists(),
+            "the contested name is the sweeper's to reclaim — never ours to unlink"
+        );
+        unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_PROBERACE") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The still-empty sibling an `Occupied` claim leaves behind is
+    /// unclaimed staging residue: the next `ensure`'s sweep reclaims
+    /// it like any dead owner's leftover, and staging proceeds past
+    /// it — a seq, never the launch.
+    #[test]
+    fn a_sweep_reclaims_the_sibling_an_occupied_claim_left() {
+        let dir = tmp("sweepresidue");
+        let runtime = dir.join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let residue = runtime.join("runtime-auth.p9.i9.0.tmp");
+        std::fs::write(&residue, b"").unwrap();
+        unsafe { std::env::set_var("TAISAN_BOUNDARY_TEST_SWEEPRES", "secret") };
+        let mut cfg = config(&dir);
+        cfg.credential_ref = Some("env:TAISAN_BOUNDARY_TEST_SWEEPRES".into());
+        let boundary = RuntimeBoundary::new(cfg);
+        let grant = boundary.ensure().unwrap();
+        assert!(grant.credential_file.is_some());
+        assert!(
+            !residue.exists(),
+            "unclaimed staging residue is the sweep's to reclaim"
+        );
+        unsafe { std::env::remove_var("TAISAN_BOUNDARY_TEST_SWEEPRES") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 
