@@ -24,6 +24,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
+          # The input defaults to `stable`; pass it explicitly so the
+          # toolchain selection survives the SHA pin unambiguously.
+          toolchain: stable
           components: rustfmt, clippy
 
       # The runner image ships toolchains this job never uses; the
