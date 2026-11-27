@@ -1117,6 +1117,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A staging sibling a live boundary is still filling — the
+    /// `.tmp` name claimed before its first secret byte — is never
+    /// swept: the sweep's claim probe meets the owner's flock and
+    /// keeps the file, so the owner's publish still finds its source
+    /// and the launch never loses the create→flock race to a
+    /// neighbour. Once the owner releases the claim, the same sibling
+    /// is ordinary residue the next sweep reclaims.
+    #[test]
+    fn a_live_owners_staging_sibling_is_never_swept() {
+        let dir = tmp("live-tmp");
+        let runtime = dir.join("runtime");
+        std::fs::create_dir_all(&runtime).unwrap();
+        let live = runtime.join("runtime-auth.p5.i6.7.tmp");
+        let lock = claim(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&live)
+                .unwrap(),
+        );
+        std::fs::write(&live, b"in-progress").unwrap();
+        let boundary = RuntimeBoundary::new(config(&dir));
+        boundary.ensure().unwrap();
+        assert!(
+            live.exists(),
+            "a live owner's in-progress staging sibling survives the sweep"
+        );
+        drop(lock);
+        boundary.ensure().unwrap();
+        assert!(
+            !live.exists(),
+            "an owner that released the claim leaves reclaimable residue"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A staging-shaped name that is not one of the boundary's shapes
     /// is never probed for a claim — a malformed tag or any other
     /// `runtime-auth.*` name is operator content and stays.
