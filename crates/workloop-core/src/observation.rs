@@ -124,6 +124,23 @@ pub enum ObservationFact {
         code: String,
         detail: String,
     },
+    /// The remote-executor reconciler fenced a bound request (contract
+    /// §14, #378): a possibly-live remote writer can no longer be
+    /// proven under its recorded binding — the endpoint restarted
+    /// under a new incarnation, the durable operation ledger was
+    /// contradicted, the bounded transport/answer budget ran out, or
+    /// the coordinator's own records failed verification. The writer
+    /// reservation is held: a fence is fail-closed evidence, never
+    /// proof the remote process stopped. `invocation_id` is `None`
+    /// when the binding's request could not be mapped to a local
+    /// Invocation — the fence still names the bound request so the
+    /// record is never dropped.
+    RemoteFence {
+        request_id: String,
+        invocation_id: Option<InvocationId>,
+        class: RemoteFenceClass,
+        detail: String,
+    },
     /// The supervisor-collected `taisan.worker.report/2` evidence for
     /// one v2 Invocation (`docs/v0.3.md` §6): the classification the
     /// envelope earned against the exact durable request binding,
@@ -508,6 +525,62 @@ pub enum ProcessStateFact {
     Running,
     Exited,
     Unknown,
+}
+
+/// The closed remote-fence taxonomy (contract §14, #378): every
+/// reconciliation failure class names one of these so the Attention a
+/// fenced writer produces is named by its class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteFenceClass {
+    /// The session/hello responder incarnation differs from the
+    /// recorded `bound_incarnation_id` while a writer may still live —
+    /// the endpoint restart left the binding's liveness unverifiable.
+    IncarnationChanged,
+    /// Connect/IO faults exceeded `transport_max_retries` — the
+    /// endpoint could not be reached inside the bounded budget.
+    TransportExhausted,
+    /// The endpoint's replay fence refused a recorded command as
+    /// `conflicting_replay` — the two ledgers disagree about an
+    /// operation identity; nothing may proceed under disagreement.
+    ConflictingReplay,
+    /// Receipts answered `unknown`/`unavailable` past the bounded
+    /// budget — liveness stayed unverifiable long enough to fence.
+    Unanswerable,
+    /// A durable binding or operation row failed read-side
+    /// verification — reconciliation never acts on corrupt evidence.
+    RecordCorrupt,
+    /// The local store refused a reconcile write (a CAS loss or a
+    /// locally conflicting replay) — an orchestration disagreement
+    /// the pass cannot resolve alone.
+    LedgerConflict,
+}
+
+impl RemoteFenceClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::IncarnationChanged => "incarnation_changed",
+            Self::TransportExhausted => "transport_exhausted",
+            Self::ConflictingReplay => "conflicting_replay",
+            Self::Unanswerable => "unanswerable",
+            Self::RecordCorrupt => "record_corrupt",
+            Self::LedgerConflict => "ledger_conflict",
+        }
+    }
+
+    /// The closed decode counterpart: a stored value outside the
+    /// vocabulary is `None`, never a guessed class.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "incarnation_changed" => Some(Self::IncarnationChanged),
+            "transport_exhausted" => Some(Self::TransportExhausted),
+            "conflicting_replay" => Some(Self::ConflictingReplay),
+            "unanswerable" => Some(Self::Unanswerable),
+            "record_corrupt" => Some(Self::RecordCorrupt),
+            "ledger_conflict" => Some(Self::LedgerConflict),
+            _ => None,
+        }
+    }
 }
 
 /// Whether the required process observations for bounded Worker-report

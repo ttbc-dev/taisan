@@ -60,7 +60,6 @@ fn config() -> WorkloopConfig {
         },
         budget: ExecutionBudget::default(),
         policy: WorkPolicy::default(),
-        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
     }
 }
 

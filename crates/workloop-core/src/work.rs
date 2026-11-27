@@ -2801,6 +2801,7 @@ fn assess(
                     | ObservationFact::Issue { .. }
                     | ObservationFact::Assessment { .. }
                     | ObservationFact::Mergeability { .. }
+                    | ObservationFact::RemoteFence { .. }
             ) =>
         {
             crate::projection::current_execution(tx, work_id)?
@@ -2900,6 +2901,42 @@ fn assess(
                     &execution,
                     "absence_unprovable",
                     &format!("repair: launch absence unprovable: {reason}"),
+                    vec![RepairPrerequisite::OperatorDecision],
+                    now_unix_seconds,
+                )?;
+            }
+            Ok(())
+        }
+        ObservationFact::RemoteFence {
+            invocation_id,
+            class,
+            detail,
+            ..
+        } => {
+            // A fenced remote writer is never released: the Invocation
+            // stays an unresolved writer (a live remote process may
+            // still exist) and is marked `unknown` — the outcome
+            // survives the resolution loop, which keeps driving the
+            // durable stop intent under any incarnation the contract
+            // permits, so a later provable answer still settles the
+            // writer under the recorded desired action. An Execution
+            // already carrying a cancel/fail/pause desire keeps it —
+            // `pause_for_repair` guards every state it cannot move —
+            // and a terminal Execution is never resurrected. The
+            // `remote_fence` classification on the decision ledger is
+            // what the named Attention derives from while the fence
+            // holds the Execution in `stopping`/`uncertain`/`paused`.
+            if let Some(invocation_id) = invocation_id {
+                mark_invocation(tx, invocation_id, |_| InvocationState::Unknown)?;
+            }
+            if execution.desired_action.is_none()
+                || execution.desired_action == Some(DesiredAction::Continue)
+            {
+                pause_for_repair(
+                    tx,
+                    &execution,
+                    "remote_fence",
+                    &format!("repair: remote fence {}: {detail}", class.as_str()),
                     vec![RepairPrerequisite::OperatorDecision],
                     now_unix_seconds,
                 )?;

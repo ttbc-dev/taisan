@@ -152,6 +152,31 @@ impl<C: Read + Write> RemoteExecutor<C> {
         &self.view
     }
 
+    /// The incarnation this session bound at `hello` — the identity a
+    /// reconcile pass compares against each binding's recorded
+    /// `bound_incarnation_id` (contract §14 fencing).
+    pub fn session_incarnation(&self) -> &str {
+        &self.view.bound_incarnation_id
+    }
+
+    /// Issue a command the caller already committed to the durable
+    /// operation ledger (contract §14 persist-before-send): the
+    /// adapter sends the recorded canonical bytes verbatim — a
+    /// restart replay and a first send travel the same path, and the
+    /// receipt is verified against the recorded command before it is
+    /// returned for durable attachment.
+    pub fn issue_recorded(
+        &mut self,
+        command: &ExecutorCommandV1,
+    ) -> Result<ExecutorReceiptV1, AdapterError> {
+        let bytes = command
+            .to_canonical_bytes()
+            .map_err(|e| AdapterError::Session(SessionError::Protocol(e.to_string())))?;
+        channel::write_frame(&mut self.channel, &bytes, FrameClass::Command)?;
+        let raw = channel::read_frame(&mut self.channel, FrameClass::Receipt)?;
+        verify_receipt(command, &raw).map_err(AdapterError::ForeignReceipt)
+    }
+
     /// Issue one fixed operation. `operation_id` is the caller's
     /// durable idempotence key: re-issuing the same operation after a
     /// reconnect requires the identical id and payload so the
@@ -204,5 +229,26 @@ impl<C: Read + Write> RemoteExecutor<C> {
     /// transport's shutdown.
     pub fn into_inner(self) -> C {
         self.channel
+    }
+}
+
+/// The adapter satisfies the reconcile seam (`contract §14, #378`):
+/// `issue_recorded` sends the pre-persisted canonical command bytes
+/// verbatim and verifies the receipt against them, so a coordinator
+/// reconcile pass and a first send travel the identical path.
+impl<C: Read + Write> workloop_exec::remote_reconcile::RemoteTransport for RemoteExecutor<C> {
+    fn session_incarnation(&self) -> &str {
+        RemoteExecutor::session_incarnation(self)
+    }
+
+    fn issue_recorded(
+        &mut self,
+        command: &ExecutorCommandV1,
+    ) -> Result<ExecutorReceiptV1, workloop_exec::remote_reconcile::TransportError> {
+        RemoteExecutor::issue_recorded(self, command).map_err(|e| {
+            workloop_exec::remote_reconcile::TransportError {
+                detail: e.to_string(),
+            }
+        })
     }
 }

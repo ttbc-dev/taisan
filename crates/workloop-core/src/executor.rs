@@ -1391,7 +1391,8 @@ pub struct ExecutorLimits {
 /// The complete immutable first binding for one remote request
 /// (contract §2): endpoint identity and incarnation, selected protocol
 /// version, capability-set digest, launch-configuration digest,
-/// request digest, and transfer limits. Serialized into the durable
+/// request digest, transfer limits, and the absolute bounded-budget
+/// deadline recorded at bind time. Serialized into the durable
 /// `binding_body`; changing any field is a different binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1406,6 +1407,12 @@ pub struct ExecutorBindingFields {
     pub request_id: String,
     pub invocation_id: String,
     pub request_digest: String,
+    /// The absolute authorized-runtime deadline (unix ms) the binding
+    /// carried at accept time. Reconciliation derives every minted
+    /// operation's remaining budget from it — replayed commands keep
+    /// their original fields, and clock skew may only shorten the
+    /// effective runtime, never extend it (contract §8, #378).
+    pub deadline_unix_ms: i64,
     pub limits: ExecutorLimits,
 }
 
@@ -1556,6 +1563,45 @@ impl ExecutorOperation {
             _ => false,
         }
     }
+}
+
+/// The durable reconcile cursor for one bound request (contract §14,
+/// #378): how many consecutive unproductive reconciliation steps the
+/// request has carried, which fence class — if any — has been emitted,
+/// and the earliest unix-ms a re-drive may spend another step. This
+/// row is what makes reconnect/retry/fence state durable across a
+/// coordinator restart: a transport fault that never reached an
+/// operation leaves no operation-ledger record, so bounded retry
+/// cannot be reconstructed from `executor_operations` alone.
+///
+/// `updated_seq` is the compare-and-set cursor the
+/// `UpsertExecutorReconcile` effect guards: a writer that read an
+/// older row conflicts instead of silently losing the newer count —
+/// the same discipline `executor_collections.recorded_seq` and the
+/// handoff rows already use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutorReconcile {
+    pub request_id: String,
+    /// Consecutive steps that produced no durable progress (a
+    /// transport fault, an `unknown`/`unavailable` answer, or a
+    /// replayed receipt that changed nothing). A productive step —
+    /// receipt attached, writer adopted or proven, fence recorded —
+    /// resets it to zero.
+    pub consecutive_faults: u32,
+    /// The emitted `RemoteFence` class once the bounded fault budget
+    /// was spent (contract §14 closed vocabulary); `None` while the
+    /// request is still within budget. Sticky: re-emitting the same
+    /// fence is a delivery-id duplicate, and a recorded fence is the
+    /// durable signal the operator attention names.
+    pub fenced_class: Option<String>,
+    /// Earliest unix-ms the next re-drive may run — the persisted
+    /// `transport_backoff_seconds` schedule applied to
+    /// `consecutive_faults`. A pass before it leaves the row
+    /// untouched: the schedule survives restarts unchanged.
+    pub next_attempt_unix_ms: i64,
+    /// Compare-and-set sequence; `0` on a row not yet committed.
+    pub updated_seq: i64,
 }
 
 // ---------------------------------------------------------------------
@@ -2738,6 +2784,7 @@ mod tests {
             request_id: "e-7:inv:2".into(),
             invocation_id: "inv-41".into(),
             request_digest: "b".repeat(64),
+            deadline_unix_ms: 1_800_000_000_000,
             limits: ExecutorLimits {
                 max_input_bytes: 4 * 1024 * 1024,
                 max_output_bytes: 4 * 1024 * 1024,

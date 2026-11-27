@@ -155,6 +155,7 @@ fn binding_fields(request_id: &str) -> ExecutorBindingFields {
         request_id: request_id.into(),
         invocation_id: format!("inv-{request_id}"),
         request_digest: "b".repeat(64),
+        deadline_unix_ms: 1_800_000_000_000,
         limits: ExecutorLimits {
             max_input_bytes: 4 * 1024 * 1024,
             max_output_bytes: 4 * 1024 * 1024,
@@ -872,7 +873,7 @@ fn a_v13_store_gains_the_executor_tables() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 19, "the upgrade lands on the current format");
+    assert_eq!(version, 20, "the upgrade lands on the current format");
     assert!(
         store
             .transact(|tx| tx.request(&request_id))

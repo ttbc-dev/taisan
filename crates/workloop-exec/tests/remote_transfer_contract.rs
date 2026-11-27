@@ -332,6 +332,7 @@ fn seed_remote_request(
                     request_id: request_id.clone(),
                     invocation_id: invocation_id.clone(),
                     request_digest: request.digest(),
+                    deadline_unix_ms: 1_800_000_000_000,
                     limits: limits(),
                 })
                 .unwrap(),
@@ -678,6 +679,7 @@ fn seed_review_request(
                     request_id: request_id.clone(),
                     invocation_id: invocation_id.clone(),
                     request_digest: request.digest(),
+                    deadline_unix_ms: 1_800_000_000_000,
                     limits: limits(),
                 })
                 .unwrap(),
@@ -3069,6 +3071,7 @@ fn seed_fix_request(
                     request_id: request_id.clone(),
                     invocation_id: invocation_id.clone(),
                     request_digest: request.digest(),
+                    deadline_unix_ms: 1_800_000_000_000,
                     limits: limits(),
                 })
                 .unwrap(),

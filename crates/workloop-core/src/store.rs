@@ -311,6 +311,16 @@ pub enum Effect {
         collection: crate::executor::ExecutorCollection,
         expected_seq: EventSequence,
     },
+    /// Full-row upsert of the durable reconcile cursor
+    /// (`docs/executor-transport-contract.md` §14, #378). `expected_seq`
+    /// is the `updated_seq` the writer read (0 for a row believed
+    /// absent): a row concurrently advanced past it makes the write a
+    /// `ConstraintConflict`, never a silently lost fault count — a
+    /// second reconcile writer cannot overwrite a newer cursor.
+    UpsertExecutorReconcile {
+        cursor: crate::executor::ExecutorReconcile,
+        expected_seq: i64,
+    },
     /// Replaces the singleton intake-settings record, guarded by the
     /// caller-observed revision: `expected_revision` must equal the
     /// currently recorded `settings_revision`, and `None` requires the
@@ -902,6 +912,22 @@ pub trait ReadView {
         &self,
         request_id: &str,
     ) -> Result<Option<crate::executor::ExecutorBinding>, StoreError>;
+    /// Every durable executor binding — the re-adoption set a
+    /// coordinator restart replays against (contract §14, #378).
+    /// Stores that cannot enumerate them return none.
+    fn executor_bindings(&self) -> Result<Vec<crate::executor::ExecutorBinding>, StoreError> {
+        Ok(Vec::new())
+    }
+    /// The durable reconcile cursor for one bound request; `None` =
+    /// reconciliation has never committed a step for it (contract §14).
+    /// Stores that cannot read it return `None` and rely on the
+    /// reconcile driver's in-pass bookkeeping.
+    fn executor_reconcile(
+        &self,
+        _request_id: &str,
+    ) -> Result<Option<crate::executor::ExecutorReconcile>, StoreError> {
+        Ok(None)
+    }
     /// The durable operation record for one command identity;
     /// `None` = absent. Replay and reconciliation read this before any
     /// endpoint contact.

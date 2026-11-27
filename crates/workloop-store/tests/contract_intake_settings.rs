@@ -785,7 +785,7 @@ fn a_v8_store_upgrades_to_the_current_format_additively() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 19);
+    assert_eq!(version, 20);
 
     // The new table exists and reads empty — the documented default
     // applies until a guarded write lands.
