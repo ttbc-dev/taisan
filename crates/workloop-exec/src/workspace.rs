@@ -39,7 +39,6 @@ pub enum PreparationError {
     ReservationConflict { detail: String },
     ActiveWriter { detail: String },
     WorkspaceConflict { detail: String },
-    GitVersionUnsupported { detail: String },
     Io(std::io::Error),
     Git { detail: String },
 }
@@ -62,13 +61,6 @@ impl std::fmt::Display for PreparationError {
             Self::ActiveWriter { detail } => write!(f, "active writer: {detail}"),
             Self::WorkspaceConflict { detail } => {
                 write!(f, "workspace conflict: {detail}")
-            }
-            Self::GitVersionUnsupported { detail } => {
-                write!(
-                    f,
-                    "git version unsupported (requires >= {}.{}.{}): {detail}",
-                    MINIMUM_GIT_VERSION.0, MINIMUM_GIT_VERSION.1, MINIMUM_GIT_VERSION.2
-                )
             }
             Self::Io(e) => write!(f, "{e}"),
             Self::Git { detail } => write!(f, "git failure: {detail}"),
@@ -97,58 +89,6 @@ const GIT_BOUNDS: ExchangeBounds = ExchangeBounds {
     max_stdout: 4 * 1024 * 1024,
     max_stderr: 16 * 1024,
 };
-
-/// The oldest git whose protected-configuration scoping this module
-/// relies on. Since git 2.30.2 `uploadpack.packObjectsHook` is honored
-/// only from system/global/command scope, never from the fetched
-/// repository's own `.git/config`, so a direct local-path fetch cannot
-/// make the source repository's config execute code.
-pub const MINIMUM_GIT_VERSION: (u32, u32, u32) = (2, 30, 2);
-
-fn parse_git_version(report: &str) -> Option<(u32, u32, u32)> {
-    let rest = report.trim().strip_prefix("git version ")?;
-    let token = rest.split_whitespace().next()?;
-    let mut parts = token.split('.');
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    let patch = parts.next().unwrap_or("0").parse().ok()?;
-    Some((major, minor, patch))
-}
-
-/// Fail closed unless `git --version` reports at least
-/// [`MINIMUM_GIT_VERSION`]. The named diagnostic is
-/// `git-version-unsupported`; an unparseable report is treated as
-/// unsupported, never assumed new enough.
-fn require_supported_git(report: &str) -> Result<(), PreparationError> {
-    match parse_git_version(report) {
-        Some(found) if found >= MINIMUM_GIT_VERSION => Ok(()),
-        Some((major, minor, patch)) => Err(PreparationError::GitVersionUnsupported {
-            detail: format!(
-                "git-version-unsupported: found {major}.{minor}.{patch}, need >= 2.30.2"
-            ),
-        }),
-        None => Err(PreparationError::GitVersionUnsupported {
-            detail: format!(
-                "git-version-unsupported: could not parse `git --version` output {report:?}, need >= 2.30.2"
-            ),
-        }),
-    }
-}
-
-fn check_git_version() -> Result<(), PreparationError> {
-    let argv = vec!["git".to_string(), "--version".to_string()];
-    let (stdout, code) = bounded_run(&argv, Path::new("/"), GIT_TIMEOUT).map_err(|e| {
-        PreparationError::GitVersionUnsupported {
-            detail: format!("git-version-unsupported: `git --version` could not run: {e}"),
-        }
-    })?;
-    if code != Some(0) {
-        return Err(PreparationError::GitVersionUnsupported {
-            detail: "git-version-unsupported: `git --version` did not succeed".into(),
-        });
-    }
-    require_supported_git(&stdout)
-}
 
 fn git_env() -> WorkerEnv {
     WorkerEnv {
@@ -1156,12 +1096,11 @@ fn build_staging(
             // `-c` scope) and `GIT_CONFIG_COUNT` (the environment scope)
             // from the spawned server's environment, so
             // `GIT_CONFIG_ARGS`/`git_env` cannot unset its repo-local
-            // config. Non-exec keys (for example
-            // `uploadpack.allowFilter`, `uploadpack.allowTipSHA1InWant`)
-            // still reach the spawned server. Exec-capable keys such as
-            // `uploadpack.packObjectsHook` are honored only from
-            // protected configuration on git >= 2.30.2, which
-            // `check_git_version` enforces before any staging is built.
+            // config. What the server does read is the trusted source's
+            // own configuration, exec-capable keys included; that is
+            // trusted input because the mirror is installation-owned,
+            // and the untrusted worker workspace is never a fetch
+            // source.
             let src = source.path.to_string_lossy().into_owned();
             git(
                 staging,
@@ -1189,12 +1128,10 @@ fn build_staging(
             // objects, so it is inside the trust boundary just like the
             // operator-configured source mirror. `git fetch <path>`
             // still spawns `git-upload-pack` in it and that server keeps
-            // its non-exec repo-local config (`allowFilter`,
-            // `allowTipSHA1InWant`, ...), because git strips the client
-            // `-c`/environment config from the spawned server; the
-            // exec-capable `uploadpack.packObjectsHook` is
-            // protected-configuration only on git >= 2.30.2, which
-            // `check_git_version` enforces.
+            // its own repo-local config, because git strips the client
+            // `-c`/environment config from the spawned server; that
+            // config is installation-owned, and the untrusted workspace
+            // is never a fetch source.
             let src = handoff_repo.to_string_lossy().into_owned();
             let reference = handoff::artifact_ref(artifact_id);
             git(
@@ -1504,7 +1441,6 @@ pub fn prepare(
     source: &RepositorySource,
     now_unix_seconds: i64,
 ) -> Result<PreparedWorkspace, PreparationError> {
-    check_git_version()?;
     let gated: Result<Result<Gate, PreparationError>, StoreError> =
         store.transact_deferred(|tx| Ok(gates(tx, request_id, source, handoff, now_unix_seconds)));
     let gate = match gated {
@@ -1590,36 +1526,5 @@ mod tests {
         assert_eq!(declared_porcelain_path("/abs.json"), None);
         assert_eq!(declared_porcelain_path("../escape.json"), None);
         assert_eq!(declared_porcelain_path("a/../../escape"), None);
-    }
-
-    #[test]
-    fn git_version_floor_is_enforced_and_parsed_tolerantly() {
-        let ok = |s: &str| require_supported_git(s);
-        assert!(ok("git version 2.30.2").is_ok());
-        assert!(ok("git version 2.30.2.windows.1").is_ok());
-        assert!(ok("git version 2.39.3 (Apple Git-145)").is_ok());
-        assert!(ok("git version 2.54.0").is_ok());
-
-        for old in [
-            "git version 2.30.1",
-            "git version 2.29.9",
-            "git version 1.9.0",
-        ] {
-            let err = ok(old).unwrap_err();
-            assert!(
-                matches!(&err, PreparationError::GitVersionUnsupported { detail }
-                    if detail.contains("git-version-unsupported")),
-                "{old}: {err:?}"
-            );
-        }
-        assert!(matches!(
-            ok("not a git version").unwrap_err(),
-            PreparationError::GitVersionUnsupported { .. }
-        ));
-    }
-
-    #[test]
-    fn the_installed_git_satisfies_the_documented_floor() {
-        check_git_version().unwrap();
     }
 }
