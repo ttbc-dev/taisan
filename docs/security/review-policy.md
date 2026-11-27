@@ -48,6 +48,9 @@ touches a trust-boundary surface:
   `service.rs`, `runner.rs`, `state.rs`, `adapter.rs` — session auth,
   framed channel, bootstrap credentials, operation dispatch, staging and
   lifecycle, durable state, and the coordinator-side adapter.
+- `crates/workloop-executor/src/bin/` — the `serve`/`connect`
+  entrypoints: bootstrap-credential handling and the stdio↔socket
+  transport bridge the checklist audits as a trust-boundary surface.
 - `crates/workloop-github/src/credential.rs`, `gh_cli.rs` — token
   resolution and the `gh`/`git` transports that carry it.
 - `docs/executor-transport-contract.md` §2–§8,

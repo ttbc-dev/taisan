@@ -30,6 +30,8 @@
 | F6's blast radius overstated — `Runner::observe` still enforces per-request | Resolved in-change — scope narrowed to the autonomous sweep | `audit-v0.3.md` F6; `runner.rs:975`,`:1001`,`:1051-1054` |
 | `rust.yml` enforcement described as "every push and PR" though it triggers only on PRs and pushes to `main` | Resolved in-change | `docs/security/review-policy.md` Automated scanning; `.github/workflows/rust.yml:3-6` |
 | Review-required surface list omitted `AGENTS.md`'s canonical sections | Resolved in-change — added to the required list, together with `docs/identity-storage.md` and `docs/u3.6e-authorization.md`, the remaining claimed-invariant sources named by checklist Step 1 | `docs/security/review-policy.md` Review required; `docs/security/audit-checklist.md` Step 1 |
+| Review-required surface list omitted `crates/workloop-executor/src/bin/`, which checklist §C audits (serve/connect entrypoints, transport bridge) | Resolved in-change — added to the required list | `docs/security/review-policy.md` Review required; `docs/security/audit-checklist.md` §C |
+| Worker-env row cited `env_clear` and the selector passthrough but not the profile allowlist's settling code | Resolved in-change — the citation now names `ENV_PASSTHROUGH`'s definition and consumption; the AGENTS.md bullet citation widened to match | `audit-v0.3.md` Invariants-verified table; `AGENTS.md` Invariants; `workloop-core/src/worker.rs:79`; `workloop-exec/src/isolation.rs:79` |
 
 ## Residual risk
 

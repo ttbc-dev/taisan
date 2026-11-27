@@ -136,7 +136,9 @@ is right.
   tracked defects).
 - Worker environment is an allowlist, never inheritance: `env_clear` at
   spawn plus `ENV_PASSTHROUGH`/`SELECTOR_ENV_PASSTHROUGH` containing no
-  credential-bearing names (`crates/workloop-exec/src/supervisor.rs`,
+  credential-bearing names (`crates/workloop-core/src/worker.rs`,
+  `crates/workloop-exec/src/isolation.rs`,
+  `crates/workloop-exec/src/supervisor.rs`,
   `crates/workloop-exec/src/bounded.rs`).
 - Contained launches unshare user/pid/ipc/net, bind system dirs read-only,
   tmpfs `/tmp` `/run` `/home`, and shadow masked roots/files; a mount plan

@@ -62,7 +62,7 @@
 | Command bound to full identity set before dispatch; replay fence; conflicting op id refused | upheld | `workloop-executor/src/service.rs:217-427,447-491` |
 | `runtime-auth` written 0600 atomic-private, bound to launch digest, ≤4 KiB, only while `prepared` | upheld | `runner.rs:472-497`; `state.rs:93-115` |
 | `runtime-auth` removed after stop proof / at acknowledge reclaim | partially upheld | findings F3, F5 |
-| Worker env is allowlist + `env_clear`, no credential-bearing passthrough names | upheld | `supervisor.rs:606-610`; `bounded.rs:92-228` |
+| Worker env is allowlist + `env_clear`, no credential-bearing passthrough names | upheld | `workloop-core/src/worker.rs:79` (`ENV_PASSTHROUGH`); `isolation.rs:79` (profile passthrough consumption); `supervisor.rs:606-610` (`env_clear`); `bounded.rs:92-228` (selector counterpart) |
 | Containment: unshare, ro binds, tmpfs, masked roots/files, unshadowable plans refused | upheld | `workloop-exec/src/containment.rs` |
 | Closed isolation-profile registry; unapproved id fails closed | upheld | `worker.rs:104-128`; `service.rs:564-572` |
 | Worker output read: whitelist + `symlink_metadata` + regular-file check + byte cap; `copy_tree` refuses symlinks | upheld | `runner.rs:38-43,~1729,~1782` |
