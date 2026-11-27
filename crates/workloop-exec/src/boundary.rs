@@ -716,19 +716,32 @@ fn publish_staged(tmp: &Path, path: &Path) -> Result<(), StageError> {
 /// Bounded digest of one file's content: at most the contract's own
 /// size bound is read, through fixed-size chunks, so a same-size edit
 /// anywhere in an admitted file changes the identity without
-/// buffering the file. A larger source cannot be a valid contract —
-/// `bindings::validate` refuses it unread — so the identity fails
-/// the same way instead of hashing an unbounded file before the
-/// refusal runs.
+/// buffering the file. The stat and the open race, so — as in
+/// `bindings::validate` — the opened descriptor carries the
+/// guarantee: `O_NOFOLLOW` refuses a link swapped in after the stat,
+/// `O_NONBLOCK` keeps a swapped-in fifo from blocking the open, and
+/// the opened inode is re-proven regular and inside the bound before
+/// the chunked read.
 fn file_content_digest(path: &Path) -> Result<String, std::io::Error> {
     use std::io::Read;
-    if std::fs::metadata(path)?.len() > crate::bindings::MAX_CONTRACT_BYTES {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file — the contract is exactly one document",
+        ));
+    }
+    if metadata.len() > crate::bindings::MAX_CONTRACT_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "provider config exceeds the contract size bound",
         ));
     }
-    let mut file = std::fs::File::open(path)?;
     let mut chunks = String::new();
     let mut total = 0u64;
     let mut buf = [0u8; 64 * 1024];
@@ -752,72 +765,20 @@ fn file_content_digest(path: &Path) -> Result<String, std::io::Error> {
 }
 
 /// Bounded content digest of a provider-config path for the boundary
-/// identity: a file hashes its full bytes; a directory hashes a
-/// sorted manifest of member names, kinds, sizes, and content
-/// digests — enough that any edit, including a same-size one,
-/// re-proves the gate without hashing unbounded trees.
+/// identity: the contract is exactly one document, so a regular file
+/// hashes its full bytes and every other source — a directory, a
+/// link, a special file — fails the identity read the same way
+/// `bindings::validate` refuses it. The identity surface never
+/// records evidence for a config no dispatch can admit.
 fn provider_config_digest(path: &Path) -> Result<String, std::io::Error> {
-    const MAX_ENTRIES: usize = 256;
     let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.is_file() {
-        return file_content_digest(path);
-    }
-    if !metadata.is_dir() {
+    if !metadata.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "not a file or directory",
+            "not a regular file — the contract is exactly one document",
         ));
     }
-    let mut manifest = Vec::new();
-    collect_manifest(path, path, &mut manifest, MAX_ENTRIES)?;
-    manifest.sort();
-    Ok(sha256_hex(
-        "provider-config-dir-v1",
-        &canonical_json(&serde_json::json!(manifest)),
-    ))
-}
-
-/// Per-member read bound for [`collect_manifest`]: a member file's
-/// digest covers the member's full content — the manifest stays
-/// bounded by the file count cap however large the config tree is.
-fn collect_manifest(
-    root: &Path,
-    dir: &Path,
-    out: &mut Vec<String>,
-    budget: usize,
-) -> Result<(), std::io::Error> {
-    if out.len() >= budget {
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(dir)? {
-        if out.len() >= budget {
-            break;
-        }
-        let entry = entry?;
-        let path = entry.path();
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .into_owned();
-        // Never follow a member link: a symlink's identity is its
-        // target path, and recursing or hashing through it would
-        // fold an outside tree into this config's identity.
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            let target = std::fs::read_link(&path)?.to_string_lossy().into_owned();
-            out.push(format!("link:{rel}:{target}"));
-        } else if file_type.is_dir() {
-            out.push(format!("dir:{rel}"));
-            collect_manifest(root, &path, out, budget)?;
-        } else if file_type.is_file() {
-            // Content, not name+size: a same-size edit is an identity
-            // change the gate must re-prove.
-            let digest = file_content_digest(&path)?;
-            out.push(format!("file:{rel}:{}:{digest}", entry.metadata()?.len()));
-        }
-    }
-    Ok(())
+    file_content_digest(path)
 }
 
 #[cfg(test)]
@@ -1009,48 +970,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A directory provider-config's identity covers member *content*:
-    /// a same-size edit is still an identity change — the gate re-proves
-    /// rather than riding on stale preflight evidence.
+    /// The contract is exactly one document, so the identity surface
+    /// refuses what validation refuses: a directory provider config —
+    /// or a source of any other kind — fails the identity read with
+    /// the same `provider_config.unreadable` class instead of being
+    /// hashed into evidence no dispatch could ever use.
     #[test]
-    fn a_same_size_member_edit_changes_the_directory_identity() {
-        let dir = tmp("dirmanifest");
+    fn a_directory_provider_config_fails_the_identity_read() {
+        let dir = tmp("dirrefuse");
         let cfg_dir = dir.join("provider.d");
         std::fs::create_dir_all(&cfg_dir).unwrap();
-        std::fs::write(cfg_dir.join("a.toml"), "model = \"m1\"\n").unwrap();
-        let digest_before = provider_config_digest(&cfg_dir).unwrap();
-        // Same byte length, different content.
-        std::fs::write(cfg_dir.join("a.toml"), "model = \"m2\"\n").unwrap();
-        let digest_after = provider_config_digest(&cfg_dir).unwrap();
-        assert_ne!(
-            digest_before, digest_after,
-            "a same-size content edit must re-prove the boundary"
-        );
-        // A re-pointed member link is an identity change too.
-        std::fs::write(dir.join("real.toml"), "x = 1\n").unwrap();
-        std::os::unix::fs::symlink(dir.join("real.toml"), cfg_dir.join("b.toml")).unwrap();
-        let linked = provider_config_digest(&cfg_dir).unwrap();
-        std::fs::remove_file(cfg_dir.join("b.toml")).unwrap();
-        std::fs::write(dir.join("other.toml"), "x = 1\n").unwrap();
-        std::os::unix::fs::symlink(dir.join("other.toml"), cfg_dir.join("b.toml")).unwrap();
-        assert_ne!(linked, provider_config_digest(&cfg_dir).unwrap());
+        std::fs::write(cfg_dir.join("provider.toml"), "model = \"m1\"\n").unwrap();
+        let err = provider_config_digest(&cfg_dir).unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        let mut cfg = config(&dir);
+        cfg.provider_config = Some(cfg_dir);
+        let boundary = RuntimeBoundary::new(cfg);
+        let err = boundary.identity_digest().unwrap_err();
+        assert!(err.contains("provider_config.unreadable"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A same-size edit inside a provider-config directory changes the
-    /// content identity — the manifest hashes member bytes, not only
-    /// names and sizes.
+    /// Every other non-regular source fails the same way: a link that
+    /// resolves to a perfectly valid contract document is still
+    /// refused, and so is a special file — the `is_file` guard or the
+    /// descriptor re-check must never let one through into evidence.
     #[test]
-    fn a_same_size_dir_edit_changes_the_provider_config_digest() {
-        let dir = tmp("samesize");
-        let cfg_dir = dir.join("cfg");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        let member = cfg_dir.join("provider.toml");
-        std::fs::write(&member, "token = \"aaaa\"\n").unwrap();
-        let d1 = provider_config_digest(&cfg_dir).unwrap();
-        std::fs::write(&member, "token = \"bbbb\"\n").unwrap();
-        let d2 = provider_config_digest(&cfg_dir).unwrap();
-        assert_ne!(d1, d2, "same-size content edits move the digest");
+    fn a_link_or_special_provider_config_fails_the_identity_read() {
+        let dir = tmp("linkrefuse");
+        let target = dir.join("provider.json");
+        std::fs::write(
+            &target,
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\"}\n",
+        )
+        .unwrap();
+        let link = dir.join("provider-link.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let fifo = dir.join("provider.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mkfifo must succeed for the trigger");
+        for source in [link, fifo] {
+            let err = provider_config_digest(&source).unwrap_err();
+            assert!(err.to_string().contains("not a regular file"), "{err}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1727,9 +1692,9 @@ mod tests {
     }
 
     /// The identity digest reads at most the contract's own size
-    /// bound: an oversized provider source — file or directory
-    /// member — fails the identity the same way validation refuses
-    /// it, instead of being hashed unbounded before the refusal runs.
+    /// bound: an oversized provider source fails the identity the
+    /// same way validation refuses it, instead of being hashed
+    /// unbounded before the refusal runs.
     #[test]
     fn an_oversized_provider_config_fails_the_bounded_identity_read() {
         let dir = tmp("oversize");
@@ -1745,16 +1710,6 @@ mod tests {
         let boundary = RuntimeBoundary::new(cfg);
         let err = boundary.identity_digest().unwrap_err();
         assert!(err.contains("provider_config.unreadable"), "{err}");
-        // An oversized member of a directory config fails the same
-        // bounded read — the entry cap does not bound member bytes.
-        let cfg_dir = dir.join("provider.d");
-        std::fs::create_dir_all(&cfg_dir).unwrap();
-        std::fs::write(
-            cfg_dir.join("big.json"),
-            vec![b'x'; crate::bindings::MAX_CONTRACT_BYTES as usize + 1],
-        )
-        .unwrap();
-        assert!(provider_config_digest(&cfg_dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

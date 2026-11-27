@@ -3,8 +3,10 @@
 # packaged Worker reads its bindings — the real adapter is installed by
 # the deployment, never by this repository.
 #
-# Reads:   /taisan/provider-config  (taisan.worker.bindings/1, read-only)
-#          /taisan/runtime-auth     (staged credential, read-only)
+# Reads:   /taisan/provider-config  (taisan.worker.bindings/1, read-only;
+#                                   absent without worker_provider_config)
+#          /taisan/runtime-auth     (staged credential, read-only;
+#                                   absent without worker_credential_ref)
 #          /taisan/request.json     (canonical request, read-only)
 # Writes:  /taisan/out              (report.json, runtime.log)
 # Egress:  $HTTPS_PROXY             (CONNECT relay, model-API hosts only)

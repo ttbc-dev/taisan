@@ -50,16 +50,16 @@ the failed rule, never the document's content:
 
 | Diagnostic | Cause |
 | --- | --- |
-| `provider_config.unreadable` | Path absent or not readable — also the bounded identity digest's verdict for an oversized source, which it refuses unread before validation runs |
-| `provider_config.contract_invalid` | Not a regular file, over the size bound at validation, not a JSON object, a repeated member name anywhere in the document, or a fixed member violates its shape rule (missing `model`, empty or all-whitespace/over-long/wrong-typed value) |
+| `provider_config.unreadable` | Path absent or not readable — also the bounded identity digest's verdict for an oversized or non-regular source, which it refuses unread before validation runs |
+| `provider_config.contract_invalid` | Not a regular file or over the size bound at validation, not a JSON object, a repeated member name anywhere in the document, or a fixed member violates its shape rule (missing `model`, empty or all-whitespace/over-long/wrong-typed value) |
 | `provider_config.contract_version` | `format_version` absent or not exactly `taisan.worker.bindings/1` |
 | `provider_config.contains_credential` | The resolved credential value — as a consumer reads it, trimmed and JSON-decoded — appears anywhere in the document |
 
 An invalid or missing required binding refuses the launch; there is
 no partial mount and no ambient fallback. The preflight identity hash
-is bounded the same way — at most the contract size bound is read, so
-an oversized source fails the gate unread instead of being hashed
-before validation runs.
+is bounded the same way — at most the contract size bound is read and
+only a regular file is hashed, so an oversized or non-regular source
+fails the gate unread instead of being hashed before validation runs.
 
 ## Runtime credential delivery
 
@@ -150,34 +150,36 @@ sandbox through the narrow read-only surface: paths under the fixed
 system prefixes (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`) ride the
 wholesale read-only system binds; every other absolute path the argv
 names is bound read-only at its own path. `/etc` and `/opt` are
-deliberately not bound — they are host configuration and third-party
-install trees, not the runtime. A Worker package installed outside
-the bound prefixes therefore exposes only the paths its argv names:
-the argv[0] executable and every absolute-path argv element bind at
-their own path, but sibling dependencies the argv does not name stay
-invisible. Packages that need a directory of dependencies must live
-under a bound prefix (as in the example layout), name each required
-absolute path in argv, or ship a self-contained executable. Bind
-sources the contract never admits are refused by `plan_denial`
-before the plan renders: host `/`, the owner's home directory or an
-ancestor of it (the home is resolved from `$HOME` and the account
-database, so an unset or misleading environment spelling cannot
-lapse the guard; a path strictly beneath the home still binds only
-the named path while the tmpfs `/home` keeps the rest invisible),
-and any own-path source that is not a regular file or directory — a
-host socket, device, or fifo grants an IPC endpoint, never file
-content — including a declared directory source holding such an
-entry anywhere in its tree, so an argv-named container-runtime
-socket cannot be mounted. The directory scan is bounded and fails
-closed: a tree that cannot be read or cannot be fully certified
-within the entry bound is refused rather than admitted uninspected.
-The scan certifies declared sources — binds spelled from worker
-argv, profile, or installation config; trees the supervisor itself
-produced, such as the verification worktree and the installation
-bare repository, are admitted without it: no declared text reaches
-their spelling and their content is git-produced, so a repository
-larger than the entry bound must not fail verification on a
-certification nobody needed.
+deliberately not bound wholesale — they are host configuration and
+third-party install trees, not the runtime. The narrow exception is
+the declared CA trust surface above: a profile-declared bundle or
+hashed directory under `/etc` still binds read-only at its own path.
+A Worker package installed outside the bound prefixes therefore
+exposes only the paths its argv names: the argv[0] executable and
+every absolute-path argv element bind at their own path, but sibling
+dependencies the argv does not name stay invisible. Packages that
+need a directory of dependencies must live under a bound prefix (as
+in the example layout), name each required absolute path in argv, or
+ship a self-contained executable. Bind sources the contract never
+admits are refused by `plan_denial` before the plan renders: host
+`/`, the owner's home directory or an ancestor of it (the home is
+resolved from `$HOME` and the account database, so an unset or
+misleading environment spelling cannot lapse the guard; a path
+strictly beneath the home still binds only the named path while the
+tmpfs `/home` keeps the rest invisible), and any own-path source
+that is not a regular file or directory — a host socket, device, or
+fifo grants an IPC endpoint, never file content — including a
+declared directory source holding such an entry anywhere in its
+tree, so an argv-named container-runtime socket cannot be mounted.
+The directory scan is bounded and fails closed: a tree that cannot
+be read or cannot be fully certified within the entry bound is
+refused rather than admitted uninspected. The scan certifies
+declared sources — binds spelled from worker argv, profile, or
+installation config; trees the supervisor itself produced, such as
+the verification worktree and the installation bare repository, are
+admitted without it: no declared text reaches their spelling and
+their content is git-produced, so a repository larger than the entry
+bound must not fail verification on a certification nobody needed.
 Nothing packaged is bound writable. The only writable host paths are
 `/workspace` (role-dependent) and `/taisan/out`; every other writable
 location inside the sandbox is ephemeral — the tmpfs the sandbox root
