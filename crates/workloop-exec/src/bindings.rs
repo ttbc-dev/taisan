@@ -233,90 +233,13 @@ fn invalid(detail: impl Into<String>) -> String {
 /// ambiguity — and a strict consumer (the adapter's own field parse)
 /// then rejects the whole document and silently falls back to
 /// defaults. The boundary fails closed instead: a repeated member
-/// name anywhere in the document is not a contract document.
+/// name anywhere in the document is not a contract document. The
+/// adapters gate on the same parse
+/// ([`workloop_core::domain::parse_unique_members`]) so supervisor and
+/// Worker can never disagree on which bytes are a contract document.
 fn parse_contract(bytes: &[u8]) -> Result<serde_json::Value, String> {
-    serde_json::from_slice::<UniqueMembers>(bytes)
-        .map(|document| document.0)
+    workloop_core::domain::parse_unique_members(bytes)
         .map_err(|e| invalid(format!("not a contract JSON object: {e}")))
-}
-
-/// A `serde_json::Value` whose object member names are unique at
-/// every depth — see [`parse_contract`].
-struct UniqueMembers(serde_json::Value);
-
-impl<'de> serde::Deserialize<'de> for UniqueMembers {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(UniqueVisitor)
-    }
-}
-
-struct UniqueVisitor;
-
-impl<'de> serde::de::Visitor<'de> for UniqueVisitor {
-    type Value = UniqueMembers;
-
-    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str("a JSON value")
-    }
-
-    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
-        Ok(UniqueMembers(serde_json::Value::Bool(value)))
-    }
-
-    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
-        Ok(UniqueMembers(value.into()))
-    }
-
-    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
-        Ok(UniqueMembers(value.into()))
-    }
-
-    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
-        serde_json::Number::from_f64(value)
-            .map(|n| UniqueMembers(serde_json::Value::Number(n)))
-            .ok_or_else(|| E::custom("non-finite number"))
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
-        Ok(UniqueMembers(value.into()))
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(UniqueMembers(serde_json::Value::Null))
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(UniqueMembers(serde_json::Value::Null))
-    }
-
-    fn visit_some<D: serde::Deserializer<'de>>(
-        self,
-        deserializer: D,
-    ) -> Result<Self::Value, D::Error> {
-        <UniqueMembers as serde::Deserialize>::deserialize(deserializer)
-    }
-
-    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-        while let Some(UniqueMembers(item)) = seq.next_element::<UniqueMembers>()? {
-            items.push(item);
-        }
-        Ok(UniqueMembers(serde_json::Value::Array(items)))
-    }
-
-    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        let mut object = serde_json::Map::new();
-        while let Some((key, UniqueMembers(value))) = map.next_entry::<String, UniqueMembers>()? {
-            if object.contains_key(&key) {
-                // A member name is document content — an extension
-                // key may carry the credential itself — so the
-                // diagnostic names the rule and never echoes it.
-                return Err(serde::de::Error::custom("duplicate member name"));
-            }
-            object.insert(key, value);
-        }
-        Ok(UniqueMembers(serde_json::Value::Object(object)))
-    }
 }
 
 #[cfg(test)]

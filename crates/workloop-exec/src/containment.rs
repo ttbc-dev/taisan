@@ -394,17 +394,20 @@ pub fn ca_trust_binds(profile: &IsolationProfile) -> Vec<PathBuf> {
 /// The sandbox spellings at which a `masked_files` entry stays
 /// visible — the destinations its `/dev/null` shadow must cover. An
 /// own-path plan bind mounts host content at its own spelling, so a
-/// covered file is reachable inside at that path. A symlinked bind or
-/// ancestor exposes the same file under a second spelling, so the
-/// literal path and its canonical form are both checked, and coverage
-/// through a resolved bind renders the mask under the spelling the
-/// plan named. A path beneath an emitted mask-root tmpfs is already
-/// invisible — only an own-path bind re-mounting over the tmpfs can
-/// make it reachable again, and that coverage is collected first.
-/// Nothing else creates the path inside the sandbox: an entry no
-/// mount covers is already invisible and must not be masked — a
-/// `--ro-bind` destination nothing created would fail the whole mount
-/// setup.
+/// covered file is reachable inside at that path; the supervisor's
+/// own produced trees (`supervised_binds` — the verification
+/// worktree, the installation repository) count the same way, since
+/// they re-mount host content over any mask-root tmpfs that covers
+/// their spelling. A symlinked bind or ancestor exposes the same
+/// file under a second spelling, so the literal path and its
+/// canonical form are both checked, and coverage through a resolved
+/// bind renders the mask under the spelling the plan named. A path
+/// beneath an emitted mask-root tmpfs is already invisible — only an
+/// own-path bind re-mounting over the tmpfs can make it reachable
+/// again, and that coverage is collected first. Nothing else creates
+/// the path inside the sandbox: an entry no mount covers is already
+/// invisible and must not be masked — a `--ro-bind` destination
+/// nothing created would fail the whole mount setup.
 fn masked_file_dests(plan: &MountPlan, file: &Path) -> Vec<PathBuf> {
     masked_file_dests_among(plan, file, SYSTEM_BINDS)
 }
@@ -435,6 +438,7 @@ fn masked_file_dests_among(plan: &MountPlan, file: &Path, binds: &[&str]) -> Vec
         .chain(plan.ca_bundles.iter())
         .chain(plan.extra_binds.iter())
         .chain(plan.extra_rw_binds.iter())
+        .chain(plan.supervised_binds.iter())
         .chain(plan.worker.iter())
     {
         let bind_resolved = bind.canonicalize().unwrap_or_else(|_| bind.clone());
@@ -2033,6 +2037,51 @@ mod tests {
             mask > own_bind,
             "the mask must shadow the own-path bind: {text}"
         );
+    }
+
+    /// A `file:` credential source beneath a supervisor-produced tree —
+    /// the verification worktree or the installation bare repository —
+    /// is reachable inside the sandbox at its own spelling, so the
+    /// `/dev/null` shadow must cover it there too: the supervised bind
+    /// mounts the tree read-only over any mask-root tmpfs that
+    /// swallowed its spelling.
+    #[test]
+    fn a_masked_file_beneath_a_supervised_bind_is_shadowed() {
+        let dir = tmp("masked-supervised");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("credential-source");
+        std::fs::write(&file, b"sentinel").unwrap();
+        let mut plan = plan_fixture();
+        plan.masked_files = vec![file.clone()];
+        plan.supervised_binds = vec![dir.clone()];
+        let args = bwrap_args(
+            Path::new("/usr/bin/bwrap"),
+            &plan,
+            &["worker".into()],
+            "/workspace",
+        );
+        let text = args.join(" ");
+        let own_bind = text
+            .find(&format!("--ro-bind {0} {0}", dir.display()))
+            .expect("the supervised bind renders at its own spelling");
+        let mask = text
+            .find(&format!("--ro-bind /dev/null {}", file.display()))
+            .expect("a supervised-bind-covered credential is masked");
+        assert!(
+            mask > own_bind,
+            "the mask renders after the supervised bind: {text}"
+        );
+        assert!(
+            plan_denial(&plan).is_none(),
+            "a regular covered file shadows instead of refusing: {text}"
+        );
+        // A covered *directory* named in masked_files cannot take the
+        // shadow — the plan refuses rather than emit a mask that
+        // cannot hold.
+        plan.masked_files = vec![dir.clone()];
+        let reason = plan_denial(&plan).expect("an unshadowable entry refuses");
+        assert!(reason.contains("not a regular file"), "{reason}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// On a merged-`/usr` layout each system-bind member is bound as

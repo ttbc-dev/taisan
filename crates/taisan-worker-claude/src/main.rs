@@ -501,12 +501,12 @@ fn workspace_dir() -> PathBuf {
 
 /// The provider binding is optional: an absent path means nothing was
 /// staged and the default config applies. A *present* document is the
-/// versioned contract mount — it must parse, stay inside the contract
-/// bound, and carry the exact `format_version`, so the supervisor and
-/// the adapter can never silently disagree on which contract the
-/// mount carries (docs/runtime-bindings.md). There is no tolerant
-/// parse and no fallback to defaults: an invalid present document
-/// refuses the launch.
+/// versioned contract mount — it must parse as a JSON object, stay
+/// inside the contract bound, and carry the exact `format_version`,
+/// so the supervisor and the adapter can never silently disagree on
+/// which contract the mount carries (docs/runtime-bindings.md). There
+/// is no tolerant parse and no fallback to defaults: an invalid
+/// present document refuses the launch.
 fn load_provider_config(cfg: &Config) -> Result<ProviderConfig, String> {
     // The contract is exactly one document: a directory, a link, or
     // any other non-regular source is refused at the stat — before the
@@ -533,7 +533,18 @@ fn load_provider_config(cfg: &Config) -> Result<ProviderConfig, String> {
     if bytes.len() as u64 > MAX_PROVIDER_CONTRACT_BYTES {
         return Err("provider_config.contract_invalid: exceeds the contract size bound".into());
     }
-    let provider: ProviderConfig = serde_json::from_slice(&bytes)
+    // The document parses under the same rule the supervisor's
+    // validator applies — duplicate member names refuse at every
+    // depth — and it must be a JSON object: the derived struct
+    // deserializer would otherwise also accept a sequence, reading a
+    // JSON array's elements as the fields in declaration order — a
+    // shape the boundary refuses outright.
+    let document = workloop_core::domain::parse_unique_members(&bytes)
+        .map_err(|e| format!("provider_config.contract_invalid: {e}"))?;
+    if !document.is_object() {
+        return Err("provider_config.contract_invalid: not a JSON object".into());
+    }
+    let provider: ProviderConfig = serde_json::from_value(document)
         .map_err(|e| format!("provider_config.contract_invalid: {e}"))?;
     if provider.format_version.as_deref() != Some(PROVIDER_CONTRACT_FORMAT) {
         return Err(format!(

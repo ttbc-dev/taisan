@@ -5,10 +5,11 @@
 // taisan.worker.report/2).
 const fs = require("fs");
 
-// Both bindings are optional: `/taisan/provider-config` exists only
-// when the installation configures `worker_provider_config`, and
-// `/taisan/runtime-auth` only when it configures `worker_credential_ref`
-// — a valid installation omitting either mounts neither file.
+// Both bindings are optional, and each setting gates only its own
+// mount: `/taisan/provider-config` exists when the installation
+// configures `worker_provider_config`, and `/taisan/runtime-auth`
+// when it configures `worker_credential_ref` — omitting one leaves
+// the other in place.
 const bindings = fs.existsSync("/taisan/provider-config")
   ? JSON.parse(fs.readFileSync("/taisan/provider-config", "utf8"))
   : null;

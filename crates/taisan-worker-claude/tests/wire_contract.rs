@@ -1929,6 +1929,20 @@ fn a_present_provider_document_must_carry_the_contract_version() {
         ),
         ("noversion", "{\"model\":\"m\"}\n".to_string()),
         ("malformed", "not json\n".to_string()),
+        // A sequence document satisfies the derived struct's fields
+        // in declaration order — the contract mount is a JSON object,
+        // so the array form refuses like every other non-object.
+        (
+            "arraydoc",
+            "[\"taisan.worker.bindings/1\",\"m\",null,null]\n".to_string(),
+        ),
+        // A repeated member name — here inside an adapter-owned
+        // extension member — is not a contract document at any depth.
+        (
+            "dupmember",
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\",\"ext\":{\"a\":1,\"a\":2}}\n"
+                .to_string(),
+        ),
         (
             "nomodel",
             "{\"format_version\":\"taisan.worker.bindings/1\"}\n".to_string(),
@@ -2070,7 +2084,7 @@ fn assert_provider_config_refuses(dir: &Path, ws: &Path, provider: &Path, name: 
         false,
     );
     let (request_path, _, out_dir) = dispatch(name, &req, &[("goal.md", "goal\n")]);
-    let out = Command::new(shim())
+    let mut child = Command::new(shim())
         .args(["--runtime"])
         .arg(&fake)
         .args(["--provider-config"])
@@ -2080,8 +2094,28 @@ fn assert_provider_config_refuses(dir: &Path, ws: &Path, provider: &Path, name: 
         .args(["--out"])
         .arg(&out_dir)
         .current_dir(ws)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
+    // The wait is bounded: a regression that opens the source before
+    // the stat check parks on a fifo's writer forever, and the test
+    // must report that failure, not hang the suite on it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let out = loop {
+        if child.try_wait().unwrap().is_some() {
+            break child.wait_with_output().unwrap();
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "{name}: the provider-config refusal did not exit within the bound — \
+                 a non-regular source must be refused at the stat, not parked on the open"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
     assert!(
         !out.status.success(),
         "{name}: an invalid present document must refuse: {out:?}"
