@@ -2378,15 +2378,24 @@ fn remote_placed_verification_records_the_bound_marker_without_running() {
 
     // A produced-commit change is a new evidence basis: the markers
     // re-record under the new produced value, still never running.
-    let mut s2 = s.clone();
-    s2.verification_argv = vec![vec!["true".into()]];
-    handoff::drive(&store, &layout, &aid, &s2, 3, &Ok(None), &mut || 0).unwrap();
+    std::fs::write(ws_dir.join("artifact.json"), "{\"ok\":\"rework\"}").unwrap();
+    git(&ws_dir, &["add", "."]);
+    git(&ws_dir, &["commit", "-m", "reworked"]);
+    let reworked = git(&ws_dir, &["rev-parse", "HEAD"]);
+    assert_ne!(reworked, produced);
+    let mut moved = row(&store, &aid).unwrap();
+    moved.produced = Some(reworked.clone());
+    persist(&store, &moved);
+    handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
     let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 2, "one bounded record per requirement");
     assert!(
-        results.iter().all(
-            |r| r.result == VerificationOutcome::Inconclusive && r.environment_digest == marker
-        ),
-        "no local run ever produced a terminal result"
+        results
+            .iter()
+            .all(|r| r.result == VerificationOutcome::Inconclusive
+                && r.environment_digest == marker
+                && r.produced == reworked),
+        "the markers re-record under the new produced value, never running locally"
     );
 }
 
