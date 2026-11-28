@@ -644,7 +644,7 @@ fn a_v14_store_gains_the_collections_table() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 18, "the upgrade lands on the current format");
+    assert_eq!(version, 19, "the upgrade lands on the current format");
     assert!(
         store
             .transact(|tx| tx.executor_collection(&request_id))
@@ -698,7 +698,7 @@ fn a_v13_store_upgrades_through_v14_and_v15() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 18, "the upgrade lands on the current format");
+    assert_eq!(version, 19, "the upgrade lands on the current format");
     // The request row survived; re-attach the binding the v13 reshape
     // dropped so the collection's foreign key holds.
     assert!(

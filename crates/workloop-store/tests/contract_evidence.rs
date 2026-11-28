@@ -187,6 +187,7 @@ fn handoff(
             state,
             invalid_reason: None,
             attempt: 0,
+            verification_placement: None,
             recorded_seq: 0,
         },
         expected_seq: 0,

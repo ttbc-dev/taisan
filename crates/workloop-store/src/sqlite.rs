@@ -10,8 +10,8 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `18` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1` through `17`
+//! `PRAGMA user_version` is the format gate: `19` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1` through `18`
 //! must carry the complete recognized schema of its version and
 //! upgrades additively at open; a stamped file whose schema is foreign
 //! or incomplete, an unversioned database with user tables (a slice-0
@@ -61,8 +61,11 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// admission (`docs/remote-executor.md` §2.2, #379);
 /// `18` adds the `outbox_holds` record (#516) — why each held pending
 /// intent was not attempted in the pass that last recorded it.
+/// `19` adds the `artifact_handoffs.verification_placement` column —
+/// the verification placement and bound executor pinned when the
+/// handoff row is created (#506).
 /// Older files upgrade additively at open.
-pub(crate) const FORMAT_VERSION: i64 = 18;
+pub(crate) const FORMAT_VERSION: i64 = 19;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -373,9 +376,10 @@ impl SqliteStore {
             // and a v8 file everything except the v9 addition, a
             // v9–v13 file everything except the v13 and v14
             // additions, a v14 file everything except v15's
-            // collection table, and a v15–v17 file everything except
+            // collection table, a v15–v17 file everything except
             // v18's hold table (v16 and v17 each add a column, not a
-            // table). A
+            // table), and a v18 file everything (v19 adds a column,
+            // not a table). A
             // foreign or
             // truncated stamped file fails this check untouched, and
             // the accepted difference is a previous release's store: it
@@ -477,7 +481,7 @@ impl SqliteStore {
                     .iter()
                     .filter(|t| !V14_ADDED_TABLES.contains(t) && !V17_ADDED_TABLES.contains(t))
                     .all(|t| present.contains(*t))
-            } else {
+            } else if version < 18 {
                 // A v15–v17 file holds every table except the v18
                 // hold record (v16 and v17 each add a column, not a
                 // table).
@@ -485,6 +489,10 @@ impl SqliteStore {
                     .iter()
                     .filter(|t| !V17_ADDED_TABLES.contains(t))
                     .all(|t| present.contains(*t))
+            } else {
+                // A v18 file holds every table; v19 adds a column,
+                // not a table.
+                EXPECTED_TABLES.iter().all(|t| present.contains(*t))
             };
             if !required_complete {
                 return Err(StoreError::UnsupportedFormat {
@@ -499,8 +507,10 @@ impl SqliteStore {
             // work_usage.last_progress_basis,
             // recovery_intents.retirement_generation,
             // finding_occurrences.summary,
-            // work_usage.merge_check_services, and the pin-ledger
-            // reconstruction. A crash leaves the old stamp and the
+            // work_usage.merge_check_services,
+            // invocation_requests.placement_binding,
+            // artifact_handoffs.verification_placement, and the
+            // pin-ledger reconstruction. A crash leaves the old stamp and the
             // migration reruns idempotently (CREATE IF NOT EXISTS; each
             // column check guards a partial ALTER; the ledger insert is
             // guarded by NOT EXISTS).
@@ -617,6 +627,20 @@ impl SqliteStore {
             if !has_placement_binding {
                 tx.execute_batch(
                     "ALTER TABLE invocation_requests ADD COLUMN placement_binding TEXT",
+                )
+                .map_err(internal)?;
+            }
+            let has_handoff_verification_placement: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('artifact_handoffs') \
+                     WHERE name='verification_placement')",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(internal)?;
+            if !has_handoff_verification_placement {
+                tx.execute_batch(
+                    "ALTER TABLE artifact_handoffs ADD COLUMN verification_placement TEXT",
                 )
                 .map_err(internal)?;
             }
@@ -1269,7 +1293,7 @@ fn invocation_from_row(row: &rusqlite::Row<'_>) -> Result<Invocation, rusqlite::
 
 const HANDOFF_COLS: &str = "artifact_id, invocation_id, request_id, work_id, \
     execution_id, base, produced, manifest_digest, state, invalid_reason, \
-    attempt, recorded_seq";
+    attempt, verification_placement, recorded_seq";
 
 fn handoff_from_row(row: &rusqlite::Row<'_>) -> Result<ArtifactHandoff, rusqlite::Error> {
     Ok(ArtifactHandoff {
@@ -1284,7 +1308,8 @@ fn handoff_from_row(row: &rusqlite::Row<'_>) -> Result<ArtifactHandoff, rusqlite
         state: untag(&row.get::<_, String>(8)?)?,
         invalid_reason: row.get(9)?,
         attempt: row.get::<_, u32>(10)?,
-        recorded_seq: row.get(11)?,
+        verification_placement: opt_de_row(row.get::<_, Option<String>>(11)?)?,
+        recorded_seq: row.get(12)?,
     })
 }
 
@@ -1954,6 +1979,19 @@ impl ReadView for Tx<'_> {
              payload, adapter_binding, placement_binding FROM invocation_requests \
              WHERE consumed=0 ORDER BY rowid",
             [],
+            request_from_row,
+        )
+    }
+
+    fn requests_for_execution(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<Vec<InvocationRequest>, StoreError> {
+        self.query_all(
+            "SELECT request_id, work_id, execution_id, role, spec_revision, \
+             payload, adapter_binding, placement_binding FROM invocation_requests \
+             WHERE execution_id=?1 ORDER BY rowid",
+            params![execution_id.0],
             request_from_row,
         )
     }
@@ -4450,11 +4488,12 @@ impl TxView for Tx<'_> {
                     "INSERT INTO artifact_handoffs (artifact_id, invocation_id, \
                      request_id, work_id, execution_id, base, produced, \
                      manifest_digest, state, invalid_reason, attempt, \
-                     recorded_seq) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) \
+                     verification_placement, recorded_seq) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) \
                      ON CONFLICT(artifact_id) DO UPDATE SET base=?6, produced=?7, \
                      manifest_digest=?8, state=?9, invalid_reason=?10, \
-                     attempt=?11, recorded_seq=?12 \
-                     WHERE artifact_handoffs.recorded_seq=?13",
+                     attempt=?11, verification_placement=?12, recorded_seq=?13 \
+                     WHERE artifact_handoffs.recorded_seq=?14",
                     params![
                         handoff.artifact_id,
                         handoff.invocation_id.0,
@@ -4467,6 +4506,12 @@ impl TxView for Tx<'_> {
                         tag(&handoff.state),
                         handoff.invalid_reason,
                         handoff.attempt,
+                        handoff
+                            .verification_placement
+                            .as_ref()
+                            .map(serde_json::to_string)
+                            .transpose()
+                            .map_err(|e| internal(Box::new(e)))?,
                         handoff.recorded_seq,
                         expected_seq,
                     ],

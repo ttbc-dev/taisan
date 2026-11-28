@@ -1,6 +1,6 @@
--- workloop v18 store: current-state tables enforcing structural
+-- workloop v19 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
--- `PRAGMA user_version = 18` marks the format; a stamped older file with
+-- `PRAGMA user_version = 19` marks the format; a stamped older file with
 -- the complete recognized schema upgrades additively at open, while an
 -- unversioned slice-0 database and a newer version are refused.
 -- v7 added work_usage.last_progress_basis; v8 added the intake run and
@@ -18,7 +18,9 @@
 -- the invocation_requests.placement_binding column recording the
 -- per-request executor placement bound at admission (#379); v18 added
 -- the outbox_holds record (#516): why each held pending intent was not
--- attempted in the pass that last recorded it.
+-- attempted in the pass that last recorded it; v19 added the
+-- artifact_handoffs.verification_placement column pinning the separate
+-- verification placement and bound executor at handoff creation (#506).
 
 CREATE TABLE IF NOT EXISTS store_meta (
     key TEXT PRIMARY KEY,
@@ -303,6 +305,10 @@ CREATE TABLE IF NOT EXISTS artifact_handoffs (
     state TEXT NOT NULL,
     invalid_reason TEXT,
     attempt INTEGER NOT NULL,
+    -- The verification placement pinned when the row was created:
+    -- target plus bound executor, JSON-encoded. Null on a row written
+    -- before the pin existed; the first verification pass backfills it.
+    verification_placement TEXT,
     recorded_seq INTEGER NOT NULL
 );
 

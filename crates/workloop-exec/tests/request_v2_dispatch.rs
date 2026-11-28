@@ -549,6 +549,7 @@ fn done_writer_with_handoff(
                     state: HandoffState::Acknowledged,
                     invalid_reason: None,
                     attempt: 0,
+                    verification_placement: None,
                     recorded_seq: seq,
                 },
                 expected_seq: 0,
@@ -4777,6 +4778,7 @@ fn an_interrupted_v2_handoff_resumes_from_its_durable_stage() {
         state: HandoffState::ExportStarted,
         invalid_reason: None,
         attempt: 0,
+        verification_placement: None,
         recorded_seq: 0,
     };
     store
@@ -7440,6 +7442,7 @@ fn a_recovery_detected_refusal_charges_no_attempt() {
                     state: HandoffState::Acknowledged,
                     invalid_reason: None,
                     attempt: 0,
+                    verification_placement: None,
                     recorded_seq: seq,
                 },
                 expected_seq: 0,

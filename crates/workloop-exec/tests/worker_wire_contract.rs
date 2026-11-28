@@ -593,6 +593,7 @@ fn done_writer_with_handoff(
                     state: HandoffState::Acknowledged,
                     invalid_reason: None,
                     attempt: 0,
+                    verification_placement: None,
                     recorded_seq: seq,
                 },
                 expected_seq: 0,

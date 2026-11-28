@@ -104,7 +104,7 @@ coordinator-side.
 | Axis | Selected by | Binding rule |
 | --- | --- | --- |
 | **Worker implementation** | `worker_argv` plus the `describe` declaration, as today | First binding wins per request; a running Invocation never migrates adapters |
-| **Execution placement** | Per-role placement in configuration (`local` or the configured remote endpoint), plus a separate verification placement | Recorded on the durable request before dispatch, like the adapter binding; a configuration reload affects only requests not yet bound and never retargets a running or unproven one |
+| **Execution placement** | Per-role placement in configuration (`local` or the configured remote endpoint), plus a separate verification placement | Recorded on the durable request before dispatch, like the adapter binding; the separate verification placement and its bound executor are pinned on the durable handoff record when it is created. A configuration reload affects only requests and handoffs not yet bound and never retargets a running, unproven, or remote-pending one |
 
 The two axes are orthogonal by construction — the same rule the stage
 contract already enforces for the reviewer axis

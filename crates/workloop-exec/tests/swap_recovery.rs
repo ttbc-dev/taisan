@@ -1151,6 +1151,7 @@ fn u46c_interrupted_export_import_recovers_under_changed_config_without_duplicat
                     state: HandoffState::ExportStarted,
                     invalid_reason: None,
                     attempt: 0,
+                    verification_placement: None,
                     recorded_seq: seq,
                 },
                 expected_seq: 0,

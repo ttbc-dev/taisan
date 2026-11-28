@@ -129,7 +129,8 @@ pub struct RequestView {
     pub placement_config_digest: Option<String>,
     /// `pending` while unconsumed, `launched` once an Invocation
     /// exists for the request, `refused` once a durable
-    /// dispatch-refusal fact names it.
+    /// dispatch-refusal fact names it, and `consumed` when the row was
+    /// consumed with neither (a dispatch gate that can never launch it).
     pub liveness: String,
     /// The closed `request.*` refusal code when refused.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -548,22 +549,24 @@ pub fn work_detail(
         .map(|e| {
             let invs = tx.invocations_for_execution(&e.id).unwrap_or_default();
             let ids = invs.iter().map(|i| i.id.clone()).collect();
-            // Every durable request row for the execution, classified:
-            // still-pending rows come from the pending set, launched
-            // rows behind each Invocation, refused rows behind the
-            // dispatch-refusal facts. A refused request is consumed
-            // without an Invocation, so the refusal facts are the only
-            // index onto it.
-            let mut requests: Vec<RequestView> = pending
+            // Every durable request row for the execution, classified
+            // once: still-pending rows come from the pending set,
+            // launched rows behind each Invocation, refused rows behind
+            // the dispatch-refusal facts, and a consumed row with
+            // neither is the gate-consumed case (`mark_consumed` without
+            // a launch). Reading the request log once — never unioning
+            // the three views — keeps one row from rendering twice for
+            // one `request_id`, and the explicit consumed class keeps a
+            // gate-consumed request visible.
+            let pending_ids: std::collections::HashSet<&str> = pending
                 .iter()
                 .filter(|r| r.execution_id == e.id)
-                .map(|r| request_view(r, "pending", None, None))
+                .map(|r| r.request_id.as_str())
                 .collect();
-            for inv in &invs {
-                if let Ok(Some(r)) = tx.request(&inv.request_id) {
-                    requests.push(request_view(&r, "launched", Some(inv), None));
-                }
-            }
+            let inv_by_request: std::collections::HashMap<&str, &Invocation> =
+                invs.iter().map(|i| (i.request_id.as_str(), i)).collect();
+            let mut refusals: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             if let Ok(obs) = tx.observations_for_execution(&e.id) {
                 for fact in obs.iter().filter_map(|o| match &o.fact {
                     ObservationFact::DispatchRefused {
@@ -571,11 +574,25 @@ pub fn work_detail(
                     } => Some((request_id.clone(), code.clone())),
                     _ => None,
                 }) {
-                    if let Ok(Some(r)) = tx.request(&fact.0) {
-                        requests.push(request_view(&r, "refused", None, Some(fact.1)));
-                    }
+                    refusals.insert(fact.0, fact.1);
                 }
             }
+            let mut requests: Vec<RequestView> = tx
+                .requests_for_execution(&e.id)
+                .unwrap_or_default()
+                .iter()
+                .map(|r| {
+                    if let Some(inv) = inv_by_request.get(r.request_id.as_str()).copied() {
+                        request_view(r, "launched", Some(inv), None)
+                    } else if let Some(code) = refusals.get(r.request_id.as_str()) {
+                        request_view(r, "refused", None, Some(code.clone()))
+                    } else if pending_ids.contains(r.request_id.as_str()) {
+                        request_view(r, "pending", None, None)
+                    } else {
+                        request_view(r, "consumed", None, None)
+                    }
+                })
+                .collect();
             requests.sort_by(|a, b| a.request_id.cmp(&b.request_id));
             ExecutionView {
                 ownership: if e.state == ExecutionState::Uncertain {

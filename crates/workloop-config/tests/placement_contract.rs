@@ -194,6 +194,7 @@ fn endpoint_fields_validate() {
             serde_json::json!({ "host": "edge-1.internal/path" }),
             "bare host name",
         ),
+        (serde_json::json!({ "host": "::1" }), "bare host name"),
         (serde_json::json!({ "port": 0 }), "not a port"),
         (
             serde_json::json!({ "expected_identity_digest": "AB".repeat(32) }),

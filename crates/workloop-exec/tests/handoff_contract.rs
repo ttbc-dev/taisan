@@ -19,7 +19,7 @@ use workloop_core::work::{
     HostTemplate, WorkloopConfig, admit_queued, handle_command, handle_observation,
 };
 use workloop_exec::handoff::{self, HandoffLayout, HandoffSeed, artifact_ref};
-use workloop_exec::supervisor::{PosixProcessControl, Supervisor};
+use workloop_exec::supervisor::{ExecError, PosixProcessControl, Supervisor};
 use workloop_store::sqlite::SqliteStore;
 
 const NOW: i64 = 1_700_000_000;
@@ -98,6 +98,16 @@ fn actor() -> Actor {
 
 /// Submit+admit so `works`/`executions` rows exist for FK integrity.
 fn admit(store: &SqliteStore, key: &str) -> (WorkId, ExecutionId) {
+    admit_with_verification(store, key, vec![])
+}
+
+/// `admit` with a caller-declared spec argv — the verification commands
+/// the handoff seed reads for a v1 dispatch.
+fn admit_with_verification(
+    store: &SqliteStore,
+    key: &str,
+    verification_argv: Vec<Vec<String>>,
+) -> (WorkId, ExecutionId) {
     let req = CommandRequest {
         actor: actor(),
         origin: Origin("cli".into()),
@@ -106,7 +116,7 @@ fn admit(store: &SqliteStore, key: &str) -> (WorkId, ExecutionId) {
             intent: "produce an artifact".into(),
             sources: vec![],
             constraints: vec![],
-            verification_argv: vec![],
+            verification_argv,
         },
     };
     let d = handle_command(store, &config(), &req, NOW).unwrap();
@@ -290,6 +300,7 @@ fn seed_export_started(store: &SqliteStore, invocation: &Invocation, w: &WorkId,
                     state: HandoffState::ExportStarted,
                     invalid_reason: None,
                     attempt: 1,
+                    verification_placement: None,
                     recorded_seq: seq,
                 },
                 expected_seq: 0,
@@ -2377,14 +2388,718 @@ fn remote_placed_verification_records_the_bound_marker_without_running() {
 
     // A produced-commit change is a new evidence basis: the markers
     // re-record under the new produced value, still never running.
-    let mut s2 = s.clone();
-    s2.verification_argv = vec![vec!["true".into()]];
-    handoff::drive(&store, &layout, &aid, &s2, 3, &Ok(None), &mut || 0).unwrap();
+    std::fs::write(ws_dir.join("artifact.json"), "{\"ok\":\"rework\"}").unwrap();
+    git(&ws_dir, &["add", "."]);
+    git(&ws_dir, &["commit", "-m", "reworked"]);
+    let reworked = git(&ws_dir, &["rev-parse", "HEAD"]);
+    assert_ne!(reworked, produced);
+    let mut moved = row(&store, &aid).unwrap();
+    moved.produced = Some(reworked.clone());
+    persist(&store, &moved);
+    handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
     let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 2, "one bounded record per requirement");
     assert!(
-        results.iter().all(
-            |r| r.result == VerificationOutcome::Inconclusive && r.environment_digest == marker
-        ),
-        "no local run ever produced a terminal result"
+        results
+            .iter()
+            .all(|r| r.result == VerificationOutcome::Inconclusive
+                && r.environment_digest == marker
+                && r.produced == reworked),
+        "the markers re-record under the new produced value, never running locally"
     );
+}
+
+/// A remote placement with no bound executor is refused when the row is
+/// created: fabricating an executor identity would pin a phantom
+/// endpoint whose marker could never match a real one, so the pin fails
+/// closed instead (#506 review).
+#[test]
+fn remote_placement_without_bound_executor_refuses_to_pin() {
+    let root = tmp_root("verify-remote-no-executor");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-vremote-no-executor");
+    let (mut layout, ws_dir) = layout(&root, &w);
+    layout.verification_placement = workloop_core::placement::PlacementTarget::Remote;
+    layout.remote_verification_executor = None;
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-vremote-no-executor");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let s = seed(&invocation, &w, &base);
+
+    let err = handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0)
+        .expect_err("a remote placement without a bound executor is refused");
+    assert!(
+        matches!(err, handoff::HandoffError::PlacementConflict(_)),
+        "unexpected error: {err}"
+    );
+    assert!(
+        row(&store, &aid).is_none(),
+        "no handoff row is pinned to a fabricated executor"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The placement and bound executor are pinned on the handoff row
+/// (#506): a config reload after the row exists cannot retarget the
+/// pending remote verification to local or another executor.
+#[test]
+fn remote_placement_pin_survives_config_reload_and_executor_change() {
+    let root = tmp_root("verify-remote-pin");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-vremote-pin");
+    let (mut layout, ws_dir) = layout(&root, &w);
+    layout.verification_placement = workloop_core::placement::PlacementTarget::Remote;
+    layout.remote_verification_executor = Some("edge-1".into());
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-vremote-pin");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let mut s = seed(&invocation, &w, &base);
+    s.verification_argv = vec![vec!["true".into()]];
+
+    let h = handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    assert_eq!(h.state, HandoffState::Acknowledged);
+    assert_eq!(
+        h.verification_placement,
+        Some(VerificationPlacement {
+            target: workloop_core::placement::PlacementTarget::Remote,
+            executor: "edge-1".into(),
+        })
+    );
+    let marker = handoff::placement_bound_marker("edge-1");
+    assert_eq!(
+        store.transact(|tx| tx.verification_results(&aid)).unwrap()[0].environment_digest,
+        marker
+    );
+
+    // A reload to local must not run the argv locally or replace the
+    // pending remote evidence.
+    layout.verification_placement = workloop_core::placement::PlacementTarget::Local;
+    layout.remote_verification_executor = None;
+    let h = handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    assert_eq!(
+        h.verification_placement
+            .as_ref()
+            .map(|p| p.executor.as_str()),
+        Some("edge-1"),
+        "the durable pin is unchanged by the reload"
+    );
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].environment_digest, marker);
+    assert_eq!(results[0].result, VerificationOutcome::Inconclusive);
+
+    // A reload to a different executor must not re-record under the
+    // new executor's marker either.
+    layout.verification_placement = workloop_core::placement::PlacementTarget::Remote;
+    layout.remote_verification_executor = Some("edge-2".into());
+    handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].environment_digest, marker);
+    assert!(
+        results
+            .iter()
+            .all(|r| r.environment_digest != handoff::placement_bound_marker("edge-2")),
+        "the second executor's marker never replaces the pinned one"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A local placement pinned at handoff creation is equally durable:
+/// a later remote config cannot turn an already-bound local run into a
+/// deferred remote marker.
+#[test]
+fn local_placement_pin_does_not_follow_later_remote_config() {
+    let root = tmp_root("verify-local-pin");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-vlocal-pin");
+    let (mut layout, ws_dir) = layout(&root, &w);
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-vlocal-pin");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let mut s = seed(&invocation, &w, &base);
+    s.verification_argv = vec![vec!["true".into()]];
+
+    let h = handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    assert_eq!(
+        h.verification_placement,
+        Some(VerificationPlacement {
+            target: workloop_core::placement::PlacementTarget::Local,
+            executor: "local".into(),
+        })
+    );
+    assert_eq!(
+        store.transact(|tx| tx.verification_results(&aid)).unwrap()[0].result,
+        VerificationOutcome::Pass
+    );
+
+    layout.verification_placement = workloop_core::placement::PlacementTarget::Remote;
+    layout.remote_verification_executor = Some("edge-2".into());
+    handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].result, VerificationOutcome::Pass);
+    assert!(
+        !handoff::is_placement_bound_marker(&results[0].environment_digest),
+        "a pinned local run never becomes a remote-pending marker"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A pre-pin row that already carries a local terminal result keeps it:
+/// enabling remote verification on upgrade must not replace valid local
+/// Pass/Fail evidence with a remote-pending marker (#506 follow-up).
+#[test]
+fn legacy_local_terminal_result_survives_remote_placement_binding() {
+    let root = tmp_root("verify-legacy-local-terminal");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-vlegacy-local-terminal");
+    let (mut layout, ws_dir) = layout(&root, &w);
+    let (base, produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-vlegacy-local-terminal");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let mut s = seed(&invocation, &w, &base);
+    s.verification_argv = vec![vec!["true".into()]];
+
+    // Local verification records terminal evidence while the row has
+    // not yet been pinned.
+    let h = handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    assert_eq!(h.state, HandoffState::Acknowledged);
+    let mut legacy = row(&store, &aid).unwrap();
+    legacy.verification_placement = None;
+    persist(&store, &legacy);
+    let recorded = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].result, VerificationOutcome::Pass);
+    let local_digest = recorded[0].environment_digest.clone();
+
+    // Upgrade + enable remote verification: the pin binds remote but the
+    // existing local Pass is preserved, never overwritten by a marker.
+    layout.verification_placement = workloop_core::placement::PlacementTarget::Remote;
+    layout.remote_verification_executor = Some("edge-1".into());
+    let h = handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    assert_eq!(
+        h.verification_placement.as_ref().map(|p| p.target),
+        Some(workloop_core::placement::PlacementTarget::Remote)
+    );
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].result, VerificationOutcome::Pass);
+    assert_eq!(results[0].environment_digest, local_digest);
+    assert_eq!(results[0].produced, produced);
+    assert!(
+        !handoff::is_placement_bound_marker(&results[0].environment_digest),
+        "valid local evidence never becomes a remote-pending marker"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A pre-pin row that already carries remote-pending evidence refuses
+/// a changed placement instead of reinterpreting those markers under a
+/// new executor or silently running local. The same placement may
+/// still be re-bound.
+#[test]
+fn legacy_remote_pending_row_refuses_a_changed_placement() {
+    let root = tmp_root("verify-legacy-pin");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-vlegacy-pin");
+    let (mut layout, ws_dir) = layout(&root, &w);
+    layout.verification_placement = workloop_core::placement::PlacementTarget::Remote;
+    layout.remote_verification_executor = Some("edge-1".into());
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-vlegacy-pin");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let mut s = seed(&invocation, &w, &base);
+    s.verification_argv = vec![vec!["true".into()]];
+
+    handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    let marker = handoff::placement_bound_marker("edge-1");
+
+    // Simulate a row written before the pin existed.
+    let mut legacy = row(&store, &aid).unwrap();
+    legacy.verification_placement = None;
+    persist(&store, &legacy);
+
+    // The same placement re-binds the pin without recording anything.
+    handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    let rebound = row(&store, &aid).unwrap();
+    assert_eq!(
+        rebound
+            .verification_placement
+            .as_ref()
+            .map(|p| p.executor.as_str()),
+        Some("edge-1")
+    );
+
+    // A changed placement refuses before any local run.
+    let mut changed = rebound;
+    changed.verification_placement = None;
+    persist(&store, &changed);
+    layout.verification_placement = workloop_core::placement::PlacementTarget::Local;
+    layout.remote_verification_executor = None;
+    let err = handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0)
+        .expect_err("a changed placement over remote-pending evidence is refused");
+    match err {
+        handoff::HandoffError::PlacementConflict(detail) => {
+            assert!(
+                detail.contains("verification placement changed"),
+                "{detail}"
+            );
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    // The permanent conflict is never swallowed as a retryable
+    // transport hiccup by the sweep: it surfaces as an infrastructure
+    // fault an operator can see.
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].environment_digest, marker);
+    assert!(
+        results
+            .iter()
+            .all(|r| r.result == VerificationOutcome::Inconclusive),
+        "no local result was recorded"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Binding a pre-pin row writes with the same compare-and-set as
+/// `advance`: losing that write to a concurrent supervisor is retryable,
+/// so `drive` returns the row and the next sweep re-reads, binds the pin
+/// once, and records the verification (#506 follow-up review).
+#[test]
+fn a_conflict_binding_the_pre_pin_row_is_retryable() {
+    use std::cell::Cell;
+    use workloop_core::store::TxView;
+
+    struct ConflictOnNth<'a> {
+        inner: &'a SqliteStore,
+        calls: Cell<usize>,
+        fail_at: usize,
+    }
+    impl Store for ConflictOnNth<'_> {
+        fn transact<R>(
+            &self,
+            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+        ) -> Result<R, StoreError> {
+            let call = self.calls.get() + 1;
+            self.calls.set(call);
+            if call == self.fail_at {
+                return Err(StoreError::ConstraintConflict {
+                    detail: "racing pin write".into(),
+                });
+            }
+            self.inner.transact(f)
+        }
+    }
+
+    let root = tmp_root("verify-pin-conflict");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-pin-conflict");
+    let (layout, ws_dir) = layout(&root, &w);
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-pin-conflict");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+
+    // Acknowledge with no declared argv, then rewind the row so it is
+    // exactly the pre-pin shape: no placement and no verification.
+    handoff::drive(
+        &store,
+        &layout,
+        &aid,
+        &seed(&invocation, &w, &base),
+        3,
+        &Ok(None),
+        &mut || 0,
+    )
+    .unwrap();
+    let mut legacy = row(&store, &aid).unwrap();
+    legacy.verification_placement = None;
+    persist(&store, &legacy);
+
+    // The next drive reads the row (1), reads its results (2), then
+    // loses the pin's compare-and-set (3).
+    let conflicting = ConflictOnNth {
+        inner: &store,
+        calls: Cell::new(0),
+        fail_at: 3,
+    };
+    let mut s = seed(&invocation, &w, &base);
+    s.verification_argv = vec![vec!["true".into()]];
+    let returned = handoff::drive(&conflicting, &layout, &aid, &s, 3, &Ok(None), &mut || 0)
+        .expect("a lost pin compare-and-set is retryable, not a sweep abort");
+    assert!(
+        returned.verification_placement.is_some(),
+        "the retryable result carries the would-be pin"
+    );
+    assert!(
+        row(&store, &aid).unwrap().verification_placement.is_none(),
+        "the losing write never lands"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.verification_results(&aid))
+            .unwrap()
+            .is_empty(),
+        "nothing was recorded under the losing pass"
+    );
+
+    // The next sweep re-reads and binds the pin exactly once.
+    let pinned = handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    assert_eq!(
+        pinned
+            .verification_placement
+            .as_ref()
+            .map(|p| p.executor.as_str()),
+        Some("local")
+    );
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].result, VerificationOutcome::Pass);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Two supervisors backfilling the same pre-pin row must not lose an
+/// update: the transaction that pins first wins and the stale pass is a
+/// retryable conflict — it never overwrites the winner's pin with its
+/// own stale placement, and it records no local evidence. The next pass
+/// resolves the durable pin, not the live layout (#506 follow-up
+/// review).
+#[test]
+fn a_concurrent_pin_backfill_is_not_overwritten() {
+    use std::cell::Cell;
+    use workloop_core::store::TxView;
+
+    struct PinOnNth<'a> {
+        inner: &'a SqliteStore,
+        artifact_id: String,
+        winner: VerificationPlacement,
+        calls: Cell<usize>,
+        pin_at: usize,
+    }
+    impl Store for PinOnNth<'_> {
+        fn transact<R>(
+            &self,
+            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+        ) -> Result<R, StoreError> {
+            let call = self.calls.get() + 1;
+            self.calls.set(call);
+            if call == self.pin_at {
+                // A racing supervisor pins the row between this pass's
+                // read and its backfill.
+                self.inner.transact(|tx| {
+                    let mut row = tx
+                        .artifact_handoff(&self.artifact_id)?
+                        .expect("the legacy row exists");
+                    let expected_seq = row.recorded_seq;
+                    row.verification_placement = Some(self.winner.clone());
+                    tx.apply(&Effect::UpsertHandoff {
+                        handoff: row,
+                        expected_seq,
+                    })
+                })?;
+            }
+            self.inner.transact(f)
+        }
+    }
+
+    let root = tmp_root("verify-pin-lost-update");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-pin-lost-update");
+    let (layout, ws_dir) = layout(&root, &w);
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-pin-lost-update");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+
+    // Acknowledge with no declared argv, then rewind the row so it is
+    // exactly the pre-pin shape: no placement and no verification.
+    handoff::drive(
+        &store,
+        &layout,
+        &aid,
+        &seed(&invocation, &w, &base),
+        3,
+        &Ok(None),
+        &mut || 0,
+    )
+    .unwrap();
+    let mut legacy = row(&store, &aid).unwrap();
+    legacy.verification_placement = None;
+    persist(&store, &legacy);
+
+    let winner = VerificationPlacement {
+        target: workloop_core::placement::PlacementTarget::Remote,
+        executor: "edge-1".into(),
+    };
+    // Reads the row (1), reads its results (2), then pins concurrently
+    // before the losing backfill (3).
+    let racing = PinOnNth {
+        inner: &store,
+        artifact_id: aid.clone(),
+        winner: winner.clone(),
+        calls: Cell::new(0),
+        pin_at: 3,
+    };
+    let mut s = seed(&invocation, &w, &base);
+    s.verification_argv = vec![vec!["true".into()]];
+    let returned = handoff::drive(&racing, &layout, &aid, &s, 3, &Ok(None), &mut || 0)
+        .expect("a lost pin backfill is retryable, not a sweep abort");
+    assert_eq!(
+        returned
+            .verification_placement
+            .as_ref()
+            .map(|p| p.executor.as_str()),
+        Some("local"),
+        "the losing pass carries its would-be pin"
+    );
+    assert_eq!(
+        row(&store, &aid).unwrap().verification_placement,
+        Some(winner.clone()),
+        "the first pin is never overwritten by the stale pass"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.verification_results(&aid))
+            .unwrap()
+            .is_empty(),
+        "the losing pass records no local evidence"
+    );
+
+    // The next pass resolves the durable remote pin even though the
+    // live layout is local: it records the remote-pending marker, never
+    // a local result.
+    handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].result, VerificationOutcome::Inconclusive);
+    assert_eq!(
+        results[0].environment_digest,
+        handoff::placement_bound_marker("edge-1")
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Backfilling the pin on a legacy row must not advance its
+/// `recorded_seq`: that sequence is the recency order
+/// `latest_acknowledged_handoff` uses to pick a Work's predecessor
+/// artifact, so a pin write that allocated a new seq would promote an
+/// older produced commit above a newer one (#506 follow-up review).
+#[test]
+fn binding_a_pre_pin_row_preserves_its_recorded_seq() {
+    let root = tmp_root("verify-pin-recorded-seq");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-pin-recorded-seq");
+    let (layout, ws_dir) = layout(&root, &w);
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-pin-recorded-seq");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+
+    // Acknowledge with no declared argv, then rewind the row to the
+    // pre-pin shape while keeping the seq it was acknowledged at.
+    handoff::drive(
+        &store,
+        &layout,
+        &aid,
+        &seed(&invocation, &w, &base),
+        3,
+        &Ok(None),
+        &mut || 0,
+    )
+    .unwrap();
+    let mut legacy = row(&store, &aid).unwrap();
+    legacy.verification_placement = None;
+    persist(&store, &legacy);
+    let legacy_seq = row(&store, &aid).unwrap().recorded_seq;
+
+    // A newer acknowledged artifact of the same Work, ordered after the
+    // legacy row — the predecessor a follow-on role must keep binding.
+    let newer_aid = format!("{}/later", invocation.id.0);
+    let newer_seq = store
+        .transact(|tx| {
+            let seq = tx.alloc_seq()?;
+            tx.apply(&Effect::UpsertHandoff {
+                handoff: ArtifactHandoff {
+                    artifact_id: newer_aid.clone(),
+                    invocation_id: invocation.id.clone(),
+                    request_id: invocation.request_id.clone(),
+                    work_id: w.clone(),
+                    execution_id: e.clone(),
+                    base: base.clone(),
+                    produced: Some("cd".repeat(20)),
+                    manifest_digest: Some("ef".repeat(32)),
+                    state: HandoffState::Acknowledged,
+                    invalid_reason: None,
+                    attempt: 0,
+                    verification_placement: Some(VerificationPlacement {
+                        target: workloop_core::placement::PlacementTarget::Local,
+                        executor: "local".into(),
+                    }),
+                    recorded_seq: seq,
+                },
+                expected_seq: 0,
+            })?;
+            Ok(seq)
+        })
+        .unwrap();
+    assert!(newer_seq > legacy_seq);
+
+    let mut s = seed(&invocation, &w, &base);
+    s.verification_argv = vec![vec!["true".into()]];
+    handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+
+    let rebound = row(&store, &aid).unwrap();
+    assert!(
+        rebound.verification_placement.is_some(),
+        "the legacy row is bound by the pass"
+    );
+    assert_eq!(
+        rebound.recorded_seq, legacy_seq,
+        "backfilling the pin never re-orders the older artifact"
+    );
+    assert!(
+        row(&store, &newer_aid).unwrap().recorded_seq > rebound.recorded_seq,
+        "the newer produced artifact stays the Work's predecessor"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// One artifact whose legacy row disagrees with its recorded
+/// remote-pending markers must not starve every later seed: the pass
+/// drives the remaining artifacts, then surfaces the permanent conflict
+/// as a fault (#506 follow-up review).
+#[test]
+fn a_placement_conflict_does_not_starve_later_handoffs() {
+    let root = tmp_root("placement-conflict-isolation");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit_with_verification(&store, "h-conflict-isolation", vec![vec![]]);
+    let ws_root = root.join("ws");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    let ws_dir = ws_root.join(format!("ws-{}", w.0));
+    let (base, produced) = git_workspace(&ws_dir, &w);
+    let layout = HandoffLayout {
+        repository: bare_repo(&root),
+        workspace_root: ws_root.clone(),
+        out_root: root.join("out"),
+        state_root: None,
+        verification: None,
+        verification_placement: workloop_core::placement::PlacementTarget::Remote,
+        remote_verification_executor: Some("edge-1".into()),
+    };
+    let sup = Supervisor::new(PosixProcessControl, ws_root.clone(), vec![], config())
+        .with_handoff(layout);
+
+    let mut invocation = done_invocation(&e, "inv-conflict-isolation");
+    invocation.required_artifacts.push(RequiredArtifact {
+        kind: "patch2".into(),
+        path: "artifact.json".into(),
+        expected_digest: None,
+    });
+    insert_invocation(&store, &invocation);
+
+    let conflicting_aid = format!("{}/patch", invocation.id.0);
+    let later_aid = format!("{}/patch2", invocation.id.0);
+    store
+        .transact(|tx| {
+            // A pre-pin row already carrying a marker for a *different*
+            // executor: reinterpreting it under edge-1 is refused.
+            let seq = tx.alloc_seq()?;
+            tx.apply(&Effect::UpsertHandoff {
+                handoff: ArtifactHandoff {
+                    artifact_id: conflicting_aid.clone(),
+                    invocation_id: invocation.id.clone(),
+                    request_id: invocation.request_id.clone(),
+                    work_id: w.clone(),
+                    execution_id: e.clone(),
+                    base: base.clone(),
+                    produced: Some(produced.clone()),
+                    manifest_digest: Some("ab".repeat(32)),
+                    state: HandoffState::Acknowledged,
+                    invalid_reason: None,
+                    attempt: 0,
+                    verification_placement: None,
+                    recorded_seq: seq,
+                },
+                expected_seq: 0,
+            })?;
+            let seq = tx.alloc_seq()?;
+            tx.apply(&Effect::InsertVerificationResult {
+                result: VerificationResult {
+                    id: "vr-legacy".into(),
+                    artifact_id: conflicting_aid.clone(),
+                    requirement: "verification_argv[0]".into(),
+                    argv: vec![String::new()],
+                    produced: produced.clone(),
+                    environment_digest: handoff::placement_bound_marker("edge-2"),
+                    result: VerificationOutcome::Inconclusive,
+                    output: "deferred to edge-2".into(),
+                    recorded_seq: seq,
+                },
+            })?;
+            // A second, healthy pre-pin artifact in the same pass.
+            let seq = tx.alloc_seq()?;
+            tx.apply(&Effect::UpsertHandoff {
+                handoff: ArtifactHandoff {
+                    artifact_id: later_aid.clone(),
+                    invocation_id: invocation.id.clone(),
+                    request_id: invocation.request_id.clone(),
+                    work_id: w.clone(),
+                    execution_id: e.clone(),
+                    base: base.clone(),
+                    produced: None,
+                    manifest_digest: None,
+                    state: HandoffState::Acknowledged,
+                    invalid_reason: None,
+                    attempt: 0,
+                    verification_placement: None,
+                    recorded_seq: seq,
+                },
+                expected_seq: 0,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+
+    let err = sup
+        .drive_handoffs_scoped(&store, None, &mut || NOW, None)
+        .expect_err("the permanent conflict still surfaces");
+    match err {
+        ExecError::Fault(detail) => assert!(
+            detail.contains("verification placement changed"),
+            "{detail}"
+        ),
+        other => panic!("unexpected error: {other}"),
+    }
+
+    // The later seed was driven in the same pass: its pre-pin row is
+    // bound without waiting for the conflicting artifact to heal.
+    let later = row(&store, &later_aid).unwrap();
+    assert_eq!(
+        later.verification_placement,
+        Some(VerificationPlacement {
+            target: workloop_core::placement::PlacementTarget::Remote,
+            executor: "edge-1".into(),
+        })
+    );
+    let conflicting = row(&store, &conflicting_aid).unwrap();
+    assert!(
+        conflicting.verification_placement.is_none(),
+        "the conflicting row is never reinterpreted"
+    );
+    assert_eq!(
+        store
+            .transact(|tx| tx.verification_results(&conflicting_aid))
+            .unwrap()
+            .len(),
+        1,
+        "no evidence was rewritten under the changed placement"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }

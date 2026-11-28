@@ -4755,6 +4755,7 @@ fn record_verification_result(
                         state: HandoffState::Acknowledged,
                         invalid_reason: None,
                         attempt: 1,
+                        verification_placement: None,
                         recorded_seq: handoff_seq,
                     },
                     expected_seq: 0,
@@ -5923,7 +5924,7 @@ fn a_v2_store_upgrades_to_the_current_format_preserving_rows() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 18, "the upgrade lands on the current format");
+        assert_eq!(version, 19, "the upgrade lands on the current format");
     }
     // A second open must not re-migrate — the schema is already current.
     let _ = SqliteStore::open(&db, 1).unwrap();
@@ -5988,7 +5989,7 @@ fn a_v9_store_gains_the_retirement_generation_column() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 18, "the upgrade lands on the current format");
+        assert_eq!(version, 19, "the upgrade lands on the current format");
     }
     drop(store);
     // Re-opening after the upgrade is a no-op, not a second migration.
@@ -6040,7 +6041,7 @@ fn a_v12_store_gains_the_observation_execution_index() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 18, "the upgrade lands on the current format");
+        assert_eq!(version, 19, "the upgrade lands on the current format");
     }
     drop(store);
     // Re-opening after the upgrade is a no-op, not a second migration.
@@ -6048,11 +6049,13 @@ fn a_v12_store_gains_the_observation_execution_index() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Regression (#379): a v16 store's `invocation_requests` lacks the
-/// v17 `placement_binding` column; opening it adds the column inside
-/// the idempotent upgrade transaction, request rows survive and read
-/// back as pre-placement rows (`placement: None` — their executor is
-/// the coordinator host's local one).
+/// Regression (#379, #506): a v16 store lacks both the v17
+/// `invocation_requests.placement_binding` and the v19
+/// `artifact_handoffs.verification_placement` columns; opening it adds
+/// both inside the idempotent upgrade transaction, request rows survive
+/// and read back as pre-placement rows (`placement: None` — their
+/// executor is the coordinator host's local one), and handoff rows read
+/// back with no pin.
 #[test]
 fn a_v16_store_gains_the_placement_binding_column() {
     let root = temp_root("upgrade-v16");
@@ -6081,15 +6084,16 @@ fn a_v16_store_gains_the_placement_binding_column() {
             .unwrap();
         format!("{}:inv:0", execution_id.0)
     };
-    // Reshape into a faithful v16 file: the column absent, stamp 16.
+    // Reshape into a faithful v16 file: both later columns absent, stamp 16.
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(
             "ALTER TABLE invocation_requests DROP COLUMN placement_binding; \
+             ALTER TABLE artifact_handoffs DROP COLUMN verification_placement; \
              PRAGMA user_version=16;",
         )
         .unwrap();
-        let has: bool = conn
+        let has_placement_binding: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('invocation_requests') \
                  WHERE name='placement_binding')",
@@ -6097,7 +6101,18 @@ fn a_v16_store_gains_the_placement_binding_column() {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(!has, "the reshaped file is a real v16 table");
+        let has_verification_placement: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('artifact_handoffs') \
+                 WHERE name='verification_placement')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !has_placement_binding && !has_verification_placement,
+            "the reshaped file is a real v16 table"
+        );
     }
     let store = SqliteStore::open(&db, 1).expect("a v16 store upgrades in place");
     {
@@ -6111,10 +6126,22 @@ fn a_v16_store_gains_the_placement_binding_column() {
             )
             .unwrap();
         assert!(has, "the v16->v17 migration adds placement_binding");
+        let has_handoff_pin: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('artifact_handoffs') \
+                 WHERE name='verification_placement')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            has_handoff_pin,
+            "the v16->v19 path also adds handoff verification_placement"
+        );
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 18, "the upgrade lands on the current format");
+        assert_eq!(version, 19, "the upgrade lands on the current format");
     }
     // The pre-placement request row reads back unbound — its executor
     // is the coordinator host's local one, never a retarget.
@@ -6126,6 +6153,56 @@ fn a_v16_store_gains_the_placement_binding_column() {
     drop(store);
     // Re-opening after the upgrade is a no-op, not a second migration.
     let _ = SqliteStore::open(&db, 1).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Regression (#506): a v17 store's `artifact_handoffs` lacks the
+/// v19 `verification_placement` column; opening it adds the column
+/// inside the idempotent upgrade transaction. A pre-pin handoff row
+/// reads back with no placement, ready for the first verification
+/// pass to bind it.
+#[test]
+fn a_v17_store_gains_the_handoff_verification_placement_column() {
+    let root = temp_root("upgrade-v17-handoff");
+    let db = root.join("store.db");
+    {
+        let store = SqliteStore::open(&db, 1).unwrap();
+        drop(store);
+    }
+    // Reshape into a faithful v17 file: the column absent, stamp 17.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE artifact_handoffs DROP COLUMN verification_placement; \
+             PRAGMA user_version=17;",
+        )
+        .unwrap();
+        let has: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('artifact_handoffs') \
+                 WHERE name='verification_placement')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!has, "the reshaped file is a real v17 table");
+    }
+    let _store = SqliteStore::open(&db, 1).expect("a v17 store upgrades in place");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let has: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('artifact_handoffs') \
+             WHERE name='verification_placement')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(has, "the v17->v19 migration adds verification_placement");
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 19, "the upgrade lands on the current format");
+    drop(conn);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -6741,6 +6818,7 @@ fn the_push_intent_names_the_acknowledged_produced_commit() {
                     state: HandoffState::Acknowledged,
                     invalid_reason: None,
                     attempt: 0,
+                    verification_placement: None,
                     recorded_seq: 0,
                 },
                 expected_seq: 0,
@@ -6833,6 +6911,7 @@ fn publication_waits_for_the_acknowledged_produced_commit() {
             state,
             invalid_reason: None,
             attempt: 0,
+            verification_placement: None,
             recorded_seq: 0,
         },
         expected_seq: 0,
@@ -8193,7 +8272,7 @@ fn a_previous_release_v1_store_is_upgraded_in_place() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 18, "the upgrade lands on the current format");
+        assert_eq!(version, 19, "the upgrade lands on the current format");
     }
     // Re-opening after the upgrade is a no-op, not a second migration.
     drop(store);
