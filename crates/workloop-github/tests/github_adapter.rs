@@ -488,6 +488,108 @@ fn waiting_with_applied_publish(store: &SqliteStore, key: &str) -> (WorkId, Exec
     (work_id, eid)
 }
 
+/// The shared setup for #514's bounded re-drive tests: an admitted
+/// Execution parked in `Waiting/HostWrite` whose `maybe_publish` gates
+/// already pass — a Done producing Invocation with its artifact (no
+/// handoff rows, so the digest token is the produced revision), the
+/// invariant lane's own Done check on a proven exit 0, and the
+/// capability grant the re-issue mint requires — so a failed stage-2
+/// effect can take the transport-bounded retry path end to end.
+fn waiting_for_publish(store: &SqliteStore, key: &str) -> (WorkId, ExecutionId) {
+    let (work_id, eid) = submit(store, key);
+    store
+        .transact(|tx| admit_queued(tx, &config(), &eid, NOW).map(|_| ()))
+        .unwrap();
+    store
+        .transact(|tx| {
+            let request = tx
+                .pending_requests()?
+                .into_iter()
+                .find(|request| request.execution_id == eid)
+                .expect("admitted coding request");
+            tx.apply(&Effect::MarkRequestConsumed {
+                request_id: request.request_id.clone(),
+            })?;
+            let coding = InvocationId(format!("{}-coding", eid.0));
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: coding.clone(),
+                    request_id: request.request_id,
+                    execution_id: eid.clone(),
+                    role: InvocationRole::Coding,
+                    state: InvocationState::Done,
+                    process_identity: None,
+                    required_artifacts: vec![artifact("artifact.json")],
+                    evidence_refs: vec![],
+                    descendants: vec![],
+                },
+            })?;
+            let check = InvocationId(format!("{}-invariant-check", eid.0));
+            tx.apply(&Effect::InsertInvocation {
+                invocation: Invocation {
+                    id: check.clone(),
+                    request_id: format!("{}:inv:check", eid.0),
+                    execution_id: eid.clone(),
+                    role: InvocationRole::InvariantCheck,
+                    state: InvocationState::Done,
+                    process_identity: None,
+                    required_artifacts: vec![],
+                    evidence_refs: vec![],
+                    descendants: vec![],
+                },
+            })?;
+            for fact in [
+                ObservationFact::Artifact {
+                    invocation_id: coding,
+                    required_artifact: "artifact.json".into(),
+                    state: ArtifactFact::Present {
+                        digest: "artifact-digest".into(),
+                    },
+                },
+                ObservationFact::ProcessState {
+                    invocation_id: check,
+                    process_identity: String::new(),
+                    state: ProcessStateFact::Exited,
+                    exit_code: Some(0),
+                },
+                ObservationFact::CapabilityReport {
+                    host: host(),
+                    capabilities: vec![
+                        CapabilityEntry {
+                            capability: HostCapability::PushRef,
+                            support: CapabilityState::Supported,
+                            authorization: CapabilityState::Authorized,
+                        },
+                        CapabilityEntry {
+                            capability: HostCapability::ChangeRequestCreate,
+                            support: CapabilityState::Supported,
+                            authorization: CapabilityState::Authorized,
+                        },
+                    ],
+                },
+            ] {
+                tx.apply(&Effect::InsertObservation {
+                    observation: Observation {
+                        delivery: None,
+                        subject_work_id: Some(work_id.clone()),
+                        subject_execution_id: Some(eid.clone()),
+                        fact,
+                        observed_unix_seconds: NOW,
+                    },
+                })?;
+            }
+            let mut execution = tx.execution(&eid)?.unwrap();
+            execution.state = ExecutionState::Waiting;
+            execution.waiting_reason = Some(WaitingReason::HostWrite);
+            tx.apply(&Effect::UpdateExecution {
+                execution,
+                expected_state: ExecutionState::Ready,
+            })
+        })
+        .unwrap();
+    (work_id, eid)
+}
+
 /// One generic port test: the fixture and the real adapter answer the
 /// same two calls — inbound `ingest`, outbound `apply_outbox` — with
 /// the same receipts, so the contract tests exercise one port.
@@ -881,6 +983,239 @@ fn unknown_result_stays_outstanding_until_reconciled_by_action_id() {
             .transact(|tx| outstanding_actions(tx, &work_id))
             .unwrap()
             .is_empty()
+    );
+}
+
+/// #514: an `unknown` open reconciles on the intent's own payload, not
+/// the recorded revision — a create that landed and then watched the
+/// pull's head follow the source branch past the recorded push is
+/// adopted with its current head, never left outstanding forever.
+#[test]
+fn unknown_open_reconciles_a_landed_create_whose_head_moved() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, _eid) = waiting_for_publish(&store, "redrive-adopt");
+    let branch = format!("work/{}", work_id.0);
+    insert_intent(
+        &store,
+        &work_id,
+        HostAction::PushRef {
+            branch: branch.clone(),
+            produced: rev("artifact-digest"),
+            expected_prior: None,
+        },
+    );
+    let open_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::OpenChangeRequest {
+            source_branch: branch.clone(),
+            target_branch: "main".into(),
+            title: "t".into(),
+            body: "b".into(),
+        },
+    );
+    // The push lands; the create's response dies after it landed.
+    adapter.client_mut().lose_response("open_pull");
+    adapter.apply_outbox(&store, &config, NOW).unwrap();
+    assert!(matches!(
+        intent_status(&store, &open_id),
+        HostActionStatus::Unknown { .. }
+    ));
+    // The pull's head followed the source branch past the recorded
+    // push: a revision-bound read never finds this effect again.
+    adapter
+        .client_mut()
+        .set_pull_head(&repo(), "pr-1", "moved-head");
+
+    let report = adapter
+        .reconcile_outbox_bounded(&store, &config, &mut || NOW + 10, None, None, 10)
+        .unwrap();
+    assert_eq!(report.applied, 1, "{report:?}");
+    assert_eq!(intent_status(&store, &open_id), HostActionStatus::Applied);
+    // The adopted effect carries the pull's CURRENT head — the observed
+    // position, never the recorded one.
+    match &intent_status_effects(&store, &open_id)[..] {
+        [NormalizedEffectFact::ChangeOpened { head, change, .. }] => {
+            assert_eq!(head.object, "moved-head");
+            assert_eq!(change.change_request.as_str(), "pr-1");
+        }
+        other => panic!("reconciled receipt missing ChangeOpened: {other:?}"),
+    }
+}
+
+/// #514: an `unknown` open with genuinely no landed create settles
+/// `failed` and takes the existing transport-bounded retry path — the
+/// due recovery intent re-mints the stage-2 write through
+/// `maybe_publish`, and the next drain lands it. The bound is the
+/// Work's transport account, not the reconcile pass.
+#[test]
+fn unknown_open_with_no_landed_create_retries_through_the_transport_bound() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, _eid) = waiting_for_publish(&store, "redrive-retry");
+    let branch = format!("work/{}", work_id.0);
+    insert_intent(
+        &store,
+        &work_id,
+        HostAction::PushRef {
+            branch: branch.clone(),
+            produced: rev("artifact-digest"),
+            expected_prior: None,
+        },
+    );
+    let open_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::OpenChangeRequest {
+            source_branch: branch.clone(),
+            target_branch: "main".into(),
+            title: "t".into(),
+            body: "b".into(),
+        },
+    );
+    // The request died before its effect: `unknown`, nothing landed.
+    adapter.client_mut().fail_next("open_pull");
+    adapter.apply_outbox(&store, &config, NOW).unwrap();
+    assert!(matches!(
+        intent_status(&store, &open_id),
+        HostActionStatus::Unknown { .. }
+    ));
+    assert!(adapter.client().pull(&repo(), "pr-1").is_none());
+
+    // The unfiltered reconcile read finds no payload match anywhere on
+    // the branch — a definite no-effect verdict, settled `failed`.
+    adapter
+        .reconcile_outbox_bounded(&store, &config, &mut || NOW + 5, None, None, 10)
+        .unwrap();
+    assert_eq!(
+        intent_status(&store, &open_id),
+        HostActionStatus::Failed {
+            reason: "reconciled: no matching change request".into()
+        }
+    );
+    // The failed receipt charged the transport account and persisted
+    // its bounded retry in the same deciding transaction.
+    let pending_retry = store
+        .transact(|tx| tx.recovery_intents())
+        .unwrap()
+        .into_iter()
+        .filter(|i| i.kind == "retry" && i.state == RecoveryIntentState::Pending)
+        .count();
+    assert_eq!(pending_retry, 1, "the bounded retry is scheduled");
+
+    // The due retry consumes and `maybe_publish` re-mints the stage-2
+    // write — the same path a first-pass publish takes.
+    let scan = workloop_core::work::consume_due_recovery_intents(
+        &store,
+        &config,
+        &mut || NOW + 20,
+        None,
+        None,
+        10,
+    )
+    .unwrap();
+    assert_eq!(scan.consumed, 1, "{scan:?}");
+    let reissued = store
+        .transact(|tx| {
+            Ok(tx
+                .action_intents()?
+                .into_iter()
+                .find(|i| {
+                    matches!(i.action, HostAction::OpenChangeRequest { .. })
+                        && i.action_id != open_id
+                        && i.status == HostActionStatus::Pending
+                })
+                .map(|i| i.action_id))
+        })
+        .unwrap()
+        .expect("the retry re-minted the open intent");
+
+    // The re-issued intent drains normally and lands.
+    adapter.apply_outbox(&store, &config, NOW + 20).unwrap();
+    assert_eq!(intent_status(&store, &reissued), HostActionStatus::Applied);
+}
+
+/// #514's unfiltered reconcile read applies to `open_change_request`
+/// only: an `unknown` `update_change_request` still binds its recorded
+/// head — a moved head stays indeterminate, never adopted on payload
+/// alone and never written past the guard.
+#[test]
+fn unknown_update_keeps_its_recorded_head_guard() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, _eid) = waiting_for_publish(&store, "redrive-guard");
+    let branch = format!("work/{}", work_id.0);
+    adapter.client_mut().seed_branch(&repo(), &branch, "head-1");
+    let pull = adapter
+        .client_mut()
+        .open_pull(&repo(), &branch, "main", "t", "b")
+        .unwrap();
+    let change = ChangeRequestRef {
+        repository: repo(),
+        change_request: ChangeRequestId::trusted(pull.id.clone()),
+        display_number: Some(pull.display_number),
+    };
+    let update_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::UpdateChangeRequest {
+            change,
+            expected_head: rev("head-1"),
+            title: Some("edited".into()),
+            body: None,
+        },
+    );
+    adapter
+        .ingest(
+            &store,
+            &config,
+            Observation {
+                delivery: None,
+                subject_work_id: Some(work_id.clone()),
+                subject_execution_id: None,
+                fact: ObservationFact::HostActionResult {
+                    action_id: update_id.clone(),
+                    authenticated_actor: Some(publisher()),
+                    status: HostActionStatus::Unknown {
+                        reason: "response lost".into(),
+                    },
+                    effects: vec![],
+                },
+                observed_unix_seconds: NOW,
+            },
+            NOW,
+        )
+        .unwrap();
+    // The head moved since the intent was recorded — the guard's
+    // contract is unchanged (#514 touched only the open lane).
+    adapter
+        .client_mut()
+        .set_pull_head(&repo(), pull.id.as_str(), "moved-head");
+    let resolved = adapter
+        .reconcile_outstanding(&store, &config, NOW + 10)
+        .unwrap();
+    assert!(
+        !resolved.contains(&update_id),
+        "a moved head never confirms the guarded write"
+    );
+    assert!(
+        matches!(
+            intent_status(&store, &update_id),
+            HostActionStatus::Unknown { .. }
+        ),
+        "the update stays outstanding, never failed and never adopted"
+    );
+    assert!(
+        !adapter
+            .client()
+            .writes()
+            .iter()
+            .any(|w| w.starts_with("update_change")),
+        "no write landed past the guard"
     );
 }
 
@@ -1549,8 +1884,13 @@ fn fresh_read_records_a_head_that_was_observed_before() {
     );
 }
 
+/// A foreign change request on the same source branch is never
+/// adopted: its payload is not this intent's, so the unfiltered
+/// reconcile read (#514) reports a definite no-effect and the intent
+/// settles `failed` for the bounded retry path — never `applied` on
+/// somebody else's change.
 #[test]
-fn unknown_open_reconciliation_requires_the_recorded_source_revision() {
+fn unknown_open_reconciliation_rejects_a_foreign_payload() {
     let store = SqliteStore::in_memory(1).unwrap();
     let config = config();
     let mut adapter = Adapter::new(InMemoryGitHub::new());
@@ -1628,19 +1968,25 @@ fn unknown_open_reconciliation_requires_the_recorded_source_revision() {
         )
         .unwrap();
 
+    // No pull on the branch matches the intent's own payload: the
+    // foreign change at our recorded revision is not this Work's
+    // effect, and its presence does not make the read indeterminate —
+    // the definite no-effect verdict settles `failed`, whose receipt
+    // arms the bounded retry path (#514).
     let resolved = adapter
         .reconcile_outstanding(&store, &config, NOW + 10)
         .unwrap();
-    assert!(
-        !resolved.contains(&open_id),
-        "a foreign change request at another head is not this Work's effect"
+    assert_eq!(
+        resolved,
+        vec![open_id.clone()],
+        "the definite no-effect read settles the intent"
     );
-    assert!(
-        matches!(
-            intent_status(&store, &open_id),
-            HostActionStatus::Unknown { .. }
-        ),
-        "the unreconciled open stays outstanding"
+    assert_eq!(
+        intent_status(&store, &open_id),
+        HostActionStatus::Failed {
+            reason: "reconciled: no matching change request".into()
+        },
+        "a foreign payload is a definite absence, not an adoption"
     );
     assert!(
         !observations(&store, &work_id).iter().any(|o| matches!(

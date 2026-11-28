@@ -4559,6 +4559,16 @@ fn redrive_capability_waiters(
     Ok(())
 }
 
+/// Per-produced-revision bound on invariant-check re-mints: the check
+/// minted after a producing Invocation may be re-minted at most this
+/// many times. Every re-mint rides the same `waiting → ready` request
+/// path and is also charged to the Invocation budget, but the lane
+/// bound stops a wedge — evidence that stays unsatisfied or never
+/// evaluates complete after the freshest pass — long before the
+/// whole-Execution budget runs out. Exhaustion pauses the lane for an
+/// operator decision rather than minting checks forever (#515).
+const INVARIANT_RECHECK_LIMIT: usize = 2;
+
 /// Once the producing Invocation's evidence is complete — and, when
 /// the invariant lane is enabled, a completed invariant-check
 /// Invocation recorded after it — record the next stage effect intent:
@@ -4641,16 +4651,66 @@ fn maybe_publish(
     // (`waiting → ready`); the attempt is budget-bounded like every
     // other Invocation.
     if spec.payload.lanes.invariant_check {
-        let checked = satisfied_invariant_check(tx, &execution.id, &invocations[producing + 1..])?;
+        let trailing = &invocations[producing + 1..];
+        let checked = satisfied_invariant_check(tx, &execution.id, trailing)?;
         // A satisfied-but-inconclusive check is not terminal evidence
         // either: when a conclusive verification result exists that
         // the newest check's request never bound, the lane owes that
         // evidence a re-judged assessment — re-mint the check rather
-        // than park the lane on the stale verdict (#469). The mint is
-        // the same `waiting → ready` re-request `!checked` already
+        // than park the lane on the stale verdict (#469). An
+        // assessment that declares itself incomplete is the same
+        // shape (#515): the check honestly ran and answered "could
+        // not evaluate", which the completion gate can never accept
+        // — re-mint so a fresh pass can judge the evidence. The mint
+        // is the same `waiting → ready` re-request `!checked` already
         // uses, budget-bounded through `accepts_invocation` like every
         // other Invocation.
-        if !checked || unjudged_conclusive_evidence(tx, &work.id, &invocations[producing + 1..])? {
+        let unjudged = unjudged_conclusive_evidence(tx, &work.id, trailing)?;
+        let incomplete = assessment_incomplete(tx, &work.id)?;
+        if !checked || unjudged || incomplete {
+            // The lane-bound stops an open-ended wedge: trailing
+            // checks beyond the first are rechecks, and past the
+            // limit the evidence path pauses for an operator decision
+            // — the same hold an unsupported intent takes — instead
+            // of minting checks forever.
+            let rechecks_used = trailing
+                .iter()
+                .filter(|i| i.role == InvocationRole::InvariantCheck)
+                .count()
+                .saturating_sub(1);
+            if rechecks_used >= INVARIANT_RECHECK_LIMIT {
+                let (classification, detail) = if incomplete {
+                    (
+                        "invariant_assessment_incomplete",
+                        format!(
+                            "invariant assessment still incomplete after {rechecks_used} rechecks"
+                        ),
+                    )
+                } else {
+                    (
+                        "invariant_check_unsatisfied",
+                        format!("invariant check did not settle after {rechecks_used} rechecks"),
+                    )
+                };
+                pause_for_repair(
+                    tx,
+                    execution,
+                    classification,
+                    &detail,
+                    vec![RepairPrerequisite::OperatorDecision],
+                    now_unix_seconds,
+                )?;
+                // Every writer is already resolved (the gate at the
+                // top of this function), so the recorded pause settles
+                // immediately — the same writer-stop proof the receipt
+                // path applies before it leaves `stopping`.
+                if let Some(current) = tx.execution(&execution.id)?
+                    && current.state == ExecutionState::Stopping
+                {
+                    settle_after_writer_gone(tx, config, &current, now_unix_seconds)?;
+                }
+                return Ok(());
+            }
             admit_queued_role(
                 tx,
                 config,
@@ -5148,6 +5208,36 @@ fn unjudged_conclusive_evidence(
         ) && !bound.contains(r.id.as_str())
             && r.recorded_seq > bound_newest
     }))
+}
+
+/// Evidence the check honestly could not evaluate (#515): the newest
+/// `Assessment` fact on the current target declares `complete:false`
+/// or carries no items — the check ran and answered "could not
+/// evaluate", which the completion gate can never accept and no
+/// re-collected pass would supersede without a fresh check minted.
+/// No assessment at all is *not* incomplete evidence: the `!checked`
+/// and `unjudged_conclusive_evidence` triggers own that case. A
+/// `complete:true` assessment carrying negative items is conclusive
+/// (a recorded violation) and deliberately out of scope here —
+/// routing violations into the fix lane is a separate follow-up.
+fn assessment_incomplete(tx: &dyn ReadView, work_id: &WorkId) -> Result<bool, StoreError> {
+    let Some(target) = current_target(tx, work_id)? else {
+        return Ok(false);
+    };
+    Ok(tx
+        .observations_for_work(work_id)?
+        .iter()
+        .rev()
+        .find_map(|o| match &o.fact {
+            ObservationFact::Assessment {
+                target: t,
+                complete,
+                items,
+                ..
+            } if t == &target => Some(!*complete || items.is_empty()),
+            _ => None,
+        })
+        .unwrap_or(false))
 }
 
 /// `succeeded` requires the required stage effects applied, the declared

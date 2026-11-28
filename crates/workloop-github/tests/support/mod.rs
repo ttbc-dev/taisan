@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use workloop_core::identity::{ChangeRequestId, HostActorRef, IssueRef, RepositoryRef};
 use workloop_core::observation::{CheckConclusion, IssueState};
 use workloop_github::api::{
-    ApiError, GitHubApi, RemoteCheckRun, RemoteComment, RemoteIssue, RemotePull, RemoteReview,
-    RemoteReviewFinding, RepositoryPermissions,
+    ApiError, GitHubApi, PullState, RemoteCheckRun, RemoteComment, RemoteIssue, RemotePull,
+    RemoteReview, RemoteReviewFinding, RepositoryPermissions,
 };
 use workloop_github::credential::{CredentialError, ResolvedCredential};
 
@@ -24,6 +24,7 @@ struct PullRecord {
     title: String,
     body: String,
     base_sha: String,
+    state: PullState,
     merged: bool,
     mergeable: Option<bool>,
     mergeable_state: String,
@@ -40,6 +41,7 @@ impl PullRecord {
             target_branch: self.target_branch.clone(),
             title: self.title.clone(),
             body: self.body.clone(),
+            state: self.state,
             // Merge is not an adapter write; tests may seed the
             // remote's merged state to exercise read-side detection.
             merged: self.merged,
@@ -222,6 +224,18 @@ impl InMemoryGitHub {
             .get_mut(&(repository.to_string(), change_id.to_string()))
         {
             pull.merged = true;
+            pull.state = PullState::Closed;
+        }
+    }
+
+    /// Test control: the remote lists the pull closed without merging —
+    /// a stale record with the same payload, never a live change.
+    pub fn set_pull_closed(&mut self, repository: &RepositoryRef, change_id: &str) {
+        if let Some(pull) = self
+            .pulls
+            .get_mut(&(repository.to_string(), change_id.to_string()))
+        {
+            pull.state = PullState::Closed;
         }
     }
 
@@ -399,6 +413,18 @@ impl InMemoryGitHub {
             operation.to_string(),
             ApiError::Unknown {
                 reason: "response lost".into(),
+            },
+        );
+    }
+
+    /// Test control: the next call of `operation` fails `unknown`
+    /// *before* its effect lands — the request died on the wire, never
+    /// the landed write `lose_response` models. One-shot.
+    pub fn fail_next(&mut self, operation: &str) {
+        self.refusals.insert(
+            operation.to_string(),
+            ApiError::Unknown {
+                reason: "request lost before the effect".into(),
             },
         );
     }
@@ -583,6 +609,7 @@ impl GitHubApi for InMemoryGitHub {
                 .get(&(repository.to_string(), target_branch.to_string()))
                 .cloned()
                 .unwrap_or_default(),
+            state: PullState::Open,
             merged: false,
             mergeable: Some(true),
             mergeable_state: "clean".into(),
@@ -704,7 +731,7 @@ impl GitHubApi for InMemoryGitHub {
         &mut self,
         repository: &RepositoryRef,
         source_branch: &str,
-        head_sha: &str,
+        head_sha: Option<&str>,
     ) -> Result<Vec<RemotePull>, ApiError> {
         if let Some(err) = self.take_lost("list_pulls_on_branch") {
             return Err(err);
@@ -716,7 +743,7 @@ impl GitHubApi for InMemoryGitHub {
             .filter(|((repo, _), pull)| {
                 *repo == repository
                     && pull.source_branch == source_branch
-                    && pull.head_sha == head_sha
+                    && head_sha.is_none_or(|sha| pull.head_sha == sha)
             })
             .map(|(_, pull)| pull.remote())
             .collect())

@@ -4672,6 +4672,18 @@ fn sweep_conflict_during_reassessment_is_deferred_not_fatal() {
     );
 }
 
+/// An assessment the check declared incomplete — `complete:false`
+/// with no judged items — the honest "could not evaluate" that parked
+/// the lane forever before the #515 re-drive.
+fn incomplete_assessment(head: &str) -> ObservationFact {
+    ObservationFact::Assessment {
+        target: target(head),
+        set_digest: "invariants".into(),
+        complete: false,
+        items: vec![],
+    }
+}
+
 /// An inconclusive lane assessment fact on the current target — the
 /// verdict that parked the lane forever before the #469 re-drive.
 fn inconclusive_assessment(head: &str) -> ObservationFact {
@@ -5015,6 +5027,105 @@ fn an_older_unbound_conclusive_result_does_not_remint() {
             .all(|r| r.role != InvocationRole::InvariantCheck),
         "no check re-minted: {pending:?}"
     );
+}
+
+/// #515: a `complete:false` assessment is not lane-terminal — the
+/// timed sweep re-mints the invariant check through the same
+/// `waiting → ready` path the missing-check trigger uses, bounded to
+/// two rechecks per produced revision, then pauses for an operator
+/// decision instead of minting checks forever.
+#[test]
+fn an_incomplete_assessment_rechecks_then_pauses_for_the_operator() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("ic1"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "ic1");
+    // The wedge shape: the newest assessment declares itself
+    // incomplete — honest evidence the completion gate can never
+    // accept, re-collected only if a fresh check judges it.
+    record_unassessed_observation(&store, &w, incomplete_assessment("sha-1"));
+
+    // One recheck's resolution: the re-minted check resolved `Done` on
+    // a proven exit 0 and judged the evidence incomplete again.
+    let recheck = |check_id: &str| {
+        force_state(&store, &e1, ExecutionState::Waiting);
+        let mut invocation = recorded_check_invocation(&e1, check_id);
+        invocation.request_id = format!("{}:inv:{}", e1.0, check_id);
+        apply_effects(
+            &store,
+            &[
+                Effect::InsertInvocation { invocation },
+                Effect::InsertObservation {
+                    observation: check_exit_observation(&e1, check_id),
+                },
+            ],
+        );
+        record_unassessed_observation(&store, &w, incomplete_assessment("sha-1"));
+    };
+    let pending_checks = |store: &SqliteStore| {
+        store
+            .transact(|tx| tx.pending_requests())
+            .unwrap()
+            .iter()
+            .filter(|r| r.role == InvocationRole::InvariantCheck)
+            .count()
+    };
+
+    // Recheck 1: the lane re-arms through the same mint the
+    // missing-check and unjudged-evidence triggers use.
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(
+        read_execution(&store, &e1).state,
+        ExecutionState::Ready,
+        "the incomplete assessment re-minted the check: {report:?}"
+    );
+    assert_eq!(pending_checks(&store), 1);
+
+    // Recheck 2 judges incomplete again — one mint remains.
+    recheck("ic1-check-2");
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(
+        read_execution(&store, &e1).state,
+        ExecutionState::Ready,
+        "{report:?}"
+    );
+    assert_eq!(pending_checks(&store), 2);
+
+    // The bound is spent: the lane pauses with an operator-decision
+    // prerequisite — the same hold an unsupported intent takes —
+    // instead of minting a third recheck.
+    recheck("ic1-check-3");
+    let report = sweep(&store, &config(), NOW).unwrap();
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Paused,
+        "the spent bound hands the wedge to an operator: {report:?}"
+    );
+    assert!(
+        e.repair_prerequisites
+            .iter()
+            .any(|p| matches!(p, RepairPrerequisite::OperatorDecision)),
+        "the hold requires an operator decision: {:?}",
+        e.repair_prerequisites
+    );
+    assert!(
+        e.pause_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("invariant assessment still incomplete")),
+        "the pause names its cause: {:?}",
+        e.pause_reason
+    );
+    assert_eq!(pending_checks(&store), 2, "no third check was minted");
+
+    // The lane holds: a further sweep never re-arms it.
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(
+        read_execution(&store, &e1).state,
+        ExecutionState::Paused,
+        "{report:?}"
+    );
+    assert_eq!(pending_checks(&store), 2);
 }
 
 /// Settlement clears recorded deferrals on EVERY completion path: a
