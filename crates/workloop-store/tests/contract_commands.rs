@@ -4699,6 +4699,23 @@ fn inconclusive_assessment(head: &str) -> ObservationFact {
     }
 }
 
+/// A conclusive lane violation fact on the current target — the shape
+/// `bind_invariant_check` records for a `Negative` report
+/// (`complete:false` with the violating member's `Negative` verdict),
+/// conclusive evidence, never "could not evaluate".
+fn violation_assessment(head: &str) -> ObservationFact {
+    ObservationFact::Assessment {
+        target: target(head),
+        set_digest: "invariants".into(),
+        complete: false,
+        items: vec![AssessmentItem {
+            id: "inv-1".into(),
+            verdict: AssessmentVerdict::Negative,
+            refs: vec![],
+        }],
+    }
+}
+
 /// Record one verification result row exactly as `handoff::verify`
 /// writes them — on an acknowledged artifact handoff, lazily seeded
 /// the first time a result lands for `artifact_id` (the results table
@@ -5126,6 +5143,117 @@ fn an_incomplete_assessment_rechecks_then_pauses_for_the_operator() {
         "{report:?}"
     );
     assert_eq!(pending_checks(&store), 2);
+}
+
+/// A `Negative` item is a conclusive violation, never the #515
+/// "could not evaluate" shape — `bind_invariant_check` seals a
+/// `Negative` report as `complete:false` too (`complete = covered &&
+/// !Negative`), so the verdict item, not the flag, separates them.
+/// The lane pauses for an operator decision on the spot with the
+/// violation named, rather than spending the recheck bound re-judging
+/// a verdict no recheck on the same revision can overturn.
+#[test]
+fn a_recorded_violation_pauses_the_lane_without_rechecks() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("iv1"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "iv1");
+    // The settled violation: the newest assessment on the current
+    // target carries a `Negative` verdict — the check affirmatively
+    // judged an invariant violated.
+    record_unassessed_observation(&store, &w, violation_assessment("sha-1"));
+
+    let pending_checks = |store: &SqliteStore| {
+        store
+            .transact(|tx| tx.pending_requests())
+            .unwrap()
+            .iter()
+            .filter(|r| r.role == InvocationRole::InvariantCheck)
+            .count()
+    };
+
+    // One pass settles the lane to the operator hold — conclusive
+    // evidence never mints a recheck.
+    let report = sweep(&store, &config(), NOW).unwrap();
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Paused,
+        "the recorded violation hands the lane to an operator: {report:?}"
+    );
+    assert!(
+        e.repair_prerequisites
+            .iter()
+            .any(|p| matches!(p, RepairPrerequisite::OperatorDecision)),
+        "the hold requires an operator decision: {:?}",
+        e.repair_prerequisites
+    );
+    assert!(
+        e.pause_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("violation")),
+        "the pause names the violation, not 'still incomplete': {:?}",
+        e.pause_reason
+    );
+    assert_eq!(pending_checks(&store), 0, "no recheck was minted");
+
+    // The lane holds: a further sweep never re-arms it.
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(
+        read_execution(&store, &e1).state,
+        ExecutionState::Paused,
+        "{report:?}"
+    );
+    assert_eq!(pending_checks(&store), 0);
+}
+
+/// The one thing that outranks a recorded violation: *unjudged*
+/// conclusive evidence. A newer `Pass` the satisfied check's bound
+/// request never carried makes the recorded verdict stale — the lane
+/// re-mints its check for a fresh judgment instead of pausing on the
+/// old one.
+#[test]
+fn a_violation_with_unjudged_evidence_rejudges_instead_of_pausing() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("iv2"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "iv2");
+    let artifact = "iv2-coding/artifact.json";
+    // The check judged an inconclusive run…
+    let judged = record_verification_result(
+        &store,
+        &e1,
+        artifact,
+        "verification_argv[0]",
+        VerificationOutcome::Inconclusive,
+    );
+    bind_check_request_body(&store, &w, &e1, "iv2-check", artifact, &[judged]);
+    // …and recorded a violation — but a newer conclusive result the
+    // bound request never carried means the violation is not the
+    // freshest judgment.
+    record_unassessed_observation(&store, &w, violation_assessment("sha-1"));
+    record_verification_result(
+        &store,
+        &e1,
+        artifact,
+        "verification_argv[1]",
+        VerificationOutcome::Pass,
+    );
+
+    let report = sweep(&store, &config(), NOW).unwrap();
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Ready,
+        "unjudged conclusive evidence takes precedence over the recorded violation: {report:?}"
+    );
+    let pending = store.transact(|tx| tx.pending_requests()).unwrap();
+    assert!(
+        pending
+            .iter()
+            .any(|r| r.execution_id == e1 && r.role == InvocationRole::InvariantCheck),
+        "a new InvariantCheck re-judges the fresher evidence: {pending:?}"
+    );
 }
 
 /// Settlement clears recorded deferrals on EVERY completion path: a

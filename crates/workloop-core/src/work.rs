@@ -4666,6 +4666,38 @@ fn maybe_publish(
         // uses, budget-bounded through `accepts_invocation` like every
         // other Invocation.
         let unjudged = unjudged_conclusive_evidence(tx, &work.id, trailing)?;
+        // A recorded violation is conclusive evidence, never the
+        // `incomplete` shape: the binder records a `Negative` report
+        // as `complete:false` too, so the verdict item — not the flag
+        // — is what separates a settled violation from "could not
+        // evaluate". The lane hands the settled negative to an
+        // operator decision — the same hold an exhausted bound takes
+        // — instead of spending the recheck bound re-judging a
+        // verdict no recheck on the same revision can overturn.
+        // Fresher unbound conclusive evidence still outranks it: the
+        // lane owes that evidence a re-judged assessment first.
+        // Routing the violation into a bounded Fix is a separate
+        // follow-up.
+        if !unjudged && assessment_records_violation(tx, &work.id)? {
+            pause_for_repair(
+                tx,
+                execution,
+                "invariant_violation",
+                "invariant assessment recorded a violation",
+                vec![RepairPrerequisite::OperatorDecision],
+                now_unix_seconds,
+            )?;
+            // Every writer is already resolved (the gate at the top
+            // of this function), so the recorded pause settles
+            // immediately — the same writer-stop proof the
+            // bound-exhaustion pause applies.
+            if let Some(current) = tx.execution(&execution.id)?
+                && current.state == ExecutionState::Stopping
+            {
+                settle_after_writer_gone(tx, config, &current, now_unix_seconds)?;
+            }
+            return Ok(());
+        }
         let incomplete = assessment_incomplete(tx, &work.id)?;
         if !checked || unjudged || incomplete {
             // The lane-bound stops an open-ended wedge: trailing
@@ -5217,9 +5249,10 @@ fn unjudged_conclusive_evidence(
 /// re-collected pass would supersede without a fresh check minted.
 /// No assessment at all is *not* incomplete evidence: the `!checked`
 /// and `unjudged_conclusive_evidence` triggers own that case. A
-/// `complete:true` assessment carrying negative items is conclusive
-/// (a recorded violation) and deliberately out of scope here —
-/// routing violations into the fix lane is a separate follow-up.
+/// `Negative` item verdict is conclusive — a recorded violation, not
+/// "could not evaluate" — and deliberately out of scope here:
+/// `assessment_records_violation` owns it, and routing violations
+/// into the fix lane is a separate follow-up.
 fn assessment_incomplete(tx: &dyn ReadView, work_id: &WorkId) -> Result<bool, StoreError> {
     let Some(target) = current_target(tx, work_id)? else {
         return Ok(false);
@@ -5234,7 +5267,41 @@ fn assessment_incomplete(tx: &dyn ReadView, work_id: &WorkId) -> Result<bool, St
                 complete,
                 items,
                 ..
-            } if t == &target => Some(!*complete || items.is_empty()),
+            } if t == &target => Some(
+                (!*complete || items.is_empty())
+                    && !items
+                        .iter()
+                        .any(|i| i.verdict == crate::observation::AssessmentVerdict::Negative),
+            ),
+            _ => None,
+        })
+        .unwrap_or(false))
+}
+
+/// Evidence the lane's newest assessment records a conclusive
+/// violation: the newest `Assessment` fact on the current target
+/// carries a `Negative` item — the check affirmatively judged an
+/// invariant violated, the `Negative` report the binder sealed as
+/// `complete:false` (`complete = covered && !Negative`). A recheck on
+/// the same produced revision cannot overturn the settled verdict —
+/// conclusive evidence settles the lane rather than spending the
+/// recheck bound under the `incomplete` shape.
+fn assessment_records_violation(tx: &dyn ReadView, work_id: &WorkId) -> Result<bool, StoreError> {
+    let Some(target) = current_target(tx, work_id)? else {
+        return Ok(false);
+    };
+    Ok(tx
+        .observations_for_work(work_id)?
+        .iter()
+        .rev()
+        .find_map(|o| match &o.fact {
+            ObservationFact::Assessment {
+                target: t, items, ..
+            } if t == &target => Some(
+                items
+                    .iter()
+                    .any(|i| i.verdict == crate::observation::AssessmentVerdict::Negative),
+            ),
             _ => None,
         })
         .unwrap_or(false))
