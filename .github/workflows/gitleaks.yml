@@ -14,6 +14,20 @@ name: Gitleaks
 # fingerprints are suppressed by .gitleaksignore at the repo root so the
 # job stays a meaningful signal. Revisit that file before treating it as
 # a settled disposition — see the issue-490 notes.
+#
+# The allowlist is part of the very diff it polices: a contributor could
+# add a secret and append the matching <commit>:<path>:<rule>:<line>
+# fingerprint in the same PR and the job would still pass. Two controls
+# keep the effective suppression set equal to the base branch's copy:
+# the gate below rejects PR-side changes to .gitleaksignore, other
+# gitleaks config/ignore artifacts, or inline allow comments; and the
+# scan masks the worktree's .gitleaksignore with the base's copy inside
+# the container. When the base has no allowlist and the PR introduces
+# one, the mounted copy is the introduced file restricted to
+# fingerprints whose commits already exist on the base — so a change
+# can never suppress a finding it adds itself. The gate inspects every
+# incoming commit's own patch plus the net diff, so a suppression added
+# in one commit and reverted later in the same PR is still caught.
 on:
   pull_request:
   push:
@@ -37,11 +51,275 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # HEAD^1 of the pull-request merge commit is the base tip the
+      # merge was built from — already present in the fetch-depth:0
+      # clone, so no extra fetch (and no stored credentials) is needed.
+      - name: Verify suppression layer is untouched
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          base=""
+          # HEAD^1 names the base tip only when HEAD is a merge
+          # commit — on a detached PR-head checkout it resolves to
+          # the PR's own parent, which must never be taken as the
+          # base. The event payload's base sha is a main-side object
+          # and keeps the gate on a trustworthy ref in that case.
+          if git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
+            base="$(git rev-parse HEAD^1 2>/dev/null || true)"
+          elif [ -n "$BASE_SHA" ]; then
+            base="$(git rev-parse --verify "$BASE_SHA" \
+                2>/dev/null || true)"
+          fi
+          if [ -z "$base" ]; then
+            echo "::notice::Neither a merge ref nor a resolvable base"
+            echo "  sha is available; suppression gate skipped. The"
+            echo "  scan still runs with an empty allowlist and no"
+            echo "  repo config, so nothing can be suppressed."
+            exit 0
+          fi
+          # A PR may not add, change or delete the allowlist itself.
+          if git cat-file -e "$base:.gitleaksignore" 2>/dev/null; then
+            if ! git diff --quiet "$base" HEAD -- .gitleaksignore; then
+              echo "::error::This PR changes .gitleaksignore. Suppression"
+              echo "  fingerprints are owner-curated on main — land the change"
+              echo "  there first, then rebase."
+              exit 1
+            fi
+          elif git cat-file -e HEAD:.gitleaksignore 2>/dev/null; then
+            # The allowlist may be INTRODUCED in a PR, but only with
+            # fingerprints for findings that already exist on the
+            # base branch: every entry's commit must be an ancestor
+            # of the base ref. A fingerprint pointing at a PR commit
+            # would let the same change suppress a finding it adds —
+            # and under rebase- or merge-landing that commit reaches
+            # main with its suppression. Malformed entries fail the
+            # same way (an unresolvable commit is not an ancestor).
+            echo "::notice::.gitleaksignore is introduced by this PR"
+            echo "  (base has none). Entries are honored only for"
+            echo "  findings already on the base branch's history."
+            git show HEAD:.gitleaksignore \
+                > "$RUNNER_TEMP/introduced.allowlist"
+            bad=0
+            while IFS= read -r fp; do
+              case "$fp" in ''|'#'*) continue;; esac
+              if ! git merge-base --is-ancestor "${fp%%:*}" "$base" \
+                  2>/dev/null; then
+                echo "::error::introduced .gitleaksignore entry does not"
+                echo "  point at a commit on the base branch: $fp"
+                bad=1
+              fi
+            done < "$RUNNER_TEMP/introduced.allowlist"
+            [ "$bad" -eq 0 ] || exit 1
+          fi
+          # No other gitleaks config/ignore artifact may appear in a PR
+          # diff (.gitleaks.toml, gitleaks.toml, nested .gitleaksignore);
+          # the root .gitleaksignore is covered by the check above.
+          # The name list is staged, not piped — a failing git must
+          # fail this step, not read as 'no artifact found'.
+          git diff --name-only "$base" HEAD \
+              > "$RUNNER_TEMP/touched.diff"
+          if grep -iE '(^|/)\.?gitleaks(ignore|\.toml)$' \
+                "$RUNNER_TEMP/touched.diff" \
+              | grep -vxF '.gitleaksignore'; then
+            echo "::error::This PR touches a gitleaks config or ignore"
+            echo "  artifact besides the root .gitleaksignore. Rule and"
+            echo "  suppression changes are owner-curated on main."
+            exit 1
+          fi
+          # Inline allow comments (the 'gitleaks:' + 'allow' marker,
+          # kept split so this file's own text never trips the gate)
+          # are a second suppression channel — the marker silences any
+          # finding on its own line. Two complementary checks run here.
+          #
+          # 1. added_lines extracts every '+'-prefixed line inside '@@'
+          #    hunks — '+++'/'---' headers only ever appear between
+          #    'diff --git' and the file's first '@@', so tracking hunk
+          #    state counts every added line (including content that
+          #    itself begins with '+' or with the marker) without ever
+          #    matching a header. Both views feed it: every incoming
+          #    commit's own patch (a marker added in one commit and
+          #    reverted later still fails) and the net diff ('git log
+          #    -p' prints no patch for merge commits — a marker left by
+          #    conflict resolution lives at HEAD and is caught there).
+          #
+          # 2. The blob check covers content git prints no patch for at
+          #    all — files marked binary or '-diff' via .gitattributes,
+          #    or carrying NUL bytes. For every path touched by incoming
+          #    commits it compares marker-bearing LINES, not mere
+          #    presence: a base blob that already carries the marker
+          #    must not exempt the path (a new secret+marker could hide
+          #    behind a binary attribute). Only marker lines absent
+          #    from the base revision fail the job — owner-curated
+          #    marker text stays inert.
+          #
+          # git output is staged to files before grepping: a failing
+          # git must fail this step, not read as 'no marker found',
+          # and file input lets grep exit early without SIGPIPE-ing
+          # git under 'bash -eo pipefail'.
+          added_lines() {
+            awk '
+              /^diff --git / { in_hunk = 0 }
+              /^@@ /         { in_hunk = 1 }
+              in_hunk && /^\+/ { print }
+            '
+          }
+          allow_marker='gitleaks:'"allow"
+          git log -p "$base"..HEAD > "$RUNNER_TEMP/pr.patch"
+          git diff "$base" HEAD >> "$RUNNER_TEMP/pr.patch"
+          if added_lines < "$RUNNER_TEMP/pr.patch" \
+              | grep -E 'gitleaks:[a]llow' >/dev/null; then
+            echo "::error::This PR adds a '${allow_marker}' inline"
+            echo "  suppression. Suppressions are owner-curated via"
+            echo "  .gitleaksignore on main."
+            exit 1
+          fi
+          git log --format= --name-only "$base"..HEAD \
+              > "$RUNNER_TEMP/touched.log"
+          sort -u "$RUNNER_TEMP/touched.log" "$RUNNER_TEMP/touched.diff" \
+              > "$RUNNER_TEMP/touched"
+          while IFS= read -r touched_path; do
+            [ -n "$touched_path" ] || continue
+            # Marker lines already present in the base blob are owner
+            # state — but the path must not be exempted on presence
+            # alone. Staging keeps a failing git a step failure
+            # rather than a silent 'no base markers'.
+            if git cat-file -e "$base:$touched_path" 2>/dev/null; then
+              git show "$base:$touched_path" \
+                  > "$RUNNER_TEMP/base.blob"
+              grep -aF "$allow_marker" "$RUNNER_TEMP/base.blob" \
+                  | sort -u > "$RUNNER_TEMP/base.marker" || true
+            else
+              : > "$RUNNER_TEMP/base.marker"
+            fi
+            revs="$(git rev-list "$base"..HEAD -- "$touched_path")"
+            [ -n "$revs" ] || continue
+            rc=0
+            # -h drops the <rev>:<path> prefix and -a prints matching
+            # lines even from binary blobs so output is bare marker
+            # lines; all incoming revisions go into one call
+            # (O(paths) spawns) and rc>1 means git itself failed —
+            # fail closed rather than read it as 'no marker found'.
+            git grep -a -h -F "$allow_marker" $revs -- "$touched_path" \
+                2>/dev/null > "$RUNNER_TEMP/rev.marker" || rc=$?
+            if [ "$rc" -gt 1 ]; then
+              echo "::error::blob scan failed for '$touched_path'."
+              exit 1
+            fi
+            if [ "$rc" -eq 0 ] \
+                && sort -u "$RUNNER_TEMP/rev.marker" \
+                  | comm -13 "$RUNNER_TEMP/base.marker" - \
+                  | grep -q .; then
+              echo "::error::This PR adds a '${allow_marker}' inline"
+              echo "  suppression in '$touched_path'. Suppressions"
+              echo "  are owner-curated via .gitleaksignore on main."
+              exit 1
+            fi
+          done < "$RUNNER_TEMP/touched"
+
+      # The scan must evaluate the base branch's suppression set, not
+      # the PR's. gitleaks auto-loads .gitleaksignore from the scanned
+      # worktree, so the file the container sees is masked below by a
+      # bind-mount: the base's copy — or, when the base has none and
+      # the PR introduces one, the introduced copy restricted to
+      # fingerprints whose commits are already on the base's history.
+      # On pull_request, HEAD^1 of the merge ref is the base tip the
+      # merge was built from; on push, HEAD itself is the curated copy.
+      # A PR therefore cannot suppress its own findings by editing the
+      # allowlist in the same change.
+      - name: Materialize effective allowlist
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          ref=""
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            # Same merge-only rule as the gate: HEAD^1 is the base
+            # tip on a merge-ref checkout, never on a detached
+            # PR-head checkout — there the event's base sha is the
+            # main-side ref to fall back to.
+            if git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
+              ref="$(git rev-parse HEAD^1 2>/dev/null || true)"
+            elif [ -n "$BASE_SHA" ]; then
+              ref="$(git rev-parse --verify "$BASE_SHA" \
+                  2>/dev/null || true)"
+            fi
+          else
+            ref="HEAD"
+          fi
+          # No resolvable ref means an EMPTY allowlist — fail-closed:
+          # a run that cannot name its base honors no suppressions at
+          # all, never the PR's own copy.
+          if [ -n "$ref" ] \
+              && git show "$ref:.gitleaksignore" \
+                > "$RUNNER_TEMP/effective-allowlist" 2>/dev/null; then
+            :
+          elif [ "$GITHUB_EVENT_NAME" = "pull_request" ] \
+              && [ -n "$ref" ] \
+              && git show HEAD:.gitleaksignore \
+                > "$RUNNER_TEMP/introduced-allowlist" 2>/dev/null; then
+            # Base has no allowlist but the PR introduces one: honor
+            # only entries whose commit is already on the base
+            # branch's history — the same ancestor rule the gate
+            # enforces, applied again here so the mounted copy can
+            # never cover a finding the PR itself introduces.
+            # Comment and blank lines pass through untouched.
+            : > "$RUNNER_TEMP/effective-allowlist"
+            while IFS= read -r fp; do
+              case "$fp" in
+                ''|'#'*) ;;
+                *)
+                  git merge-base --is-ancestor "${fp%%:*}" "$ref" \
+                      2>/dev/null || continue
+                  ;;
+              esac
+              echo "$fp" >> "$RUNNER_TEMP/effective-allowlist"
+            done < "$RUNNER_TEMP/introduced-allowlist"
+          else
+            : > "$RUNNER_TEMP/effective-allowlist"
+          fi
+          # Bind-mount targets must exist inside the read-only /repo
+          # mount or docker cannot create the mountpoints. Empty
+          # placeholders cover checkouts without the files — the masks
+          # shadow them and gitleaks scans committed objects, so the
+          # placeholders are never read.
+          if [ ! -e "$GITHUB_WORKSPACE/.gitleaksignore" ]; then
+            : > "$GITHUB_WORKSPACE/.gitleaksignore"
+          fi
+          # The second suppression channel is a repo-root config:
+          # .gitleaks.toml auto-loads, an [allowlist] in it suppresses
+          # findings, and even an EMPTY config file disables every
+          # rule (verified on the pinned engine version) — so the
+          # scan must never see a PR-side config. With a base-side
+          # config the base's copy is mounted like the allowlist;
+          # without one, every spelling the engine could auto-load
+          # is stripped from the worktree and the embedded defaults
+          # apply. gitleaks reads committed objects, so removing the
+          # file here never changes what is scanned.
+          if [ -n "$ref" ] \
+              && git show "$ref:.gitleaks.toml" \
+                > "$RUNNER_TEMP/effective-config.toml" 2>/dev/null; then
+            if [ ! -e "$GITHUB_WORKSPACE/.gitleaks.toml" ]; then
+              : > "$GITHUB_WORKSPACE/.gitleaks.toml"
+            fi
+          else
+            rm -f "$RUNNER_TEMP/effective-config.toml"
+            rm -f "$GITHUB_WORKSPACE/.gitleaks.toml" \
+                  "$GITHUB_WORKSPACE/gitleaks.toml"
+          fi
+
       # The image is pinned by multi-arch index digest — the container
       # analog of the commit-SHA pins enforced on `uses:` refs.
       - name: Scan history for secrets
-        run: >-
-          docker run --rm
-          -v "$GITHUB_WORKSPACE:/repo:ro"
-          zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f
-          git /repo --redact
+        run: |
+          cfg_mount=()
+          if [ -f "$RUNNER_TEMP/effective-config.toml" ]; then
+            cfg_mount=(
+              -v "$RUNNER_TEMP/effective-config.toml:/repo/.gitleaks.toml:ro"
+            )
+          fi
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/repo:ro" \
+            -v "$RUNNER_TEMP/effective-allowlist:/repo/.gitleaksignore:ro" \
+            "${cfg_mount[@]}" \
+            zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f \
+            git /repo --redact

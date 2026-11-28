@@ -34,9 +34,12 @@ jobs:
 
     # Pull requests from forks get a read-only GITHUB_TOKEN, so the
     # SARIF upload (security-events: write) cannot succeed — skip rather
-    # than fail noisily. Pushes to main and the nightly schedule still
-    # scan everything that lands.
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    # than fail noisily. Dependabot-authored PRs are same-repo branches,
+    # but Dependabot-triggered runs get the same read-only token (and
+    # re-runs keep it), so they are skipped by PR author as well.
+    # Pushes to main and the nightly schedule still scan everything
+    # that lands, including merged Dependabot changes.
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]') }}
 
     permissions:
       contents: read
