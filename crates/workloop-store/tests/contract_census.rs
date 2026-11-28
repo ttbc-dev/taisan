@@ -457,6 +457,7 @@ fn empty_store_reports_every_detector() {
             &c.parked_selector_starvation.applicable,
         ),
         ("source_gate_holds", &c.source_gate_holds.applicable),
+        ("outbox_holds", &c.outbox_holds.applicable),
     ] {
         assert!(*section, "{name} must be applicable");
     }
@@ -943,6 +944,19 @@ fn every_detector_is_individually_bounded() {
         open_change(&store, &work_id, object, NOW);
         seal_review(&store, &work_id, object, &["f"], Some(&eid), NOW);
     }
+    store
+        .transact(|tx| {
+            for i in 0..3 {
+                tx.apply(&Effect::RecordOutboxHold {
+                    action_id: format!("hold-{i}"),
+                    work_id: work_id.clone(),
+                    hold_kind: OutboxHoldKind::Skipped,
+                    reason: "host_mismatch".into(),
+                })?;
+            }
+            Ok(())
+        })
+        .unwrap();
     let bounds = CensusBounds {
         item_limit: 2,
         deferral_age_events: 256,
@@ -953,6 +967,7 @@ fn every_detector_is_individually_bounded() {
     assert_eq!(c.orphaned_findings.limit, 2);
     assert_eq!(c.parked_selector_starvation.limit, 2);
     assert_eq!(c.source_gate_holds.limit, 2);
+    assert_eq!(c.outbox_holds.limit, 2);
     // judgment_waits carries 3 unjudged rounds (cap 2).
     assert_eq!(c.judgment_waits.items.len(), 2);
     assert_eq!(c.judgment_waits.total, 3);
@@ -961,6 +976,10 @@ fn every_detector_is_individually_bounded() {
     assert_eq!(c.orphaned_findings.items.len(), 2);
     assert_eq!(c.orphaned_findings.total, 3);
     assert!(c.orphaned_findings.truncated);
+    // outbox_holds carries 3 recorded holds (cap 2).
+    assert_eq!(c.outbox_holds.items.len(), 2);
+    assert_eq!(c.outbox_holds.total, 3);
+    assert!(c.outbox_holds.truncated);
 }
 
 #[test]
