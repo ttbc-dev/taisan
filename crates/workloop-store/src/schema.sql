@@ -1,6 +1,6 @@
--- workloop v17 store: current-state tables enforcing structural
+-- workloop v18 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
--- `PRAGMA user_version = 17` marks the format; a stamped older file with
+-- `PRAGMA user_version = 18` marks the format; a stamped older file with
 -- the complete recognized schema upgrades additively at open, while an
 -- unversioned slice-0 database and a newer version are refused.
 -- v7 added work_usage.last_progress_basis; v8 added the intake run and
@@ -16,7 +16,9 @@
 -- added work_usage.merge_check_services, the bounded per-pair service
 -- cursor that replaced the merge-check observation record; v17 added
 -- the invocation_requests.placement_binding column recording the
--- per-request executor placement bound at admission (#379).
+-- per-request executor placement bound at admission (#379); v18 added
+-- the outbox_holds record (#516): why each held pending intent was not
+-- attempted in the pass that last recorded it.
 
 CREATE TABLE IF NOT EXISTS store_meta (
     key TEXT PRIMARY KEY,
@@ -210,6 +212,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS observations_dedupe
 -- retry; keep that lookup from scanning the whole append-only log.
 CREATE INDEX IF NOT EXISTS observations_execution
     ON observations (subject_execution_id);
+
+-- Why each held pending outbox intent stayed unattempted in the pass
+-- that last recorded it (skipped / credential_blocked / deferred),
+-- keyed by intent: `since_seq` marks the first recorded hold and
+-- `last_seen_seq` the most recent re-record, so a starving intent is
+-- one continuously aged row rather than a log per pass. A settle or a
+-- real attempt deletes the row — holds describe live intent state,
+-- never history.
+CREATE TABLE IF NOT EXISTS outbox_holds (
+    action_id TEXT PRIMARY KEY,
+    work_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN
+        ('skipped', 'credential_blocked', 'deferred')),
+    reason TEXT NOT NULL,
+    since_seq INTEGER NOT NULL,
+    last_seen_seq INTEGER NOT NULL
+);
 
 -- Recorded host write intents; `pending`/`unknown` are outstanding
 -- effects a terminal state must not silently drain.

@@ -2826,3 +2826,142 @@ fn a_pending_write_binds_the_declared_credential_before_writing() {
         HostActionStatus::Pending
     ));
 }
+
+/// #516: a held intent leaves a durable hold row — kind and reason —
+/// instead of starving invisibly across passes. A real attempt
+/// supersedes the hold; a continuous hold is one aged row, never a
+/// log per pass.
+#[test]
+fn a_held_outbox_intent_leaves_a_durable_hold_record() {
+    let push = |branch: &str| HostAction::PushRef {
+        branch: branch.into(),
+        produced: rev("head-1"),
+        expected_prior: None,
+    };
+    let holds = |store: &SqliteStore| store.transact(|tx| tx.outbox_holds()).unwrap();
+
+    // Installation-level `host_write` denied: every pending intent is
+    // reported skipped and records a `skipped` hold.
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _e) = submit(&store, "hold-deny");
+    let deny_id = insert_intent(&store, &work_id, push("work/deny"));
+    let mut denied = config();
+    denied.allowed_effects.host_write = false;
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let report = adapter
+        .apply_outbox_bounded(&store, &denied, &mut || NOW, None, None, 10)
+        .unwrap();
+    assert!(report.skipped.iter().any(|s| s.action_id == deny_id));
+    let recorded = holds(&store);
+    let hold = recorded
+        .iter()
+        .find(|h| h.action_id == deny_id)
+        .expect("a denied intent records its hold");
+    assert_eq!(hold.kind, OutboxHoldKind::Skipped);
+    assert_eq!(hold.reason, "host_write_denied");
+    assert_eq!(hold.work_id, work_id);
+
+    // The grant restored: the drain attempts the intent and the hold
+    // is superseded.
+    let report = adapter
+        .apply_outbox_bounded(&store, &config(), &mut || NOW, None, None, 10)
+        .unwrap();
+    assert_eq!(report.attempted, 1, "{report:?}");
+    assert!(
+        holds(&store).iter().all(|h| h.action_id != deny_id),
+        "an attempted intent supersedes its hold"
+    );
+
+    // The per-pass bound: the untouched remainder records a
+    // `deferred` hold naming the bound that stopped the pass.
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _e) = submit(&store, "hold-bound");
+    let first_id = insert_intent(&store, &work_id, push("work/b1"));
+    let deferred_id = insert_intent(&store, &work_id, push("work/b2"));
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let report = adapter
+        .apply_outbox_bounded(&store, &config(), &mut || NOW, None, None, 1)
+        .unwrap();
+    assert_eq!(report.deferred, vec![deferred_id.clone()]);
+    let hold = holds(&store)
+        .into_iter()
+        .find(|h| h.action_id == deferred_id)
+        .expect("a deferred intent records its hold");
+    assert_eq!(hold.kind, OutboxHoldKind::Deferred);
+    assert_eq!(hold.reason, "max_items");
+    // The attempted intent records no hold.
+    assert!(
+        store
+            .transact(|tx| tx.outbox_holds())
+            .unwrap()
+            .iter()
+            .all(|h| h.action_id != first_id),
+        "a drained intent holds no record"
+    );
+
+    // A credential-blocked intent stays pending and re-records its
+    // hold each pass: `since_seq` is preserved across re-records while
+    // `last_seen_seq` advances — one continuously aged row.
+    let store = SqliteStore::in_memory(1).unwrap();
+    let mut config = config();
+    config.host.actors[0].credential_ref = CredentialRef::trusted("env:TAISAN_TEST_TOKEN");
+    let mut adapter = Adapter::new(InMemoryGitHub::new())
+        .with_credentials(Box::new(workloop_github::fixture::CredentialBook::new()));
+    let d = handle_command(
+        &store,
+        &config,
+        &CommandRequest {
+            actor: Actor {
+                kind: ActorKind::Human,
+                external_id: "op".into(),
+            },
+            origin: Origin("cli".into()),
+            idempotency_key: "hold-cred".into(),
+            body: CommandBody::Submit {
+                intent: "do the thing".into(),
+                sources: vec![],
+                constraints: vec![],
+                verification_argv: vec![],
+            },
+        },
+        NOW,
+    )
+    .unwrap();
+    let CommandDecision::Accepted { work_id, .. } = d else {
+        panic!("submit: {d:?}")
+    };
+    let work_id = work_id.unwrap();
+    let push_id = insert_intent(&store, &work_id, push("work/hold-cred"));
+    let report = adapter
+        .apply_outbox_bounded(&store, &config, &mut || NOW, None, None, 10)
+        .unwrap();
+    assert!(
+        report
+            .credential_blocked
+            .iter()
+            .any(|b| b.action_id == push_id),
+        "{report:?}"
+    );
+    let first = holds(&store)
+        .into_iter()
+        .find(|h| h.action_id == push_id)
+        .expect("a blocked intent records its hold");
+    assert_eq!(first.kind, OutboxHoldKind::CredentialBlocked);
+    assert_eq!(first.reason, "credential.unresolvable");
+    let report = adapter
+        .apply_outbox_bounded(&store, &config, &mut || NOW, None, None, 10)
+        .unwrap();
+    assert!(
+        report
+            .credential_blocked
+            .iter()
+            .any(|b| b.action_id == push_id),
+        "{report:?}"
+    );
+    let second = holds(&store)
+        .into_iter()
+        .find(|h| h.action_id == push_id)
+        .unwrap();
+    assert_eq!(second.since_seq, first.since_seq);
+    assert!(second.last_seen_seq > first.last_seen_seq);
+}

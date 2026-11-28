@@ -1875,11 +1875,12 @@ fn store_header_classification_covers_fresh_unversioned_and_newer_formats() {
         ),
         (
             "newer format",
-            header(1, 18),
+            header(1, 19),
             false,
             Some("store.unsupported"),
         ),
         ("recognized format", header(1, 11), true, None),
+        ("current format", header(1, 18), true, None),
     ];
     for (name, bytes, should_pass, code) in cases {
         std::fs::write(&store, &bytes).unwrap();

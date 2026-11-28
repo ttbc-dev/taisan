@@ -457,6 +457,7 @@ fn empty_store_reports_every_detector() {
             &c.parked_selector_starvation.applicable,
         ),
         ("source_gate_holds", &c.source_gate_holds.applicable),
+        ("outbox_holds", &c.outbox_holds.applicable),
     ] {
         assert!(*section, "{name} must be applicable");
     }
@@ -820,6 +821,71 @@ fn parked_selector_starvation_reports_only_aged_deferrals() {
     assert_eq!(section.context.as_ref().unwrap()["slot_limit"], 2);
 }
 
+/// #516: every recorded outbox hold surfaces — the hold row is the
+/// anomaly — with kind, reason, and queue-order age; `stale` marks
+/// holds aged past the event-sequence threshold.
+#[test]
+fn outbox_holds_reports_held_intents_with_kind_and_age() {
+    let store = SqliteStore::in_memory(2).unwrap();
+    let (w1, _e1) = submit(&store, "h1");
+    let (w2, _e2) = submit(&store, "h2");
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::RecordOutboxHold {
+                action_id: "act-held".into(),
+                work_id: w1.clone(),
+                hold_kind: OutboxHoldKind::Skipped,
+                reason: "host_mismatch".into(),
+            })?;
+            // Age act-held's row past the threshold; act-blocked's is
+            // fresh. Re-recording preserves since_seq and advances
+            // last_seen_seq — one continuously aged row.
+            for _ in 0..4 {
+                tx.alloc_seq()?;
+            }
+            tx.apply(&Effect::RecordOutboxHold {
+                action_id: "act-held".into(),
+                work_id: w1.clone(),
+                hold_kind: OutboxHoldKind::Skipped,
+                reason: "host_mismatch".into(),
+            })?;
+            tx.apply(&Effect::RecordOutboxHold {
+                action_id: "act-blocked".into(),
+                work_id: w2.clone(),
+                hold_kind: OutboxHoldKind::CredentialBlocked,
+                reason: "credential.unresolvable".into(),
+            })?;
+            Ok(())
+        })
+        .unwrap();
+    let bounds = CensusBounds {
+        item_limit: 100,
+        deferral_age_events: 2,
+    };
+    let c = census_with(&store, &bounds);
+    let section = &c.outbox_holds;
+    assert_eq!(section.items.len(), 2, "{section:?}");
+    let held = section
+        .items
+        .iter()
+        .find(|i| i.action_id == "act-held")
+        .unwrap();
+    assert_eq!(held.work_id, w1);
+    assert_eq!(held.kind, OutboxHoldKind::Skipped);
+    assert_eq!(held.reason, "host_mismatch");
+    assert!(held.stale);
+    assert!(held.last_seen_seq > held.since_seq);
+    let blocked = section
+        .items
+        .iter()
+        .find(|i| i.action_id == "act-blocked")
+        .unwrap();
+    assert_eq!(blocked.kind, OutboxHoldKind::CredentialBlocked);
+    assert_eq!(blocked.reason, "credential.unresolvable");
+    assert!(!blocked.stale);
+    assert_eq!(section.context.as_ref().unwrap()["holds_total"], 2);
+}
+
 #[test]
 fn source_gate_holds_and_human_judgment_waits_surface() {
     let store = SqliteStore::in_memory(2).unwrap();
@@ -878,6 +944,19 @@ fn every_detector_is_individually_bounded() {
         open_change(&store, &work_id, object, NOW);
         seal_review(&store, &work_id, object, &["f"], Some(&eid), NOW);
     }
+    store
+        .transact(|tx| {
+            for i in 0..3 {
+                tx.apply(&Effect::RecordOutboxHold {
+                    action_id: format!("hold-{i}"),
+                    work_id: work_id.clone(),
+                    hold_kind: OutboxHoldKind::Skipped,
+                    reason: "host_mismatch".into(),
+                })?;
+            }
+            Ok(())
+        })
+        .unwrap();
     let bounds = CensusBounds {
         item_limit: 2,
         deferral_age_events: 256,
@@ -888,6 +967,7 @@ fn every_detector_is_individually_bounded() {
     assert_eq!(c.orphaned_findings.limit, 2);
     assert_eq!(c.parked_selector_starvation.limit, 2);
     assert_eq!(c.source_gate_holds.limit, 2);
+    assert_eq!(c.outbox_holds.limit, 2);
     // judgment_waits carries 3 unjudged rounds (cap 2).
     assert_eq!(c.judgment_waits.items.len(), 2);
     assert_eq!(c.judgment_waits.total, 3);
@@ -896,6 +976,10 @@ fn every_detector_is_individually_bounded() {
     assert_eq!(c.orphaned_findings.items.len(), 2);
     assert_eq!(c.orphaned_findings.total, 3);
     assert!(c.orphaned_findings.truncated);
+    // outbox_holds carries 3 recorded holds (cap 2).
+    assert_eq!(c.outbox_holds.items.len(), 2);
+    assert_eq!(c.outbox_holds.total, 3);
+    assert!(c.outbox_holds.truncated);
 }
 
 #[test]
