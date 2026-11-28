@@ -32,14 +32,19 @@ jobs:
     name: analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
 
-    # Pull requests from forks get a read-only GITHUB_TOKEN, so the
-    # SARIF upload (security-events: write) cannot succeed — skip rather
-    # than fail noisily. Dependabot-authored PRs are same-repo branches,
-    # but Dependabot-triggered runs get the same read-only token (and
-    # re-runs keep it), so they are skipped by PR author as well.
-    # Pushes to main and the nightly schedule still scan everything
-    # that lands, including merged Dependabot changes.
-    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]') }}
+    # Pull requests from forks and Dependabot-triggered runs both get a
+    # read-only GITHUB_TOKEN, so their SARIF upload (security-events:
+    # write) can never succeed — but the analysis itself needs no
+    # token. Every pull request therefore still runs the full scan
+    # before merge; only the result delivery differs. Restricted runs
+    # write the SARIF out and keep it as a plain workflow artifact
+    # instead of posting it to Code Scanning, while push-to-main and
+    # the nightly run keep uploading everything that lands — including
+    # merged Dependabot changes.
+    # The capability check keys on PR author, not actor — Dependabot-authored
+    # PRs keep the read-only token even when a human re-runs the job.
+    env:
+      CAN_UPLOAD_SARIF: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]') }}
 
     permissions:
       contents: read
@@ -86,3 +91,25 @@ jobs:
         uses: github/codeql-action/analyze@915412ff23e8b7659517e607487dbeae018f2934 # v4.39.5
         with:
           category: /language:${{ matrix.language }}
+          # The SARIF upload is what needs security-events: write, so
+          # on token-restricted runs it is skipped outright rather than
+          # failing at the code-scanning endpoint; the file is kept as
+          # a run artifact by the next step instead.
+          output: ${{ github.workspace }}/codeql-sarif
+          upload: ${{ env.CAN_UPLOAD_SARIF == 'true' && 'always' || 'never' }}
+          # With nothing uploaded there is nothing to wait on — the
+          # poll would also run against the same restricted endpoint.
+          wait-for-processing: ${{ env.CAN_UPLOAD_SARIF }}
+
+      # Artifact upload runs on the runtime token, not GITHUB_TOKEN, so
+      # it works under the read-only permissions fork and Dependabot
+      # runs get. if-no-files-found fails loudly when analyze produced
+      # no SARIF — a silent pass would hide a broken scan.
+      - name: Keep SARIF as a run artifact
+        if: env.CAN_UPLOAD_SARIF != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: codeql-sarif-${{ matrix.language }}
+          path: ${{ github.workspace }}/codeql-sarif
+          if-no-files-found: error
+          retention-days: 14
