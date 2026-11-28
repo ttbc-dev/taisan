@@ -2765,6 +2765,127 @@ fn a_conflict_binding_the_pre_pin_row_is_retryable() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Two supervisors backfilling the same pre-pin row must not lose an
+/// update: the transaction that pins first wins and the stale pass is a
+/// retryable conflict — it never overwrites the winner's pin with its
+/// own stale placement, and it records no local evidence. The next pass
+/// resolves the durable pin, not the live layout (#506 follow-up
+/// review).
+#[test]
+fn a_concurrent_pin_backfill_is_not_overwritten() {
+    use std::cell::Cell;
+    use workloop_core::store::TxView;
+
+    struct PinOnNth<'a> {
+        inner: &'a SqliteStore,
+        artifact_id: String,
+        winner: VerificationPlacement,
+        calls: Cell<usize>,
+        pin_at: usize,
+    }
+    impl Store for PinOnNth<'_> {
+        fn transact<R>(
+            &self,
+            f: impl FnOnce(&mut dyn TxView) -> Result<R, StoreError>,
+        ) -> Result<R, StoreError> {
+            let call = self.calls.get() + 1;
+            self.calls.set(call);
+            if call == self.pin_at {
+                // A racing supervisor pins the row between this pass's
+                // read and its backfill.
+                self.inner.transact(|tx| {
+                    let mut row = tx
+                        .artifact_handoff(&self.artifact_id)?
+                        .expect("the legacy row exists");
+                    let expected_seq = row.recorded_seq;
+                    row.verification_placement = Some(self.winner.clone());
+                    tx.apply(&Effect::UpsertHandoff {
+                        handoff: row,
+                        expected_seq,
+                    })
+                })?;
+            }
+            self.inner.transact(f)
+        }
+    }
+
+    let root = tmp_root("verify-pin-lost-update");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-pin-lost-update");
+    let (layout, ws_dir) = layout(&root, &w);
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-pin-lost-update");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+
+    // Acknowledge with no declared argv, then rewind the row so it is
+    // exactly the pre-pin shape: no placement and no verification.
+    handoff::drive(
+        &store,
+        &layout,
+        &aid,
+        &seed(&invocation, &w, &base),
+        3,
+        &Ok(None),
+        &mut || 0,
+    )
+    .unwrap();
+    let mut legacy = row(&store, &aid).unwrap();
+    legacy.verification_placement = None;
+    persist(&store, &legacy);
+
+    let winner = VerificationPlacement {
+        target: workloop_core::placement::PlacementTarget::Remote,
+        executor: "edge-1".into(),
+    };
+    // Reads the row (1), reads its results (2), then pins concurrently
+    // before the losing backfill (3).
+    let racing = PinOnNth {
+        inner: &store,
+        artifact_id: aid.clone(),
+        winner: winner.clone(),
+        calls: Cell::new(0),
+        pin_at: 3,
+    };
+    let mut s = seed(&invocation, &w, &base);
+    s.verification_argv = vec![vec!["true".into()]];
+    let returned = handoff::drive(&racing, &layout, &aid, &s, 3, &Ok(None), &mut || 0)
+        .expect("a lost pin backfill is retryable, not a sweep abort");
+    assert_eq!(
+        returned
+            .verification_placement
+            .as_ref()
+            .map(|p| p.executor.as_str()),
+        Some("local"),
+        "the losing pass carries its would-be pin"
+    );
+    assert_eq!(
+        row(&store, &aid).unwrap().verification_placement,
+        Some(winner.clone()),
+        "the first pin is never overwritten by the stale pass"
+    );
+    assert!(
+        store
+            .transact(|tx| tx.verification_results(&aid))
+            .unwrap()
+            .is_empty(),
+        "the losing pass records no local evidence"
+    );
+
+    // The next pass resolves the durable remote pin even though the
+    // live layout is local: it records the remote-pending marker, never
+    // a local result.
+    handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].result, VerificationOutcome::Inconclusive);
+    assert_eq!(
+        results[0].environment_digest,
+        handoff::placement_bound_marker("edge-1")
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Backfilling the pin on a legacy row must not advance its
 /// `recorded_seq`: that sequence is the recency order
 /// `latest_acknowledged_handoff` uses to pick a Work's predecessor

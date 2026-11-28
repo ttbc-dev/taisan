@@ -444,12 +444,30 @@ fn resolve_verification_placement(
 /// `recorded_seq` orders a Work's acknowledged handoffs — the newest
 /// produced commit a follow-on role binds — so re-writing a legacy row
 /// must not promote its older produced commit above a newer artifact.
-/// The write still uses the row's compare-and-set: a row actually
-/// advanced concurrently keeps its new seq and this becomes a retryable
-/// conflict instead of regressing the row.
+///
+/// Because the seq is deliberately not bumped, the compare-and-set alone
+/// cannot stop two supervisors from both backfilling the same legacy
+/// row. The write is therefore also guarded on `verification_placement`
+/// still being absent: the read and the conditional write share one
+/// transaction, so whichever supervisor pins first wins and the loser
+/// gets a retryable conflict (re-reading the winner's pin next pass)
+/// instead of overwriting it with a stale placement. Without that
+/// second guard a stale `Local` resolution could erase a concurrent
+/// remote pin and silently run local verification.
 fn persist_pin(store: &impl Store, handoff: &mut ArtifactHandoff) -> Result<(), StoreError> {
     let expected_seq = handoff.recorded_seq;
     store.transact(|tx| {
+        let still_unpinned = tx
+            .artifact_handoff(&handoff.artifact_id)?
+            .is_some_and(|row| row.verification_placement.is_none());
+        if !still_unpinned {
+            return Err(StoreError::ConstraintConflict {
+                detail: format!(
+                    "artifact_handoffs {} was pinned or advanced concurrently",
+                    handoff.artifact_id
+                ),
+            });
+        }
         tx.apply(&Effect::UpsertHandoff {
             handoff: handoff.clone(),
             expected_seq,
