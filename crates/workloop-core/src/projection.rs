@@ -424,10 +424,16 @@ fn attention_views(
     // suppression: while `stopping`/`uncertain` nothing else names the
     // fence at all, and while `paused` the reservation a fence holds
     // is exactly what the operator is deciding.
-    if matches!(
-        execution.state,
-        ExecutionState::Paused | ExecutionState::Stopping | ExecutionState::Uncertain
-    ) {
+    // The states a fence parks — plus any execution still carrying a
+    // recorded desire the fence could not override: a held execution
+    // never moves, but the fence decision on its ledger must surface or
+    // the writer's reservation is invisible while the desire waits.
+    if !execution.state.is_terminal()
+        && (matches!(
+            execution.state,
+            ExecutionState::Paused | ExecutionState::Stopping | ExecutionState::Uncertain
+        ) || execution.desired_action.is_some())
+    {
         for decision in tx.recovery_decisions(work_id)? {
             if decision.execution_id.as_ref() != Some(&execution.id)
                 || decision.classification != "remote_fence"

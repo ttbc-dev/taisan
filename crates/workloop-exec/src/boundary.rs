@@ -1146,7 +1146,17 @@ mod tests {
             "a live owner's in-progress staging sibling survives the sweep"
         );
         drop(lock);
-        boundary.ensure().unwrap();
+        // The sweep's claim probe fails toward keeping — a transient
+        // open or flock error keeps the entry for the next pass, so a
+        // released claim's reclaim is eventual, not synchronous to the
+        // release.
+        for _ in 0..5 {
+            boundary.ensure().unwrap();
+            if !live.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(
             !live.exists(),
             "an owner that released the claim leaves reclaimable residue"

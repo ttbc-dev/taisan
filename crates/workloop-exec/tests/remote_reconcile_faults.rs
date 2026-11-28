@@ -19,7 +19,9 @@ use workloop_core::executor::{
     OperationKind,
 };
 use workloop_core::identity::*;
-use workloop_core::observation::RemoteFenceClass;
+use workloop_core::observation::{
+    DeliveryId, DeliveryScope, Observation, ObservationFact, RemoteFenceClass,
+};
 use workloop_core::store::{Effect, Store};
 use workloop_core::work::{HostTemplate, WorkloopConfig, handle_command};
 use workloop_exec::remote_reconcile::{
@@ -489,6 +491,29 @@ fn rig(tag: &str) -> SqliteStore {
     SqliteStore::open(&tmp_root(tag).join("store.db"), 1).unwrap()
 }
 
+/// Land an observation under a chosen delivery id — used to poison a
+/// deterministic `remote_reconcile` delivery id with different fact
+/// content, so the ingest dedup refuses the real report.
+fn land_observation(store: &SqliteStore, seeded: &Seeded, event_id: &str, fact: ObservationFact) {
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::InsertObservation {
+                observation: Observation {
+                    delivery: Some(DeliveryId {
+                        scope: DeliveryScope::Local,
+                        source: "remote_reconcile".into(),
+                        event_id: event_id.into(),
+                    }),
+                    subject_work_id: Some(seeded.work_id.clone()),
+                    subject_execution_id: Some(seeded.execution_id.clone()),
+                    fact,
+                    observed_unix_seconds: NOW,
+                },
+            })
+        })
+        .unwrap();
+}
+
 // =====================================================================
 // The fault matrix
 // =====================================================================
@@ -616,6 +641,99 @@ fn fenced_request_mints_nothing() {
     );
 }
 
+/// A fence is a freeze, not a skip: durable unreceipted work would
+/// replay under any other cursor, but under a fence the replay stage
+/// never runs — nothing reaches the wire (contract §14).
+#[test]
+fn fenced_request_replays_nothing() {
+    let store = rig("fenced-replay");
+    let seeded = seed(&store, "fenced-replay", INCARNATION);
+    set_exec_state(&store, &seeded, ExecutionState::Running);
+    live_writer(&store, &seeded);
+    // A recorded-but-unanswered stop intent — durable work the replay
+    // stage would otherwise re-issue verbatim.
+    record_command(&store, &seeded, OperationKind::RequestStop, 1, json!({}));
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpsertExecutorReconcile {
+                cursor: ExecutorReconcile {
+                    request_id: seeded.request_id.clone(),
+                    consecutive_faults: 0,
+                    fenced_class: Some("unanswerable".into()),
+                    next_attempt_unix_ms: 0,
+                    updated_seq: 1,
+                },
+                expected_seq: 0,
+            })
+        })
+        .unwrap();
+
+    let mut transport = FakeTransport::new(INCARNATION, vec![]);
+    let report = reconcile_once(&store, &config(), &mut transport, NOW).unwrap();
+
+    assert!(
+        transport.sent.is_empty(),
+        "a fenced request sends nothing — the recorded intent is not replayed"
+    );
+    assert_eq!(
+        report.fenced,
+        vec![(seeded.request_id.clone(), RemoteFenceClass::Unanswerable)]
+    );
+}
+
+/// The crash window between the fence commit and the fact ingest: the
+/// cursor is durably fenced but no `RemoteFence` observation exists.
+/// The fenced gate re-reports the fact under its recorded delivery id,
+/// and the named Attention surfaces on that pass.
+#[test]
+fn a_fence_without_its_fact_is_re_reported() {
+    let store = rig("lost-fact");
+    let seeded = seed(&store, "lost-fact", INCARNATION);
+    set_exec_state(&store, &seeded, ExecutionState::Running);
+    live_writer(&store, &seeded);
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpsertExecutorReconcile {
+                cursor: ExecutorReconcile {
+                    request_id: seeded.request_id.clone(),
+                    consecutive_faults: 0,
+                    fenced_class: Some("transport_exhausted".into()),
+                    next_attempt_unix_ms: 0,
+                    updated_seq: 1,
+                },
+                expected_seq: 0,
+            })
+        })
+        .unwrap();
+
+    let mut transport = FakeTransport::new(INCARNATION, vec![]);
+    let report = reconcile_once(&store, &config(), &mut transport, NOW).unwrap();
+
+    assert_eq!(
+        report.fenced,
+        vec![(
+            seeded.request_id.clone(),
+            RemoteFenceClass::TransportExhausted
+        )]
+    );
+    assert!(transport.sent.is_empty());
+    assert!(
+        fence_decisions(&store, &seeded.work_id)
+            .iter()
+            .any(|d| d.contains("transport_exhausted")),
+        "the re-reported fact lands the remote_fence decision"
+    );
+    assert_eq!(
+        attention_reasons(&store, &seeded.work_id),
+        vec!["remote_fence".to_string()]
+    );
+
+    // A second pass finds the fact already delivered — ingest dedup
+    // keeps the ledger at one decision, never a repeat.
+    let _ = reconcile_once(&store, &config(), &mut transport, NOW).unwrap();
+    assert_eq!(fence_decisions(&store, &seeded.work_id).len(), 1);
+}
+
 /// The endpoint rebooted: the responder incarnation differs from the
 /// binding's recorded incarnation while a writer may still be live.
 /// The recorded-identity probe cannot prove the writer gone — the
@@ -641,6 +759,134 @@ fn incarnation_change_fences_a_possibly_live_writer() {
         )]
     );
     assert_eq!(inv_state(&store, &seeded), InvocationState::Unknown);
+    assert_eq!(
+        attention_reasons(&store, &seeded.work_id),
+        vec!["remote_fence".to_string()]
+    );
+}
+
+/// A fence landing on an Execution already in `stopping` — the normal
+/// drive_stop case — still lands the `remote_fence` decision the named
+/// Attention derives from: the pause path cannot move the state, so
+/// the ledger carries the fence class instead.
+#[test]
+fn fence_on_a_stopping_execution_surfaces_the_named_attention() {
+    let store = rig("fence-stopping");
+    let seeded = seed(&store, "fence-stopping", INCARNATION);
+    set_exec_state(&store, &seeded, ExecutionState::Running);
+    live_writer(&store, &seeded);
+    set_exec_state(&store, &seeded, ExecutionState::Stopping);
+
+    let mut transport = FakeTransport::new(
+        "boot-2",
+        vec![Step::Answer(unknown("incarnation_mismatch"))],
+    );
+    let report = reconcile_once(&store, &config(), &mut transport, NOW).unwrap();
+
+    assert_eq!(
+        report.fenced,
+        vec![(
+            seeded.request_id.clone(),
+            RemoteFenceClass::IncarnationChanged
+        )]
+    );
+    assert_eq!(inv_state(&store, &seeded), InvocationState::Unknown);
+    assert!(
+        fence_decisions(&store, &seeded.work_id)
+            .iter()
+            .any(|d| d.contains("incarnation_changed")),
+        "the remote_fence decision lands even when the Execution cannot be moved"
+    );
+    assert_eq!(
+        attention_reasons(&store, &seeded.work_id),
+        vec!["remote_fence".to_string()]
+    );
+}
+
+/// The same ledger-only shape on a `Paused` Execution: the fence fact
+/// never disturbs the recorded pause, but the decision and the named
+/// Attention still land.
+#[test]
+fn fence_on_a_paused_execution_records_the_decision() {
+    let store = rig("fence-paused");
+    let seeded = seed(&store, "fence-paused", INCARNATION);
+    set_exec_state(&store, &seeded, ExecutionState::Running);
+    live_writer(&store, &seeded);
+    set_exec_state(&store, &seeded, ExecutionState::Paused);
+
+    let mut transport = FakeTransport::new(
+        "boot-2",
+        vec![Step::Answer(unknown("incarnation_mismatch"))],
+    );
+    let report = reconcile_once(&store, &config(), &mut transport, NOW).unwrap();
+
+    assert_eq!(
+        report.fenced,
+        vec![(
+            seeded.request_id.clone(),
+            RemoteFenceClass::IncarnationChanged
+        )]
+    );
+    assert_eq!(
+        exec_state(&store, &seeded.execution_id),
+        ExecutionState::Paused,
+        "the recorded pause is never disturbed"
+    );
+    assert!(
+        fence_decisions(&store, &seeded.work_id)
+            .iter()
+            .any(|d| d.contains("incarnation_changed"))
+    );
+    assert_eq!(
+        attention_reasons(&store, &seeded.work_id),
+        vec!["paused_judgment".to_string(), "remote_fence".to_string()],
+        "the recorded pause and the fence both name their attention"
+    );
+}
+
+/// A live Execution carrying a recorded desire (a human's Cancel) is
+/// "held": the fence fact lands the decision on the ledger without
+/// moving the state or overriding the recorded desire.
+#[test]
+fn fence_on_a_held_execution_records_the_decision_without_moving_it() {
+    let store = rig("fence-held");
+    let seeded = seed(&store, "fence-held", INCARNATION);
+    set_exec_state(&store, &seeded, ExecutionState::Running);
+    live_writer(&store, &seeded);
+    store
+        .transact(|tx| {
+            let mut execution = tx.execution(&seeded.execution_id)?.unwrap();
+            execution.desired_action = Some(DesiredAction::Cancel);
+            tx.apply(&Effect::UpdateExecution {
+                execution,
+                expected_state: ExecutionState::Running,
+            })
+        })
+        .unwrap();
+
+    let mut transport = FakeTransport::new(
+        "boot-2",
+        vec![Step::Answer(unknown("incarnation_mismatch"))],
+    );
+    let report = reconcile_once(&store, &config(), &mut transport, NOW).unwrap();
+
+    assert_eq!(
+        report.fenced,
+        vec![(
+            seeded.request_id.clone(),
+            RemoteFenceClass::IncarnationChanged
+        )]
+    );
+    assert_eq!(
+        exec_state(&store, &seeded.execution_id),
+        ExecutionState::Running,
+        "the held Execution is never moved"
+    );
+    assert!(
+        fence_decisions(&store, &seeded.work_id)
+            .iter()
+            .any(|d| d.contains("incarnation_changed"))
+    );
     assert_eq!(
         attention_reasons(&store, &seeded.work_id),
         vec!["remote_fence".to_string()]
@@ -794,6 +1040,18 @@ fn ignored_signals_fence_unanswerable() {
             .as_deref(),
         Some("unanswerable")
     );
+    // The fence landed on a `stopping` Execution — the named Attention
+    // still surfaces through the recorded remote_fence decision.
+    assert!(
+        fence_decisions(&store, &seeded.work_id)
+            .iter()
+            .any(|d| d.contains("unanswerable")),
+        "a remote_fence decision names the class"
+    );
+    assert_eq!(
+        attention_reasons(&store, &seeded.work_id),
+        vec!["remote_fence".to_string()]
+    );
 }
 
 /// Unverifiable liveness under the running drive: `unknown` answers
@@ -850,6 +1108,188 @@ fn conflicting_replay_fences() {
             seeded.request_id.clone(),
             RemoteFenceClass::ConflictingReplay
         )]
+    );
+}
+
+/// A local replay conflict — the stop drive re-mints a durable intent
+/// under an operation id the ledger already holds with different bytes
+/// — is the documented `ledger_conflict` fence, and the contested
+/// request never blocks the pass for the other bindings.
+#[test]
+fn a_conflicting_ledger_write_fences_only_the_contested_request() {
+    let store = rig("ledger-conflict");
+    let contested = seed(&store, "contested", INCARNATION);
+    set_exec_state(&store, &contested, ExecutionState::Running);
+    live_writer(&store, &contested);
+    set_exec_state(&store, &contested, ExecutionState::Stopping);
+    // The stop drive mints `request_stop:2` — the ledger already holds
+    // that id with different bytes, so the mint conflicts.
+    let colliding = record_command(
+        &store,
+        &contested,
+        OperationKind::RequestStop,
+        2,
+        json!({"bogus": true}),
+    );
+    attach_receipt(
+        &store,
+        &colliding,
+        INCARNATION,
+        json!({"status": "stop_requested"}),
+    );
+
+    let healthy = seed(&store, "healthy", INCARNATION);
+    set_exec_state(&store, &healthy, ExecutionState::Running);
+    live_writer(&store, &healthy);
+
+    let mut transport = FakeTransport::new(INCARNATION, vec![Step::Answer(running())]);
+    let report = reconcile_once(&store, &config(), &mut transport, NOW).unwrap();
+
+    assert_eq!(
+        report.fenced,
+        vec![(
+            contested.request_id.clone(),
+            RemoteFenceClass::LedgerConflict
+        )]
+    );
+    assert_eq!(
+        cursor(&store, &contested.request_id)
+            .unwrap()
+            .fenced_class
+            .as_deref(),
+        Some("ledger_conflict")
+    );
+    assert_eq!(
+        report.adopted,
+        vec![healthy.request_id.clone()],
+        "the contested request never blocks the pass"
+    );
+}
+
+/// A `RemoteFence` fact write the ingest refuses (its deterministic
+/// delivery id already holds different content) does not abort the
+/// pass: the fence itself lands durably and the failure counts
+/// against the fenced request alone.
+#[test]
+fn a_failed_fence_fact_still_fences_and_frees_the_pass() {
+    let store = rig("fact-fail");
+    let contested = seed(&store, "contested", INCARNATION);
+    seeded_start(&store, &contested, None); // unreceipted start
+    // Poison the fence fact's deterministic delivery id — a different
+    // fact under `rec:<req>:fence:conflicting_replay` makes the real
+    // report a refused reuse.
+    land_observation(
+        &store,
+        &contested,
+        &format!("rec:{}:fence:conflicting_replay", contested.request_id),
+        ObservationFact::RemoteFence {
+            request_id: contested.request_id.clone(),
+            invocation_id: None,
+            class: RemoteFenceClass::Unanswerable,
+            detail: "a fact other than the fence this pass emits".into(),
+        },
+    );
+
+    let healthy = seed(&store, "healthy", INCARNATION);
+    set_exec_state(&store, &healthy, ExecutionState::Running);
+    live_writer(&store, &healthy);
+
+    let mut transport = FakeTransport::new(
+        INCARNATION,
+        vec![
+            // The contested request's replayed start is refused as a
+            // conflicting replay — emit_fence fires.
+            Step::Answer(refused("conflicting_replay")),
+            Step::Answer(running()),
+        ],
+    );
+    let report = reconcile_once(&store, &config(), &mut transport, NOW).unwrap();
+
+    // The fence is durable and reported even though its fact write was
+    // refused — the refusal counts as this request's fault.
+    assert_eq!(
+        report.fenced,
+        vec![(
+            contested.request_id.clone(),
+            RemoteFenceClass::ConflictingReplay
+        )]
+    );
+    assert_eq!(
+        cursor(&store, &contested.request_id)
+            .unwrap()
+            .fenced_class
+            .as_deref(),
+        Some("conflicting_replay")
+    );
+    assert!(
+        report
+            .faults
+            .iter()
+            .any(|(id, d)| id == &contested.request_id && d.contains("fence fact")),
+        "the refused fact write reports as a per-request fault"
+    );
+    assert_eq!(
+        report.adopted,
+        vec![healthy.request_id.clone()],
+        "the refused fact write never blocks the pass"
+    );
+}
+
+/// A typed per-request fault — an ingest that rejects a fact the
+/// reconcile pass reports — defers only its request: the pass
+/// reconciles every other binding.
+#[test]
+fn a_rejected_fact_report_defers_only_its_request() {
+    let store = rig("rejected-fact");
+    let contested = seed(&store, "contested", INCARNATION);
+    seeded_start(&store, &contested, None); // unreceipted start
+    // Poison the LaunchRefused fact's deterministic delivery id.
+    land_observation(
+        &store,
+        &contested,
+        &format!("rec:{}:refused:capability_missing", contested.request_id),
+        ObservationFact::RemoteFence {
+            request_id: contested.request_id.clone(),
+            invocation_id: None,
+            class: RemoteFenceClass::Unanswerable,
+            detail: "different content under the delivery id".into(),
+        },
+    );
+
+    let healthy = seed(&store, "healthy", INCARNATION);
+    set_exec_state(&store, &healthy, ExecutionState::Running);
+    live_writer(&store, &healthy);
+
+    let mut transport = FakeTransport::new(
+        INCARNATION,
+        vec![
+            // The replayed start is refused as a launch refusal — the
+            // pass reports LaunchRefused, which the poisoned ingest
+            // rejects as a delivery-id reuse.
+            Step::Answer(refused("capability_missing")),
+            Step::Answer(running()),
+        ],
+    );
+    let report = reconcile_once(&store, &config(), &mut transport, NOW).unwrap();
+
+    assert!(
+        report
+            .faults
+            .iter()
+            .any(|(id, d)| id == &contested.request_id && d.contains("rejected")),
+        "the rejected ingest defers its request as a reported fault"
+    );
+    assert!(
+        !report
+            .fenced
+            .iter()
+            .any(|(id, _)| id == &contested.request_id),
+        "a transient refusal takes no fence"
+    );
+    assert_eq!(
+        report.adopted,
+        vec![healthy.request_id.clone()],
+        "one request's fault never blocks the pass"
     );
 }
 
@@ -1039,6 +1479,37 @@ fn ensure_started_requires_prepared() {
         ensure_started(&store, &config(), &mut transport, &seeded.request_id, NOW).unwrap();
 
     assert_eq!(outcome, StartOutcome::Unprepared);
+    assert!(transport.sent.is_empty());
+}
+
+/// A fenced request sends nothing through `ensure_started` either —
+/// even a recorded-but-unreceipted start waits on the reconcile pass.
+#[test]
+fn ensure_started_refuses_a_fenced_request() {
+    let store = rig("ensure-fenced");
+    let seeded = seed(&store, "ensure-fenced", INCARNATION);
+    prepared(&store, &seeded);
+    seeded_start(&store, &seeded, None); // recorded, unanswered
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpsertExecutorReconcile {
+                cursor: ExecutorReconcile {
+                    request_id: seeded.request_id.clone(),
+                    consecutive_faults: 0,
+                    fenced_class: Some("transport_exhausted".into()),
+                    next_attempt_unix_ms: 0,
+                    updated_seq: 1,
+                },
+                expected_seq: 0,
+            })
+        })
+        .unwrap();
+
+    let mut transport = FakeTransport::new(INCARNATION, vec![]);
+    let outcome =
+        ensure_started(&store, &config(), &mut transport, &seeded.request_id, NOW).unwrap();
+
+    assert_eq!(outcome, StartOutcome::Fenced);
     assert!(transport.sent.is_empty());
 }
 

@@ -50,7 +50,7 @@ use workloop_core::executor::{
 use workloop_core::observation::{
     DeliveryId, DeliveryScope, Observation, ObservationFact, ProcessStateFact, RemoteFenceClass,
 };
-use workloop_core::store::{Effect, Store};
+use workloop_core::store::{Effect, Store, StoreError};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
 
 use crate::supervisor::ExecError;
@@ -175,6 +175,10 @@ pub enum StartOutcome {
     /// recorded incarnation — the endpoint restarted; a start under it
     /// is refused, and the reconcile pass fences the writer.
     ForeignIncarnation,
+    /// The request's reconcile cursor records a fence — a fenced
+    /// request mints and sends nothing (contract §14); the recorded
+    /// start question waits on the reconcile pass, never a wire send.
+    Fenced,
     /// No executor binding exists for the request — not a remote
     /// request at all.
     Unbound,
@@ -242,6 +246,17 @@ pub fn ensure_started(
             "executor binding {request_id} failed verification: {e}"
         ))
     })?;
+    // A fenced request mints and sends nothing (contract §14): the
+    // recorded start question waits on the reconcile pass, never a
+    // wire send.
+    if store
+        .transact(|tx| tx.executor_reconcile(request_id))?
+        .and_then(|c| c.fenced_class.as_deref().map(str::to_string))
+        .and_then(|c| RemoteFenceClass::parse(&c))
+        .is_some()
+    {
+        return Ok(StartOutcome::Fenced);
+    }
     if transport.session_incarnation() != fields.bound_incarnation_id {
         return Ok(StartOutcome::ForeignIncarnation);
     }
@@ -544,8 +559,91 @@ fn wants_run(state: &ExecutionState, desired: &Option<DesiredAction>) -> bool {
 // The per-request pass
 // ---------------------------------------------------------------------
 
+/// The conflicts contract §14 maps to `ledger_conflict`: a reconcile
+/// cursor CAS loss or a refused write on the executor operation
+/// ledger — a mint, a receipt attach, a binding check. A constraint
+/// refusal on any other surface — an ingest-side CAS inside
+/// `handle_observation`, another table's row check — is transient
+/// contention, never the durable ledger disagreement the fence is
+/// named for. The surface is named by the store's conflict detail,
+/// the same convention `is_dedupe_conflict` uses for the observations
+/// dedupe index.
+fn is_reconcile_ledger_conflict(detail: &str) -> bool {
+    [
+        "executor reconcile cursor",
+        "executor operation",
+        "executor command",
+        "executor binding",
+        "executor receipt",
+        "conflicting_replay",
+    ]
+    .iter()
+    .any(|prefix| detail.starts_with(prefix))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reconcile_one(
+    store: &impl Store,
+    config: &WorkloopConfig,
+    transport: &mut impl RemoteTransport,
+    session_incarnation: &str,
+    binding: &ExecutorBinding,
+    now_unix_seconds: i64,
+    report: &mut ReconcileReport,
+) -> Result<(), ExecError> {
+    let request_id = binding.request_id.clone();
+    match reconcile_one_inner(
+        store,
+        config,
+        transport,
+        session_incarnation,
+        binding,
+        now_unix_seconds,
+        report,
+    ) {
+        // A reconcile-ledger write refused by the store — a cursor CAS
+        // loss or a local replay conflict — is the documented
+        // `ledger_conflict` fence (contract §14): the contested
+        // request closes, the pass reconciles every other binding.
+        Err(ExecError::Store(StoreError::ConstraintConflict { detail }))
+            if is_reconcile_ledger_conflict(&detail) =>
+        {
+            emit_fence(
+                store,
+                config,
+                &request_id,
+                RemoteFenceClass::LedgerConflict,
+                &format!("reconcile write refused: {detail}"),
+                now_unix_seconds,
+                report,
+            )
+        }
+        // A constraint refusal on any other surface is transient
+        // contention, not a ledger disagreement: the request defers to
+        // the next pass as a reported fault — it never takes a
+        // permanent fence for a write the ledger did not refuse.
+        Err(ExecError::Store(StoreError::ConstraintConflict { detail })) => {
+            report.faults.push((
+                request_id,
+                format!("reconcile write contested outside the ledger: {detail}"),
+            ));
+            Ok(())
+        }
+        // A typed per-request fault — a rejected ingest, an
+        // unparseable durable row — defers this request the same way;
+        // one request's fault never aborts the pass. Store and IO
+        // failures still propagate: they are infrastructure, not one
+        // request's contention.
+        Err(ExecError::Fault(detail)) => {
+            report.faults.push((request_id, detail));
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_one_inner(
     store: &impl Store,
     config: &WorkloopConfig,
     transport: &mut impl RemoteTransport,
@@ -623,6 +721,35 @@ fn reconcile_one(
             report,
         )?;
         return reset_cursor(store, &request_id, &prior);
+    }
+
+    // --- durable fence: frozen, fact at-least-once ------------------------
+    // A fenced request mints and sends nothing (contract §14): no
+    // replay, no new operation — it waits only on the durable terminal
+    // adoption handled above. The RemoteFence fact is re-reported under
+    // its recorded delivery id: a crash between the fence commit and
+    // the fact write otherwise leaves the named Attention never
+    // emitted, and ingest dedup makes a landed fact a recorded
+    // duplicate.
+    if let Some(class) = prior
+        .as_ref()
+        .and_then(|c| c.fenced_class.as_deref())
+        .and_then(RemoteFenceClass::parse)
+    {
+        if let Some(request) = &request {
+            refence_fact(
+                store,
+                config,
+                request,
+                invocation.as_ref().map(|i| i.id.clone()),
+                class,
+                &request_id,
+                now_unix_seconds,
+                report,
+            )?;
+        }
+        report.fenced.push((request_id, class));
+        return Ok(());
     }
 
     // --- persisted backoff gate ------------------------------------------
@@ -1321,10 +1448,75 @@ fn count_fault(
     Ok(())
 }
 
-/// Emit the named fence: the cursor records the class durably, and a
-/// `RemoteFence` fact moves the Execution to its fail-closed hold.
-/// The deterministic delivery id makes a re-emitted fence a recorded
-/// duplicate, so fencing is idempotent across passes and restarts.
+/// The delivery id a `RemoteFence` fact is reported under — stable so
+/// a re-report dedupes against the fact the first fence emission wrote.
+fn fence_event_id(request_id: &str, class: RemoteFenceClass) -> String {
+    format!("rec:{request_id}:fence:{}", class.as_str())
+}
+
+/// Re-report the `RemoteFence` fact for an already-fenced request when
+/// no observation carries its delivery id — the repair path for a
+/// crash between the fence commit and the fact write (INV:
+/// fence-fact-at-least-once). A landed fact makes this a no-op; a
+/// re-report failure counts against this request, never the pass.
+#[allow(clippy::too_many_arguments)]
+fn refence_fact(
+    store: &impl Store,
+    config: &WorkloopConfig,
+    request: &InvocationRequest,
+    invocation_id: Option<InvocationId>,
+    class: RemoteFenceClass,
+    request_id: &str,
+    now_unix_seconds: i64,
+    report: &mut ReconcileReport,
+) -> Result<(), ExecError> {
+    let event_id = fence_event_id(request_id, class);
+    let delivered = store.transact(|tx| {
+        Ok(tx.observations_for_work(&request.work_id)?.iter().any(|o| {
+            o.delivery.as_ref().is_some_and(|d| {
+                d.scope == DeliveryScope::Local
+                    && d.source == "remote_reconcile"
+                    && d.event_id == event_id
+            })
+        }))
+    })?;
+    if delivered {
+        return Ok(());
+    }
+    if let Err(e) = report_fact(
+        store,
+        config,
+        request,
+        ObservationFact::RemoteFence {
+            request_id: request_id.to_string(),
+            invocation_id,
+            class,
+            detail: format!(
+                "remote fence {} fact re-reported by a later reconcile pass",
+                class.as_str()
+            ),
+        },
+        event_id,
+        now_unix_seconds,
+    ) {
+        report.faults.push((
+            request_id.to_string(),
+            format!("fence fact re-report failed: {e}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Emit the named fence: the cursor records the class durably first —
+/// a fenced request stays fenced — then the `RemoteFence` fact moves
+/// the Execution to its fail-closed hold. A crash between the two
+/// leaves the cursor fenced with no fact, repaired by the fenced
+/// gate's re-report on every later pass. A cursor CAS loss is a ledger
+/// disagreement resolved against the durable row: the stored class
+/// wins when the racing write fenced, otherwise the fence is retried
+/// once and otherwise deferred to the next pass — the conflict never
+/// propagates past the request that raised it, and a fact-write
+/// failure counts against this request alone.
 fn emit_fence(
     store: &impl Store,
     config: &WorkloopConfig,
@@ -1334,24 +1526,49 @@ fn emit_fence(
     now_unix_seconds: i64,
     report: &mut ReconcileReport,
 ) -> Result<(), ExecError> {
-    let prior = store.transact(|tx| tx.executor_reconcile(request_id))?;
-    let expected = prior.as_ref().map_or(0, |c| c.updated_seq);
-    store.transact(|tx| {
-        tx.apply(&Effect::UpsertExecutorReconcile {
-            cursor: ExecutorReconcile {
-                request_id: request_id.to_string(),
-                consecutive_faults: 0,
-                fenced_class: Some(class.as_str().to_string()),
-                next_attempt_unix_ms: 0,
-                updated_seq: expected + 1,
-            },
-            expected_seq: expected,
-        })
-    })?;
+    let mut attempts = 0usize;
+    loop {
+        let prior = store.transact(|tx| tx.executor_reconcile(request_id))?;
+        if let Some(fenced) = prior
+            .as_ref()
+            .and_then(|c| c.fenced_class.as_deref())
+            .and_then(RemoteFenceClass::parse)
+        {
+            // A racing write fenced first — the durable class wins.
+            report.fenced.push((request_id.to_string(), fenced));
+            return Ok(());
+        }
+        let expected = prior.as_ref().map_or(0, |c| c.updated_seq);
+        match store.transact(|tx| {
+            tx.apply(&Effect::UpsertExecutorReconcile {
+                cursor: ExecutorReconcile {
+                    request_id: request_id.to_string(),
+                    consecutive_faults: 0,
+                    fenced_class: Some(class.as_str().to_string()),
+                    next_attempt_unix_ms: 0,
+                    updated_seq: expected + 1,
+                },
+                expected_seq: expected,
+            })
+        }) {
+            Ok(()) => break,
+            Err(StoreError::ConstraintConflict { .. }) => {
+                attempts += 1;
+                if attempts >= 2 {
+                    report.faults.push((
+                        request_id.to_string(),
+                        "reconcile cursor contested; fence deferred to the next pass".into(),
+                    ));
+                    return Ok(());
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
     let request = store.transact(|tx| tx.request(request_id))?;
     let invocation = store.transact(|tx| tx.invocation_for_request(request_id))?;
-    if let Some(request) = request {
-        report_fact(
+    if let Some(request) = request
+        && let Err(e) = report_fact(
             store,
             config,
             &request,
@@ -1361,9 +1578,14 @@ fn emit_fence(
                 class,
                 detail: detail.to_string(),
             },
-            format!("rec:{request_id}:fence:{}", class.as_str()),
+            fence_event_id(request_id, class),
             now_unix_seconds,
-        )?;
+        )
+    {
+        report.faults.push((
+            request_id.to_string(),
+            format!("fence fact not reported: {e}"),
+        ));
     }
     report.fenced.push((request_id.to_string(), class));
     Ok(())

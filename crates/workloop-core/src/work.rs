@@ -2929,17 +2929,49 @@ fn assess(
             if let Some(invocation_id) = invocation_id {
                 mark_invocation(tx, invocation_id, |_| InvocationState::Unknown)?;
             }
-            if execution.desired_action.is_none()
-                || execution.desired_action == Some(DesiredAction::Continue)
-            {
+            let detail = format!("repair: remote fence {}: {detail}", class.as_str());
+            let unheld = execution.desired_action.is_none()
+                || execution.desired_action == Some(DesiredAction::Continue);
+            let movable = matches!(
+                execution.state,
+                ExecutionState::Queued
+                    | ExecutionState::Ready
+                    | ExecutionState::Running
+                    | ExecutionState::Waiting
+                    | ExecutionState::Uncertain
+            );
+            if unheld && movable {
                 pause_for_repair(
                     tx,
                     &execution,
                     "remote_fence",
-                    &format!("repair: remote fence {}: {detail}", class.as_str()),
+                    &detail,
                     vec![RepairPrerequisite::OperatorDecision],
                     now_unix_seconds,
                 )?;
+            } else if !execution.state.is_terminal() {
+                // An Execution already on its recorded stop/pause path —
+                // or carrying a recorded desire — is never moved, but the
+                // fence decision still lands on the ledger, or the named
+                // Attention has nothing to derive from (the same rule
+                // `escalate_conflict` applies to a human-held pause).
+                let usage = tx
+                    .work_usage(&execution.work_id)?
+                    .unwrap_or_else(|| WorkUsage::new(&execution.work_id));
+                let seq = tx.alloc_seq()?;
+                tx.apply(&Effect::InsertRecoveryDecision {
+                    decision: RecoveryDecision {
+                        id: new_id("rd"),
+                        work_id: execution.work_id.clone(),
+                        execution_id: Some(execution.id.clone()),
+                        classification: "remote_fence".into(),
+                        signature: None,
+                        prerequisites: vec![RepairPrerequisite::OperatorDecision],
+                        detail,
+                        usage_after: serde_json::to_value(&usage).unwrap_or_default(),
+                        seq,
+                    },
+                })?;
             }
             Ok(())
         }

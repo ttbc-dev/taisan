@@ -590,7 +590,7 @@ fn a_previous_format_store_missing_reclaim_tables_is_upgraded_in_place() {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            version, 19,
+            version, 20,
             "the stamp-4 upgrade lands on the current format"
         );
     }
