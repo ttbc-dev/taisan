@@ -1906,6 +1906,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         } else {
             Ok(None)
         };
+        let mut placement_conflict: Option<String> = None;
         for (artifact_id, seed, bound) in seeds {
             if deadline_reached(clock, deadline) {
                 break;
@@ -1933,13 +1934,22 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 }
                 Err(crate::handoff::HandoffError::Transport(_)) => {}
                 Err(crate::handoff::HandoffError::PlacementConflict(detail)) => {
-                    return Err(ExecError::Fault(detail));
+                    // A permanent conflict on one artifact must not starve
+                    // every later seed on every tick: keep driving the rest
+                    // of the pass, then surface the first conflict (retrying
+                    // cannot heal it).
+                    if placement_conflict.is_none() {
+                        placement_conflict = Some(detail);
+                    }
                 }
                 Err(crate::handoff::HandoffError::Store(e)) => {
                     return Err(ExecError::Store(e));
                 }
                 Err(crate::handoff::HandoffError::Io(e)) => return Err(ExecError::Io(e)),
             }
+        }
+        if let Some(detail) = placement_conflict {
+            return Err(ExecError::Fault(detail));
         }
         Ok(())
     }

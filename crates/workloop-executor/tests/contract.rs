@@ -1186,9 +1186,11 @@ fn service_fixture_state(dir: &Path) -> EndpointState {
 #[test]
 fn the_executor_enforces_the_authorized_runtime_itself() {
     let fx = fixture("deadline-enforce");
-    // Deadline ~1s out: with zero uncertainty/delay the conservative
-    // interval is positive at start, then expires.
-    let config = launch_config(now_seconds() + 1);
+    // Far enough out to start, close enough to expire in-test. The
+    // deadline is checked after start, not raced against the second
+    // boundary the way a `now_seconds() + 1` window was.
+    let deadline = now_seconds() + 2;
+    let config = launch_config(deadline);
     let receipt = issue(
         &fx.service,
         "op-prepare",
@@ -1211,7 +1213,9 @@ fn the_executor_enforces_the_authorized_runtime_itself() {
     .expect("receipt");
     assert_eq!(receipt.result["status"], "started");
 
-    std::thread::sleep(std::time::Duration::from_millis(1400));
+    while now_ms() <= deadline * 1000 {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
     let receipt =
         issue(&fx.service, "op-observe", OperationKind::Observe, json!({})).expect("observe");
     // The executor stopped it under the bound deadline — the worker

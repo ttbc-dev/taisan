@@ -380,8 +380,22 @@ pub fn drive(
         }
         return Err(e);
     }
-    if handoff.state == HandoffState::Acknowledged {
-        run_verifications(store, layout, &mut handoff, seed, credential_source, clock)?;
+    if handoff.state == HandoffState::Acknowledged
+        && let Err(e) =
+            run_verifications(store, layout, &mut handoff, seed, credential_source, clock)
+    {
+        // Binding a pre-pin row and recording a verification result
+        // both write with the same compare-and-set as `advance`. A
+        // concurrent supervisor winning that write is retryable:
+        // the sweep re-reads the row next pass instead of aborting
+        // this one.
+        if matches!(
+            e,
+            HandoffError::Store(StoreError::ConstraintConflict { .. })
+        ) {
+            return Ok(handoff);
+        }
+        return Err(e);
     }
     Ok(handoff)
 }
