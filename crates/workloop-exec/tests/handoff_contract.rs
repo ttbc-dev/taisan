@@ -51,6 +51,7 @@ fn repo() -> RepositoryRef {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),
@@ -215,6 +216,8 @@ fn layout(root: &Path, work_id: &WorkId) -> (HandoffLayout, PathBuf) {
             out_root,
             state_root: None,
             verification: None,
+            verification_placement: workloop_core::placement::PlacementTarget::Local,
+            remote_verification_executor: None,
         },
         ws_root.join(format!("ws-{}", work_id.0)),
     )
@@ -741,6 +744,8 @@ fn only_a_proven_dead_invocation_exports() {
         out_root: root.join("out"),
         state_root: None,
         verification: None,
+        verification_placement: workloop_core::placement::PlacementTarget::Local,
+        remote_verification_executor: None,
     };
     let sup = Supervisor::new(PosixProcessControl, ws_root.clone(), vec![], config())
         .with_handoff(layout);
@@ -1472,6 +1477,8 @@ fn a_source_bound_work_derives_base_from_the_workspace() {
         out_root: root.join("out"),
         state_root: None,
         verification: None,
+        verification_placement: workloop_core::placement::PlacementTarget::Local,
+        remote_verification_executor: None,
     };
     let sup = Supervisor::new(PosixProcessControl, ws_root.clone(), vec![], cfg)
         .with_handoff(layout.clone());
@@ -1538,6 +1545,8 @@ fn an_unreadable_workspace_base_wedges_the_recovery_bound() {
         out_root: root.join("out"),
         state_root: None,
         verification: None,
+        verification_placement: workloop_core::placement::PlacementTarget::Local,
+        remote_verification_executor: None,
     };
     let sup = Supervisor::new(PosixProcessControl, ws_root, vec![], config()).with_handoff(layout);
     let invocation = done_invocation(&e, "inv-badbase");
@@ -2309,4 +2318,73 @@ fn contained_verification_refuses_when_the_containment_gate_fails() {
         "the declared argv never ran under a failed gate"
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The separate verification placement (#379): a remote-placed
+/// verification never runs the local runner — each declared
+/// requirement records one bounded `Inconclusive` naming the bound
+/// executor's marker, written exactly once, unproven until the remote
+/// verification machinery (#383) dispatches the run.
+#[test]
+fn remote_placed_verification_records_the_bound_marker_without_running() {
+    let root = tmp_root("verify-remote");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-vremote");
+    let (mut layout, ws_dir) = layout(&root, &w);
+    layout.verification_placement = workloop_core::placement::PlacementTarget::Remote;
+    layout.remote_verification_executor = Some("edge-1".into());
+    let (base, produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-vremote");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let mut s = seed(&invocation, &w, &base);
+    // An argv that would pass locally — a passing local run would be
+    // silent-local proof under a remote placement.
+    s.verification_argv = vec![
+        vec!["git".into(), "rev-parse".into(), "HEAD".into()],
+        vec!["true".into()],
+    ];
+
+    let h = handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    assert_eq!(h.state, HandoffState::Acknowledged);
+
+    let marker = handoff::placement_bound_marker("edge-1");
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 2, "one bounded record per requirement");
+    for (i, r) in results.iter().enumerate() {
+        assert_eq!(r.requirement, format!("verification_argv[{i}]"));
+        assert_eq!(r.result, VerificationOutcome::Inconclusive);
+        assert_eq!(r.environment_digest, marker);
+        assert_eq!(r.produced, produced);
+        assert_eq!(r.argv, s.verification_argv[i]);
+        assert!(
+            r.output.contains("edge-1"),
+            "the marker names the bound executor: {}",
+            r.output
+        );
+    }
+
+    // Re-driving records nothing twice — the bound is exactly once
+    // per (artifact, requirement, produced, executor).
+    handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    assert_eq!(
+        store
+            .transact(|tx| tx.verification_results(&aid))
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // A produced-commit change is a new evidence basis: the markers
+    // re-record under the new produced value, still never running.
+    let mut s2 = s.clone();
+    s2.verification_argv = vec![vec!["true".into()]];
+    handoff::drive(&store, &layout, &aid, &s2, 3, &Ok(None), &mut || 0).unwrap();
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert!(
+        results.iter().all(
+            |r| r.result == VerificationOutcome::Inconclusive && r.environment_digest == marker
+        ),
+        "no local run ever produced a terminal result"
+    );
 }

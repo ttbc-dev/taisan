@@ -1255,6 +1255,7 @@ mod tests {
 
     fn config() -> WorkloopConfig {
         WorkloopConfig {
+            placement: Ok(workloop_core::placement::PlacementPolicy::default()),
             host: workloop_core::work::HostTemplate {
                 adapter: AdapterId::trusted("fixture"),
                 repository: RepositoryRef::new(

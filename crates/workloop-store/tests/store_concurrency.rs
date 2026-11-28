@@ -162,6 +162,7 @@ fn preview_fails_fast_under_held_write_lock() {
 
     let host = HostInstanceId::trusted("test-host");
     let config = WorkloopConfig {
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: RepositoryRef::new(host.clone(), RepositoryId::trusted("local-repo")),

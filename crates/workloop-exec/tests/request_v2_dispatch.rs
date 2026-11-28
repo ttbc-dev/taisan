@@ -86,6 +86,7 @@ fn repo() -> RepositoryRef {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),
@@ -355,6 +356,8 @@ fn layout(root: &Path) -> HandoffLayout {
         out_root: root.join("out"),
         state_root: None,
         verification: None,
+        verification_placement: workloop_core::placement::PlacementTarget::Local,
+        remote_verification_executor: None,
     }
 }
 
@@ -467,6 +470,7 @@ fn insert_request(
         .transact(|tx| {
             tx.apply(&Effect::InsertRequest {
                 request: InvocationRequest {
+                    placement: None,
                     request_id: request_id.into(),
                     work_id: work_id.clone(),
                     execution_id: execution_id.clone(),

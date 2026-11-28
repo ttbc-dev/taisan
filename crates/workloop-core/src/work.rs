@@ -69,6 +69,14 @@ pub struct WorkloopConfig {
     pub budget: ExecutionBudget,
     /// The Work-wide recovery policy stamped at acceptance.
     pub policy: WorkPolicy,
+    /// The executor-placement resolution every admitted request binds
+    /// at dispatch (#379): the validated policy, or the bounded error
+    /// a malformed `placement` section produced. The outcome rides the
+    /// config as a `Result` rather than failing `workloop_config`
+    /// itself — a bad section gates only the dispatch paths that
+    /// consume it, never submit, status, or any other store-backed
+    /// command.
+    pub placement: Result<crate::placement::PlacementPolicy, String>,
 }
 
 /// The capability set every publishable Work needs, plus `issue_read`
@@ -2235,6 +2243,25 @@ pub fn admit_queued_role(
         }
     }
 
+    // The placement resolution fails closed at this dispatch boundary
+    // (#379): a request can never bind under an unvalidated policy, so
+    // the Execution holds for operator repair. The gate precedes every
+    // reservation — a paused Execution carries no claims out of the
+    // attempt.
+    let placement = match &config.placement {
+        Ok(policy) => policy,
+        Err(detail) => {
+            return pause_for_repair(
+                tx,
+                &execution,
+                "placement_config_invalid",
+                detail,
+                vec![RepairPrerequisite::OperatorDecision],
+                now_unix_seconds,
+            );
+        }
+    };
+
     // Atomic recheck: another writer may have claimed since acceptance. A
     // reservation this Execution itself holds (a paused/resumed Execution
     // retains its claims) is already-held, not a conflict.
@@ -2314,6 +2341,12 @@ pub fn admit_queued_role(
         // the admission scan, or by `execution` immediately before the
         // first launch. It is never inferred from configuration.
         adapter_binding: None,
+        // Bound at admission (#379): the executor placement — executor
+        // identity, resolved target, endpoint descriptor, and the
+        // schema version/config digest the decision resolved under —
+        // records with the request and is immutable. A configuration
+        // reload binds only requests admitted after it.
+        placement: Some(placement.binding_for(&role)),
     };
     let mut next = execution.clone();
     next.state = ExecutionState::Ready;
@@ -2370,7 +2403,6 @@ pub fn admit_queued_role(
     tx.apply(&Effect::ClearDeferral {
         execution_id: execution_id.clone(),
     })?;
-    let _ = config;
     Ok(Some(next))
 }
 

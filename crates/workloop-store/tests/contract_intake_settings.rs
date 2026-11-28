@@ -38,6 +38,7 @@ fn publisher() -> HostActorRef {
 fn config() -> WorkloopConfig {
     use workloop_core::identity::{ActorRole, AdapterId, HostCapability, RoleBinding};
     WorkloopConfig {
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),
@@ -784,7 +785,7 @@ fn a_v8_store_upgrades_to_the_current_format_additively() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 16);
+    assert_eq!(version, 17);
 
     // The new table exists and reads empty — the documented default
     // applies until a guarded write lands.

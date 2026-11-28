@@ -22,6 +22,7 @@ fn repo() -> RepositoryRef {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),
