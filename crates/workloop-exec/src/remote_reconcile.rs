@@ -248,12 +248,11 @@ pub fn ensure_started(
     })?;
     // A fenced request mints and sends nothing (contract §14): the
     // recorded start question waits on the reconcile pass, never a
-    // wire send.
+    // wire send. The gate reads the stored value raw — a class outside
+    // the closed vocabulary fails closed, never silently unfences.
     if store
         .transact(|tx| tx.executor_reconcile(request_id))?
-        .and_then(|c| c.fenced_class.as_deref().map(str::to_string))
-        .and_then(|c| RemoteFenceClass::parse(&c))
-        .is_some()
+        .is_some_and(|c| c.fenced_class.is_some())
     {
         return Ok(StartOutcome::Fenced);
     }
@@ -731,17 +730,14 @@ fn reconcile_one_inner(
     // the fact write otherwise leaves the named Attention never
     // emitted, and ingest dedup makes a landed fact a recorded
     // duplicate.
-    if let Some(class) = prior
-        .as_ref()
-        .and_then(|c| c.fenced_class.as_deref())
-        .and_then(RemoteFenceClass::parse)
-    {
+    if let Some((stored_class, class)) = stored_fence(prior.as_ref()) {
         if let Some(request) = &request {
             refence_fact(
                 store,
                 config,
                 request,
                 invocation.as_ref().map(|i| i.id.clone()),
+                &stored_class,
                 class,
                 &request_id,
                 now_unix_seconds,
@@ -830,11 +826,8 @@ fn reconcile_driven(
 ) -> Result<(), ExecError> {
     let request_id = fields.request_id.clone();
     let state = writer_state(ops, &fields.bound_incarnation_id);
-    let fenced = prior
-        .as_ref()
-        .and_then(|c| c.fenced_class.as_deref())
-        .and_then(RemoteFenceClass::parse);
-    if let Some(class) = fenced {
+    let fenced = stored_fence(prior.as_ref());
+    if let Some((_stored_class, class)) = fenced {
         // A fenced request only ever waits on durable terminal
         // adoption (handled before this point); no new operation is
         // minted or driven under a fence.
@@ -1402,11 +1395,7 @@ fn count_fault(
     now_unix_seconds: i64,
     report: &mut ReconcileReport,
 ) -> Result<(), ExecError> {
-    if let Some(class) = prior
-        .as_ref()
-        .and_then(|c| c.fenced_class.as_deref())
-        .and_then(RemoteFenceClass::parse)
-    {
+    if let Some((_stored_class, class)) = stored_fence(prior.as_ref()) {
         report.fenced.push((request_id.to_string(), class));
         return Ok(());
     }
@@ -1450,8 +1439,22 @@ fn count_fault(
 
 /// The delivery id a `RemoteFence` fact is reported under — stable so
 /// a re-report dedupes against the fact the first fence emission wrote.
-fn fence_event_id(request_id: &str, class: RemoteFenceClass) -> String {
-    format!("rec:{request_id}:fence:{}", class.as_str())
+fn fence_event_id(request_id: &str, stored_class: &str) -> String {
+    format!("rec:{request_id}:fence:{stored_class}")
+}
+
+/// A stored `fenced_class` outside the closed vocabulary is still a
+/// fence: a corrupt or future-version value fails closed — the request
+/// stays frozen — while the class degrades to `record_corrupt` for
+/// reporting. The raw stored string rides the fact delivery id so the
+/// re-report binds what the cursor actually recorded, and the fact's
+/// detail names the stored value an operator must reconcile.
+fn stored_fence(cursor: Option<&ExecutorReconcile>) -> Option<(String, RemoteFenceClass)> {
+    let raw = cursor?.fenced_class.as_deref()?;
+    Some((
+        raw.to_string(),
+        RemoteFenceClass::parse(raw).unwrap_or(RemoteFenceClass::RecordCorrupt),
+    ))
 }
 
 /// Re-report the `RemoteFence` fact for an already-fenced request when
@@ -1465,12 +1468,13 @@ fn refence_fact(
     config: &WorkloopConfig,
     request: &InvocationRequest,
     invocation_id: Option<InvocationId>,
+    stored_class: &str,
     class: RemoteFenceClass,
     request_id: &str,
     now_unix_seconds: i64,
     report: &mut ReconcileReport,
 ) -> Result<(), ExecError> {
-    let event_id = fence_event_id(request_id, class);
+    let event_id = fence_event_id(request_id, stored_class);
     let delivered = store.transact(|tx| {
         Ok(tx.observations_for_work(&request.work_id)?.iter().any(|o| {
             o.delivery.as_ref().is_some_and(|d| {
@@ -1483,6 +1487,17 @@ fn refence_fact(
     if delivered {
         return Ok(());
     }
+    let detail = if stored_class == class.as_str() {
+        format!(
+            "remote fence {} fact re-reported by a later reconcile pass",
+            class.as_str()
+        )
+    } else {
+        format!(
+            "stored fenced_class '{stored_class}' is outside the closed vocabulary; fact re-reported as {}",
+            class.as_str()
+        )
+    };
     if let Err(e) = report_fact(
         store,
         config,
@@ -1491,10 +1506,7 @@ fn refence_fact(
             request_id: request_id.to_string(),
             invocation_id,
             class,
-            detail: format!(
-                "remote fence {} fact re-reported by a later reconcile pass",
-                class.as_str()
-            ),
+            detail,
         },
         event_id,
         now_unix_seconds,
@@ -1529,11 +1541,7 @@ fn emit_fence(
     let mut attempts = 0usize;
     loop {
         let prior = store.transact(|tx| tx.executor_reconcile(request_id))?;
-        if let Some(fenced) = prior
-            .as_ref()
-            .and_then(|c| c.fenced_class.as_deref())
-            .and_then(RemoteFenceClass::parse)
-        {
+        if let Some((_stored_class, fenced)) = stored_fence(prior.as_ref()) {
             // A racing write fenced first — the durable class wins.
             report.fenced.push((request_id.to_string(), fenced));
             return Ok(());
@@ -1578,7 +1586,7 @@ fn emit_fence(
                 class,
                 detail: detail.to_string(),
             },
-            fence_event_id(request_id, class),
+            fence_event_id(request_id, class.as_str()),
             now_unix_seconds,
         )
     {

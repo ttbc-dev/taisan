@@ -734,6 +734,58 @@ fn a_fence_without_its_fact_is_re_reported() {
     assert_eq!(fence_decisions(&store, &seeded.work_id).len(), 1);
 }
 
+/// A stored `fenced_class` outside the closed vocabulary — corruption
+/// or a value written by a future schema — is still a fence: every
+/// gate fails closed on the raw stored value, the report degrades the
+/// class to `record_corrupt`, and the re-reported fact names the
+/// stored string while binding it in the delivery id.
+#[test]
+fn an_unknown_stored_fence_class_still_fences() {
+    let store = rig("unknown-class");
+    let seeded = seed(&store, "unknown-class", INCARNATION);
+    set_exec_state(&store, &seeded, ExecutionState::Running);
+    prepared(&store, &seeded);
+    seeded_start(&store, &seeded, None); // unreceipted — would replay if unfenced
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::UpsertExecutorReconcile {
+                cursor: ExecutorReconcile {
+                    request_id: seeded.request_id.clone(),
+                    consecutive_faults: 0,
+                    fenced_class: Some("v2_fence_class".into()),
+                    next_attempt_unix_ms: 0,
+                    updated_seq: 1,
+                },
+                expected_seq: 0,
+            })
+        })
+        .unwrap();
+
+    let mut transport = FakeTransport::new(INCARNATION, vec![]);
+    let report = reconcile_once(&store, &config(), &mut transport, NOW).unwrap();
+
+    assert!(
+        transport.sent.is_empty(),
+        "an unreadable class freezes — the recorded start never replays"
+    );
+    assert_eq!(
+        report.fenced,
+        vec![(seeded.request_id.clone(), RemoteFenceClass::RecordCorrupt)]
+    );
+    assert!(
+        fence_decisions(&store, &seeded.work_id)
+            .iter()
+            .any(|d| d.contains("record_corrupt") && d.contains("v2_fence_class")),
+        "the re-reported fact degrades the class but names the stored value"
+    );
+
+    // ensure_started gates on the same raw stored value.
+    let outcome =
+        ensure_started(&store, &config(), &mut transport, &seeded.request_id, NOW).unwrap();
+    assert_eq!(outcome, StartOutcome::Fenced);
+    assert!(transport.sent.is_empty());
+}
+
 /// The endpoint rebooted: the responder incarnation differs from the
 /// binding's recorded incarnation while a writer may still be live.
 /// The recorded-identity probe cannot prove the writer gone — the
