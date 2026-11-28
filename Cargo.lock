@@ -773,6 +773,7 @@ version = "0.3.0"
 dependencies = [
  "serde_json",
  "sha2",
+ "workloop-orphan-guard",
 ]
 
 [[package]]
@@ -836,6 +837,7 @@ version = "0.3.0"
 dependencies = [
  "serde_json",
  "workloop-core",
+ "workloop-orphan-guard",
 ]
 
 [[package]]
@@ -863,6 +865,10 @@ dependencies = [
  "workloop-selector",
  "workloop-store",
 ]
+
+[[package]]
+name = "workloop-orphan-guard"
+version = "0.3.0"
 
 [[package]]
 name = "workloop-selector"
