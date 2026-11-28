@@ -2399,6 +2399,37 @@ fn remote_placed_verification_records_the_bound_marker_without_running() {
     );
 }
 
+/// A remote placement with no bound executor is refused when the row is
+/// created: fabricating an executor identity would pin a phantom
+/// endpoint whose marker could never match a real one, so the pin fails
+/// closed instead (#506 review).
+#[test]
+fn remote_placement_without_bound_executor_refuses_to_pin() {
+    let root = tmp_root("verify-remote-no-executor");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-vremote-no-executor");
+    let (mut layout, ws_dir) = layout(&root, &w);
+    layout.verification_placement = workloop_core::placement::PlacementTarget::Remote;
+    layout.remote_verification_executor = None;
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-vremote-no-executor");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let s = seed(&invocation, &w, &base);
+
+    let err = handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0)
+        .expect_err("a remote placement without a bound executor is refused");
+    assert!(
+        matches!(err, handoff::HandoffError::PlacementConflict(_)),
+        "unexpected error: {err}"
+    );
+    assert!(
+        row(&store, &aid).is_none(),
+        "no handoff row is pinned to a fabricated executor"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The placement and bound executor are pinned on the handoff row
 /// (#506): a config reload after the row exists cannot retarget the
 /// pending remote verification to local or another executor.

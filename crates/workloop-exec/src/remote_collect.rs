@@ -856,10 +856,17 @@ fn validate_produced(
             state: HandoffState::Acknowledged,
             invalid_reason: None,
             attempt: 0,
-            verification_placement: Some(handoff::pinned_verification_placement(
-                layout.verification_placement,
-                layout.remote_verification_executor.as_deref(),
-            )),
+            verification_placement: Some(
+                handoff::pinned_verification_placement(
+                    layout.verification_placement,
+                    layout.remote_verification_executor.as_deref(),
+                )
+                .ok_or_else(|| {
+                    ProducedRefusal::Fault(fault(
+                        "remote verification placement requires a bound executor",
+                    ))
+                })?,
+            ),
             recorded_seq: 0,
         };
         let upsert = store.transact(|tx| {

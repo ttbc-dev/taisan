@@ -127,27 +127,39 @@ impl HandoffLayout {
     /// The verification placement this layout currently resolves. It is
     /// copied onto a new handoff row and never consulted again for that
     /// artifact — the durable pin decides every later run (#506).
-    fn pin_verification_placement(&self) -> VerificationPlacement {
+    fn pin_verification_placement(&self) -> Result<VerificationPlacement, HandoffError> {
         pinned_verification_placement(
             self.verification_placement,
             self.remote_verification_executor.as_deref(),
         )
+        .ok_or_else(|| {
+            HandoffError::PlacementConflict(
+                "remote verification placement requires a bound executor".to_string(),
+            )
+        })
     }
 }
 
 /// Resolve the placement + bound executor a new handoff row pins. The
 /// same rule serves every collection path: a remote placement names the
 /// configured executor, a local one is the recorded local runner.
+///
+/// A remote placement with no executor yields `None`: callers fail
+/// closed rather than fabricate an identity whose marker could never
+/// match a real endpoint.
 pub(crate) fn pinned_verification_placement(
     target: PlacementTarget,
     remote_executor: Option<&str>,
-) -> VerificationPlacement {
-    VerificationPlacement {
-        target,
-        executor: match target {
-            PlacementTarget::Remote => remote_executor.unwrap_or("remote").to_string(),
-            PlacementTarget::Local => "local".to_string(),
-        },
+) -> Option<VerificationPlacement> {
+    match target {
+        PlacementTarget::Remote => remote_executor.map(|executor| VerificationPlacement {
+            target: PlacementTarget::Remote,
+            executor: executor.to_string(),
+        }),
+        PlacementTarget::Local => Some(VerificationPlacement {
+            target: PlacementTarget::Local,
+            executor: "local".to_string(),
+        }),
     }
 }
 
@@ -168,9 +180,10 @@ pub enum HandoffError {
     /// and the sweep retries within the recovery bound.
     Transport(String),
     /// A permanent placement conflict: the row's pinned placement and
-    /// its recorded remote-pending markers disagree. Retrying cannot
-    /// heal it, so it must surface instead of being swallowed as a
-    /// retryable transport hiccup.
+    /// its recorded remote-pending markers disagree, or a remote
+    /// placement names no bound executor. Retrying cannot heal it, so
+    /// it must surface instead of being swallowed as a retryable
+    /// transport hiccup.
     PlacementConflict(String),
     Io(std::io::Error),
 }
@@ -335,7 +348,7 @@ pub fn drive(
                 state: HandoffState::ExportStarted,
                 invalid_reason: None,
                 attempt: 0,
-                verification_placement: Some(layout.pin_verification_placement()),
+                verification_placement: Some(layout.pin_verification_placement()?),
                 recorded_seq: 0,
             };
             match store.transact(|tx| {
@@ -386,7 +399,7 @@ fn resolve_verification_placement(
 ) -> Result<VerificationPlacement, HandoffError> {
     let resolved = match &handoff.verification_placement {
         Some(pinned) => pinned.clone(),
-        None => layout.pin_verification_placement(),
+        None => layout.pin_verification_placement()?,
     };
     let pending: Vec<&VerificationResult> = recorded
         .values()

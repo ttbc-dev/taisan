@@ -5753,11 +5753,13 @@ fn a_v12_store_gains_the_observation_execution_index() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Regression (#379): a v16 store's `invocation_requests` lacks the
-/// v17 `placement_binding` column; opening it adds the column inside
-/// the idempotent upgrade transaction, request rows survive and read
-/// back as pre-placement rows (`placement: None` — their executor is
-/// the coordinator host's local one).
+/// Regression (#379, #506): a v16 store lacks both the v17
+/// `invocation_requests.placement_binding` and the v18
+/// `artifact_handoffs.verification_placement` columns; opening it adds
+/// both inside the idempotent upgrade transaction, request rows survive
+/// and read back as pre-placement rows (`placement: None` — their
+/// executor is the coordinator host's local one), and handoff rows read
+/// back with no pin.
 #[test]
 fn a_v16_store_gains_the_placement_binding_column() {
     let root = temp_root("upgrade-v16");
@@ -5786,15 +5788,16 @@ fn a_v16_store_gains_the_placement_binding_column() {
             .unwrap();
         format!("{}:inv:0", execution_id.0)
     };
-    // Reshape into a faithful v16 file: the column absent, stamp 16.
+    // Reshape into a faithful v16 file: both later columns absent, stamp 16.
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(
             "ALTER TABLE invocation_requests DROP COLUMN placement_binding; \
+             ALTER TABLE artifact_handoffs DROP COLUMN verification_placement; \
              PRAGMA user_version=16;",
         )
         .unwrap();
-        let has: bool = conn
+        let has_placement_binding: bool = conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('invocation_requests') \
                  WHERE name='placement_binding')",
@@ -5802,7 +5805,18 @@ fn a_v16_store_gains_the_placement_binding_column() {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(!has, "the reshaped file is a real v16 table");
+        let has_verification_placement: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('artifact_handoffs') \
+                 WHERE name='verification_placement')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !has_placement_binding && !has_verification_placement,
+            "the reshaped file is a real v16 table"
+        );
     }
     let store = SqliteStore::open(&db, 1).expect("a v16 store upgrades in place");
     {
@@ -5816,6 +5830,18 @@ fn a_v16_store_gains_the_placement_binding_column() {
             )
             .unwrap();
         assert!(has, "the v16->v17 migration adds placement_binding");
+        let has_handoff_pin: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('artifact_handoffs') \
+                 WHERE name='verification_placement')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            has_handoff_pin,
+            "the v16->v18 path also adds handoff verification_placement"
+        );
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
