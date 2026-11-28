@@ -27,6 +27,7 @@ use workloop_core::executor::{
     item_content_digest,
 };
 use workloop_core::observation::ArtifactFact;
+use workloop_core::placement::PlacementTarget;
 use workloop_core::store::{Effect, Store, StoreError};
 use workloop_core::worker_v2::WorkerRequestV2;
 
@@ -46,6 +47,15 @@ pub struct RemoteCollectLayout {
     pub repository: PathBuf,
     /// The retained-body store report/log bodies commit into.
     pub bodies: BodyStore,
+    /// The coordinator's verification placement at collection time. It
+    /// is pinned on the acknowledged handoff row when that row is
+    /// created, so a later config reload cannot retarget verification
+    /// (#506, `docs/remote-executor.md` §2.2).
+    pub verification_placement: PlacementTarget,
+    /// The bound remote executor identity deferred verification
+    /// evidence names — `Some` exactly when
+    /// `verification_placement == Remote`.
+    pub remote_verification_executor: Option<String>,
 }
 
 /// What a validated collection produced.
@@ -846,7 +856,10 @@ fn validate_produced(
             state: HandoffState::Acknowledged,
             invalid_reason: None,
             attempt: 0,
-            verification_placement: None,
+            verification_placement: Some(handoff::pinned_verification_placement(
+                layout.verification_placement,
+                layout.remote_verification_executor.as_deref(),
+            )),
             recorded_seq: 0,
         };
         let upsert = store.transact(|tx| {

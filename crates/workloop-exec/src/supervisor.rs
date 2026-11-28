@@ -1932,6 +1932,9 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     )?;
                 }
                 Err(crate::handoff::HandoffError::Transport(_)) => {}
+                Err(crate::handoff::HandoffError::PlacementConflict(detail)) => {
+                    return Err(ExecError::Fault(detail));
+                }
                 Err(crate::handoff::HandoffError::Store(e)) => {
                     return Err(ExecError::Store(e));
                 }

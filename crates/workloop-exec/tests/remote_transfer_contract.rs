@@ -21,6 +21,7 @@ use workloop_core::executor::{
 };
 use workloop_core::identity::*;
 use workloop_core::observation::ArtifactFact;
+use workloop_core::placement::PlacementTarget;
 use workloop_core::store::{Effect, Store, StoreError};
 use workloop_core::work::{HostTemplate, WorkloopConfig, handle_command};
 use workloop_core::worker_v2::*;
@@ -401,6 +402,8 @@ fn rig(tag: &str) -> (Rig, String) {
         collect_layout: RemoteCollectLayout {
             repository: handoff_repo.clone(),
             bodies: BodyStore::new(root.join("coord/state")),
+            verification_placement: PlacementTarget::Local,
+            remote_verification_executor: None,
         },
         coord_transfers: TransferStore::new(root.join("coord/transfers")),
         exec_transfers,
@@ -695,7 +698,9 @@ fn seed_review_request(
 /// assemble → transfer → collect → artifact ref + durable row.
 #[test]
 fn a_coding_request_roundtrips_coordinator_to_executor_and_back() {
-    let (rig, base) = rig("roundtrip");
+    let (mut rig, base) = rig("roundtrip");
+    rig.collect_layout.verification_placement = PlacementTarget::Remote;
+    rig.collect_layout.remote_verification_executor = Some("edge-1".into());
     let required = vec![RequiredArtifact {
         kind: "result".into(),
         path: "dist/result.json".into(),
@@ -818,6 +823,14 @@ fn a_coding_request_roundtrips_coordinator_to_executor_and_back() {
         .unwrap();
     assert_eq!(row.state, HandoffState::Acknowledged);
     assert_eq!(row.produced.as_deref(), Some(produced.as_str()));
+    assert_eq!(
+        row.verification_placement,
+        Some(VerificationPlacement {
+            target: PlacementTarget::Remote,
+            executor: "edge-1".into(),
+        }),
+        "collection pins the configured verification placement on the durable row"
+    );
 
     // The durable collection record: the digest is one identity both
     // sides agree on — the coordinator's durable row equals the

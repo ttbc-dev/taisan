@@ -1955,6 +1955,19 @@ impl ReadView for Tx<'_> {
         )
     }
 
+    fn requests_for_execution(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<Vec<InvocationRequest>, StoreError> {
+        self.query_all(
+            "SELECT request_id, work_id, execution_id, role, spec_revision, \
+             payload, adapter_binding, placement_binding FROM invocation_requests \
+             WHERE execution_id=?1 ORDER BY rowid",
+            params![execution_id.0],
+            request_from_row,
+        )
+    }
+
     fn request(&self, request_id: &str) -> Result<Option<InvocationRequest>, StoreError> {
         self.query_opt(
             "SELECT request_id, work_id, execution_id, role, spec_revision, \

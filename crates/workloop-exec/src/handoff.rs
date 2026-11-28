@@ -128,16 +128,26 @@ impl HandoffLayout {
     /// copied onto a new handoff row and never consulted again for that
     /// artifact — the durable pin decides every later run (#506).
     fn pin_verification_placement(&self) -> VerificationPlacement {
-        VerificationPlacement {
-            target: self.verification_placement,
-            executor: match self.verification_placement {
-                PlacementTarget::Remote => self
-                    .remote_verification_executor
-                    .clone()
-                    .unwrap_or_else(|| "remote".to_string()),
-                PlacementTarget::Local => "local".to_string(),
-            },
-        }
+        pinned_verification_placement(
+            self.verification_placement,
+            self.remote_verification_executor.as_deref(),
+        )
+    }
+}
+
+/// Resolve the placement + bound executor a new handoff row pins. The
+/// same rule serves every collection path: a remote placement names the
+/// configured executor, a local one is the recorded local runner.
+pub(crate) fn pinned_verification_placement(
+    target: PlacementTarget,
+    remote_executor: Option<&str>,
+) -> VerificationPlacement {
+    VerificationPlacement {
+        target,
+        executor: match target {
+            PlacementTarget::Remote => remote_executor.unwrap_or("remote").to_string(),
+            PlacementTarget::Local => "local".to_string(),
+        },
     }
 }
 
@@ -157,6 +167,11 @@ pub enum HandoffError {
     /// A transport step could not be completed; the row is unchanged
     /// and the sweep retries within the recovery bound.
     Transport(String),
+    /// A permanent placement conflict: the row's pinned placement and
+    /// its recorded remote-pending markers disagree. Retrying cannot
+    /// heal it, so it must surface instead of being swallowed as a
+    /// retryable transport hiccup.
+    PlacementConflict(String),
     Io(std::io::Error),
 }
 
@@ -165,6 +180,7 @@ impl std::fmt::Display for HandoffError {
         match self {
             Self::Store(e) => write!(f, "{e}"),
             Self::Transport(d) => write!(f, "handoff transport: {d}"),
+            Self::PlacementConflict(d) => write!(f, "handoff placement conflict: {d}"),
             Self::Io(e) => write!(f, "{e}"),
         }
     }
@@ -384,7 +400,7 @@ fn resolve_verification_placement(
                 .iter()
                 .any(|r| Some(r.environment_digest.as_str()) != expected.as_deref())
         {
-            return Err(HandoffError::Transport(format!(
+            return Err(HandoffError::PlacementConflict(format!(
                 "verification placement changed for artifact {}: recorded remote-pending markers do not match the {:?} placement (executor '{}')",
                 handoff.artifact_id, resolved.target, resolved.executor
             )));

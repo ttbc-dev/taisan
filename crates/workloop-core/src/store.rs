@@ -781,6 +781,19 @@ pub trait ReadView {
 
     /// Approved requests not yet consumed by `execution`.
     fn pending_requests(&self) -> Result<Vec<InvocationRequest>, StoreError>;
+    /// Every durable request row for `execution`, consumed or not, in
+    /// committed order. Inspection needs the consumed-by-gate rows too:
+    /// a request can be consumed with neither an Invocation nor a
+    /// dispatch-refusal fact, so the pending set alone would hide it.
+    ///
+    /// The default has no durable request log to enumerate; the SQLite
+    /// store overrides it with the invocation_requests table.
+    fn requests_for_execution(
+        &self,
+        _execution_id: &ExecutionId,
+    ) -> Result<Vec<InvocationRequest>, StoreError> {
+        Ok(Vec::new())
+    }
     fn request(&self, request_id: &str) -> Result<Option<InvocationRequest>, StoreError>;
     fn invocations_for_execution(
         &self,

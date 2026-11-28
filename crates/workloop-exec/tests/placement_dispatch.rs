@@ -909,6 +909,46 @@ fn work_detail_explains_executor_role_liveness_and_refusal() {
     assert!(pending.endpoint.is_none());
     assert_eq!(pending.placement_schema_version, Some(0));
 
+    // Consumed-by-gate: `mark_consumed` with neither an Invocation nor
+    // a dispatch-refusal fact still leaves the durable request visible
+    // as `consumed`, never silently absent from the detail view.
+    let (w4, _e4, rid4) = admit(&store, "inspect-consumed", &local_cfg);
+    store
+        .transact(|tx| {
+            tx.apply(&Effect::MarkRequestConsumed {
+                request_id: rid4.clone(),
+            })
+        })
+        .unwrap();
+    let detail4 = view(&w4);
+    let consumed = detail4.executions[0]
+        .requests
+        .iter()
+        .find(|r| r.request_id == rid4)
+        .expect("request view");
+    assert_eq!(consumed.liveness, "consumed");
+    assert!(consumed.invocation_id.is_none());
+    assert!(consumed.refusal.is_none());
+
+    // One durable row renders once: never pending + refused (or any
+    // other double union) for a single request_id.
+    for (detail, id) in [
+        (&detail, &rid),
+        (&detail2, &rid2),
+        (&detail3, &rid3),
+        (&detail4, &rid4),
+    ] {
+        assert_eq!(
+            detail.executions[0]
+                .requests
+                .iter()
+                .filter(|r| &r.request_id == id)
+                .count(),
+            1,
+            "{id} renders exactly once"
+        );
+    }
+
     // Redaction: the serialized view names no credential reference —
     // an opaque provider ref is still configuration the inspect
     // surface never echoes.

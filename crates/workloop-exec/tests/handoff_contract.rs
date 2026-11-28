@@ -2595,7 +2595,7 @@ fn legacy_remote_pending_row_refuses_a_changed_placement() {
     let err = handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0)
         .expect_err("a changed placement over remote-pending evidence is refused");
     match err {
-        handoff::HandoffError::Transport(detail) => {
+        handoff::HandoffError::PlacementConflict(detail) => {
             assert!(
                 detail.contains("verification placement changed"),
                 "{detail}"
@@ -2603,6 +2603,9 @@ fn legacy_remote_pending_row_refuses_a_changed_placement() {
         }
         other => panic!("unexpected error: {other}"),
     }
+    // The permanent conflict is never swallowed as a retryable
+    // transport hiccup by the sweep: it surfaces as an infrastructure
+    // fault an operator can see.
     let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].environment_digest, marker);
