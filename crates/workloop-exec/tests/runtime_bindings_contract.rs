@@ -51,6 +51,7 @@ fn config() -> WorkloopConfig {
             }],
         },
         declared_capabilities: BTreeSet::from([HostCapability::RepositoryRead]),
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         lanes: LanePolicy::default(),
         required_checks: vec![],
         allowed_effects: AllowedEffects {

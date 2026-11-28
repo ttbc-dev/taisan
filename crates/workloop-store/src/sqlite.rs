@@ -1389,7 +1389,7 @@ fn request_from_row(row: &rusqlite::Row<'_>) -> Result<InvocationRequest, rusqli
         work_id: WorkId(row.get::<_, String>(1)?),
         execution_id: ExecutionId(row.get::<_, String>(2)?),
         role: untag(&row.get::<_, String>(3)?)?,
-        spec_revision: row.get(4)?,
+        spec_revision: row.get::<_, i64>(4)? as u64,
         payload: de_row(&row.get::<_, String>(5)?)?,
         adapter_binding: opt_de_row(row.get::<_, Option<String>>(6)?)?,
         placement: opt_de_row(row.get::<_, Option<String>>(7)?)?,
@@ -1432,10 +1432,10 @@ const OBSERVATION_COLS: &str = "delivery_scope, delivery_host, delivery_source, 
 fn work_from_row(row: &rusqlite::Row<'_>) -> Result<Work, rusqlite::Error> {
     Ok(Work {
         id: WorkId(row.get::<_, String>(0)?),
-        version: row.get::<_, u64>(1)?,
+        version: row.get::<_, i64>(1)? as u64,
         binding: de_row(&row.get::<_, String>(2)?)?,
-        spec: row.get(3)?,
-        approved_spec: row.get(4)?,
+        spec: row.get::<_, i64>(3)? as u64,
+        approved_spec: row.get::<_, i64>(4)? as u64,
         source_gate: untag(&row.get::<_, String>(5)?)?,
         policy: de_row(&row.get::<_, String>(6)?)?,
         created_seq: row.get(7)?,
@@ -1448,7 +1448,7 @@ const WORK_COLS: &str =
 fn spec_from_row(row: &rusqlite::Row<'_>) -> Result<SpecSnapshot, rusqlite::Error> {
     Ok(SpecSnapshot {
         work_id: WorkId(row.get::<_, String>(0)?),
-        revision: row.get(1)?,
+        revision: row.get::<_, i64>(1)? as u64,
         payload: de_row(&row.get::<_, String>(2)?)?,
         digest: row.get(3)?,
         approved_by: de_row(&row.get::<_, String>(4)?)?,
@@ -1485,7 +1485,7 @@ fn round_from_row(row: &rusqlite::Row<'_>) -> Result<ReviewRound, rusqlite::Erro
         source_revision: row.get(4)?,
         completeness: row.get(5)?,
         set_digest: row.get(6)?,
-        generation: row.get(7)?,
+        generation: row.get::<_, i64>(7)? as u64,
         seq: row.get(8)?,
     })
 }
@@ -1509,10 +1509,10 @@ fn usage_from_row(row: &rusqlite::Row<'_>) -> Result<WorkUsage, rusqlite::Error>
         transport_retries_used: row.get(2)?,
         equivalent_failure_streak: row.get(3)?,
         equivalent_signature: row.get(4)?,
-        automatic_seconds_used: row.get(5)?,
+        automatic_seconds_used: row.get::<_, i64>(5)? as u64,
         first_dispatch_unix_seconds: row.get(6)?,
         last_progress_unix_seconds: row.get(7)?,
-        human_wait_seconds_total: row.get(8)?,
+        human_wait_seconds_total: row.get::<_, i64>(8)? as u64,
         last_progress_basis: row
             .get::<_, Option<String>>(9)?
             .and_then(|s| MaterialProgressBasis::parse(&s)),
@@ -1638,13 +1638,13 @@ fn update_work(tx: &Tx<'_>, work: &Work, expected: u64) -> Result<(), StoreError
          source_gate=?6, policy=?7 WHERE id=?1 AND version=?8",
         params![
             work.id.0,
-            work.version,
+            work.version as i64,
             json(&work.binding)?,
-            work.spec,
-            work.approved_spec,
+            work.spec as i64,
+            work.approved_spec as i64,
             tag(&work.source_gate),
             json(&work.policy)?,
-            expected,
+            expected as i64,
         ],
     )?;
     if n == 0 {
@@ -1653,11 +1653,11 @@ fn update_work(tx: &Tx<'_>, work: &Work, expected: u64) -> Result<(), StoreError
             .query_row(
                 "SELECT version FROM works WHERE id=?1",
                 params![work.id.0],
-                |r| r.get(0),
+                |r| r.get::<_, i64>(0),
             )
             .optional()
             .map_err(map_err)?
-            .unwrap_or(0);
+            .unwrap_or(0) as u64;
         return Err(StoreError::VersionConflict {
             work_id: work.id.clone(),
             current_version: current,
@@ -1672,7 +1672,7 @@ fn insert_spec(tx: &Tx<'_>, spec: &SpecSnapshot) -> Result<(), StoreError> {
          recorded_seq) VALUES (?1,?2,?3,?4,?5,?6)",
         params![
             spec.work_id.0,
-            spec.revision,
+            spec.revision as i64,
             json(&spec.payload)?,
             spec.digest,
             json(&spec.approved_by)?,
@@ -1786,7 +1786,7 @@ impl ReadView for Tx<'_> {
             Some(rev) => self.query_opt(
                 "SELECT work_id, revision, payload, digest, approved_by, \
                  recorded_seq FROM specs WHERE work_id=?1 AND revision=?2",
-                params![work_id.0, rev],
+                params![work_id.0, rev as i64],
                 spec_from_row,
             ),
             None => self.query_opt(
@@ -2905,10 +2905,10 @@ impl TxView for Tx<'_> {
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                     params![
                         work.id.0,
-                        work.version,
+                        work.version as i64,
                         json(&work.binding)?,
-                        work.spec,
-                        work.approved_spec,
+                        work.spec as i64,
+                        work.approved_spec as i64,
                         tag(&work.source_gate),
                         json(&work.policy)?,
                         work.created_seq,
@@ -2937,10 +2937,10 @@ impl TxView for Tx<'_> {
                         usage.transport_retries_used,
                         usage.equivalent_failure_streak,
                         usage.equivalent_signature,
-                        usage.automatic_seconds_used,
+                        usage.automatic_seconds_used as i64,
                         usage.first_dispatch_unix_seconds,
                         usage.last_progress_unix_seconds,
-                        usage.human_wait_seconds_total,
+                        usage.human_wait_seconds_total as i64,
                         usage.last_progress_basis.map(|b| b.as_str()),
                         json(&usage.merge_check_services)?,
                     ],
@@ -3027,7 +3027,7 @@ impl TxView for Tx<'_> {
                         request.work_id.0,
                         request.execution_id.0,
                         tag(&request.role),
-                        request.spec_revision,
+                        request.spec_revision as i64,
                         json(&request.payload)?,
                         request.adapter_binding.as_ref().map(json).transpose()?,
                         request.placement.as_ref().map(json).transpose()?,
@@ -3689,7 +3689,7 @@ impl TxView for Tx<'_> {
                         round.source_revision,
                         round.completeness,
                         round.set_digest,
-                        round.generation,
+                        round.generation as i64,
                         round.seq,
                     ],
                 )?;
@@ -3752,10 +3752,10 @@ impl TxView for Tx<'_> {
                         usage.transport_retries_used,
                         usage.equivalent_failure_streak,
                         usage.equivalent_signature,
-                        usage.automatic_seconds_used,
+                        usage.automatic_seconds_used as i64,
                         usage.first_dispatch_unix_seconds,
                         usage.last_progress_unix_seconds,
-                        usage.human_wait_seconds_total,
+                        usage.human_wait_seconds_total as i64,
                         usage.last_progress_basis.map(|b| b.as_str()),
                         json(&usage.merge_check_services)?,
                     ],
