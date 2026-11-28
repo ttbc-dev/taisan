@@ -512,7 +512,7 @@ fn a_v10_store_gains_the_request_bodies_table() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 17, "the upgrade lands on the current format");
+    assert_eq!(version, 18, "the upgrade lands on the current format");
     // The pre-upgrade request row survives and the new table accepts
     // its body on the upgraded file.
     assert!(
@@ -797,7 +797,7 @@ fn a_v11_store_gains_the_occurrence_summary_column() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 17, "the upgrade lands on the current format");
+    assert_eq!(version, 18, "the upgrade lands on the current format");
     // The occurrences read the column the upgrade restored — it would
     // have failed `no such column: summary` before the bump.
     assert!(

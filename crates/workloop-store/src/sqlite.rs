@@ -10,8 +10,8 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `17` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1` through `16`
+//! `PRAGMA user_version` is the format gate: `18` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1` through `17`
 //! must carry the complete recognized schema of its version and
 //! upgrades additively at open; a stamped file whose schema is foreign
 //! or incomplete, an unversioned database with user tables (a slice-0
@@ -29,8 +29,8 @@ use workloop_core::observation::{DeliveryId, DeliveryScope, Observation};
 use workloop_core::ports::ProcessEvidence;
 use workloop_core::store::{
     CommandRecord, Deferral, Effect, HostActionIntent, IntakeCandidate, IntakeCandidateStatus,
-    IntakeRun, IntakeRunState, IntakeSettingsRecord, IntakeSourceOwner, ReadView, RecoveryIntent,
-    RecoveryIntentState, Store, StoreError, TxView,
+    IntakeRun, IntakeRunState, IntakeSettingsRecord, IntakeSourceOwner, OutboxHold, ReadView,
+    RecoveryIntent, RecoveryIntentState, Store, StoreError, TxView,
 };
 use workloop_core::worker::WorkerRequestExport;
 
@@ -58,9 +58,11 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// which replaces the merge-check service record's observation rows.
 /// `17` adds the `invocation_requests.placement_binding` column —
 /// the immutable executor-placement record every request carries at
-/// admission (`docs/remote-executor.md` §2.2, #379).
+/// admission (`docs/remote-executor.md` §2.2, #379);
+/// `18` adds the `outbox_holds` record (#516) — why each held pending
+/// intent was not attempted in the pass that last recorded it.
 /// Older files upgrade additively at open.
-pub(crate) const FORMAT_VERSION: i64 = 17;
+pub(crate) const FORMAT_VERSION: i64 = 18;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -90,6 +92,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "invocation_requests",
     "issue_claims",
     "observations",
+    "outbox_holds",
     "reclaim_plan_entries",
     "reclaim_plans",
     "recovery_decisions",
@@ -152,6 +155,10 @@ const V13_ADDED_TABLES: &[&str] = &["executor_bindings", "executor_operations"];
 /// collection record). Installed by the same `SCHEMA` batch on
 /// upgrade.
 const V14_ADDED_TABLES: &[&str] = &["executor_collections"];
+
+/// The table the v17 → v18 migration adds (the durable outbox hold
+/// record, #516). Installed by the same `SCHEMA` batch on upgrade.
+const V17_ADDED_TABLES: &[&str] = &["outbox_holds"];
 
 /// How long a writer waits on the file lock before `SQLITE_BUSY` surfaces.
 /// Connection-local (applies inside `transact` and during `init` itself) and
@@ -366,8 +373,9 @@ impl SqliteStore {
             // and a v8 file everything except the v9 addition, a
             // v9–v13 file everything except the v13 and v14
             // additions, a v14 file everything except v15's
-            // collection table, and a v15 or v16 file everything
-            // (v16 and v17 each add a column, not a table). A
+            // collection table, and a v15–v17 file everything except
+            // v18's hold table (v16 and v17 each add a column, not a
+            // table). A
             // foreign or
             // truncated stamped file fails this check untouched, and
             // the accepted difference is a previous release's store: it
@@ -388,6 +396,7 @@ impl SqliteStore {
                             && !V10_ADDED_TABLES.contains(t)
                             && !V13_ADDED_TABLES.contains(t)
                             && !V14_ADDED_TABLES.contains(t)
+                            && !V17_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version == 2 {
@@ -401,6 +410,7 @@ impl SqliteStore {
                             && !V10_ADDED_TABLES.contains(t)
                             && !V13_ADDED_TABLES.contains(t)
                             && !V14_ADDED_TABLES.contains(t)
+                            && !V17_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 5 {
@@ -413,6 +423,7 @@ impl SqliteStore {
                             && !V10_ADDED_TABLES.contains(t)
                             && !V13_ADDED_TABLES.contains(t)
                             && !V14_ADDED_TABLES.contains(t)
+                            && !V17_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 8 {
@@ -424,6 +435,7 @@ impl SqliteStore {
                             && !V10_ADDED_TABLES.contains(t)
                             && !V13_ADDED_TABLES.contains(t)
                             && !V14_ADDED_TABLES.contains(t)
+                            && !V17_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 9 {
@@ -434,6 +446,7 @@ impl SqliteStore {
                             && !V10_ADDED_TABLES.contains(t)
                             && !V13_ADDED_TABLES.contains(t)
                             && !V14_ADDED_TABLES.contains(t)
+                            && !V17_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 11 {
@@ -443,25 +456,35 @@ impl SqliteStore {
                         !V10_ADDED_TABLES.contains(t)
                             && !V13_ADDED_TABLES.contains(t)
                             && !V14_ADDED_TABLES.contains(t)
+                            && !V17_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 14 {
                 EXPECTED_TABLES
                     .iter()
-                    .filter(|t| !V13_ADDED_TABLES.contains(t) && !V14_ADDED_TABLES.contains(t))
+                    .filter(|t| {
+                        !V13_ADDED_TABLES.contains(t)
+                            && !V14_ADDED_TABLES.contains(t)
+                            && !V17_ADDED_TABLES.contains(t)
+                    })
                     .all(|t| present.contains(*t))
             } else if version < 15 {
                 // A v14 file holds every table the v13 → v14
-                // migration installed; only the v15 addition may be
-                // absent.
+                // migration installed; only the v15 and v18 additions
+                // may be absent (v16 and v17 each add a column, not a
+                // table).
                 EXPECTED_TABLES
                     .iter()
-                    .filter(|t| !V14_ADDED_TABLES.contains(t))
+                    .filter(|t| !V14_ADDED_TABLES.contains(t) && !V17_ADDED_TABLES.contains(t))
                     .all(|t| present.contains(*t))
             } else {
-                // A v15 or v16 file holds every table; v16 and v17
-                // each add a column, not a table.
-                EXPECTED_TABLES.iter().all(|t| present.contains(*t))
+                // A v15–v17 file holds every table except the v18
+                // hold record (v16 and v17 each add a column, not a
+                // table).
+                EXPECTED_TABLES
+                    .iter()
+                    .filter(|t| !V17_ADDED_TABLES.contains(t))
+                    .all(|t| present.contains(*t))
             };
             if !required_complete {
                 return Err(StoreError::UnsupportedFormat {
@@ -2281,6 +2304,24 @@ impl ReadView for Tx<'_> {
         )
     }
 
+    fn outbox_holds(&self) -> Result<Vec<OutboxHold>, StoreError> {
+        self.query_all(
+            "SELECT action_id, work_id, kind, reason, \
+             since_seq, last_seen_seq FROM outbox_holds ORDER BY action_id",
+            [],
+            |row| {
+                Ok(OutboxHold {
+                    action_id: row.get(0)?,
+                    work_id: WorkId(row.get(1)?),
+                    kind: untag(&row.get::<_, String>(2)?)?,
+                    reason: row.get(3)?,
+                    since_seq: row.get(4)?,
+                    last_seen_seq: row.get(5)?,
+                })
+            },
+        )
+    }
+
     fn attention_acks(&self, work_id: &WorkId) -> Result<Vec<String>, StoreError> {
         self.query_all(
             "SELECT attention_id FROM attention_acks WHERE work_id=?1",
@@ -3627,6 +3668,13 @@ impl TxView for Tx<'_> {
                         json(effects)?,
                     ],
                 )?;
+                // A receipt is the intent's newest outcome: any
+                // recorded hold is superseded on every settle path —
+                // write drain, reconcile read, or manual record.
+                self.exec(
+                    "DELETE FROM outbox_holds WHERE action_id=?1",
+                    params![action_id],
+                )?;
             }
             Effect::InsertReviewRound { round, occurrences } => {
                 self.exec(
@@ -4341,6 +4389,33 @@ impl TxView for Tx<'_> {
                 self.exec(
                     "DELETE FROM deferrals WHERE execution_id=?1",
                     params![execution_id.0],
+                )?;
+            }
+            Effect::RecordOutboxHold {
+                action_id,
+                work_id,
+                hold_kind,
+                reason,
+            } => {
+                self.exec(
+                    "INSERT INTO outbox_holds (action_id, work_id, \
+                     kind, reason, since_seq, last_seen_seq) \
+                     VALUES (?1,?2,?3,?4,?5,?5) \
+                     ON CONFLICT(action_id) DO UPDATE SET work_id=?2, \
+                     kind=?3, reason=?4, last_seen_seq=?5",
+                    params![
+                        action_id,
+                        work_id.0,
+                        tag(hold_kind),
+                        reason,
+                        self.last_seq()?,
+                    ],
+                )?;
+            }
+            Effect::ClearOutboxHold { action_id } => {
+                self.exec(
+                    "DELETE FROM outbox_holds WHERE action_id=?1",
+                    params![action_id],
                 )?;
             }
             Effect::InsertAttentionAck {
