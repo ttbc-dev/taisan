@@ -2499,6 +2499,55 @@ fn local_placement_pin_does_not_follow_later_remote_config() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A pre-pin row that already carries a local terminal result keeps it:
+/// enabling remote verification on upgrade must not replace valid local
+/// Pass/Fail evidence with a remote-pending marker (#506 follow-up).
+#[test]
+fn legacy_local_terminal_result_survives_remote_placement_binding() {
+    let root = tmp_root("verify-legacy-local-terminal");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-vlegacy-local-terminal");
+    let (mut layout, ws_dir) = layout(&root, &w);
+    let (base, produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-vlegacy-local-terminal");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+    let mut s = seed(&invocation, &w, &base);
+    s.verification_argv = vec![vec!["true".into()]];
+
+    // Local verification records terminal evidence while the row has
+    // not yet been pinned.
+    let h = handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    assert_eq!(h.state, HandoffState::Acknowledged);
+    let mut legacy = row(&store, &aid).unwrap();
+    legacy.verification_placement = None;
+    persist(&store, &legacy);
+    let recorded = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].result, VerificationOutcome::Pass);
+    let local_digest = recorded[0].environment_digest.clone();
+
+    // Upgrade + enable remote verification: the pin binds remote but the
+    // existing local Pass is preserved, never overwritten by a marker.
+    layout.verification_placement = workloop_core::placement::PlacementTarget::Remote;
+    layout.remote_verification_executor = Some("edge-1".into());
+    let h = handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+    assert_eq!(
+        h.verification_placement.as_ref().map(|p| p.target),
+        Some(workloop_core::placement::PlacementTarget::Remote)
+    );
+    let results = store.transact(|tx| tx.verification_results(&aid)).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].result, VerificationOutcome::Pass);
+    assert_eq!(results[0].environment_digest, local_digest);
+    assert_eq!(results[0].produced, produced);
+    assert!(
+        !handoff::is_placement_bound_marker(&results[0].environment_digest),
+        "valid local evidence never becomes a remote-pending marker"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A pre-pin row that already carries remote-pending evidence refuses
 /// a changed placement instead of reinterpreting those markers under a
 /// new executor or silently running local. The same placement may

@@ -446,9 +446,21 @@ fn run_verifications(
                 continue;
             }
             let requirement = format!("verification_argv[{i}]");
-            if recorded.get(&requirement).is_some_and(|r| {
-                r.environment_digest == marker && r.argv == *argv && r.produced == produced
-            }) {
+            // A pre-pin row may already carry a *local* terminal result
+            // from before this artifact was bound to remote placement.
+            // That Pass/Fail is valid evidence for the same argv and
+            // produced commit, so it is preserved instead of being
+            // overwritten by a remote-pending marker.
+            let already_settled = recorded.get(&requirement).is_some_and(|r| {
+                r.argv == *argv
+                    && r.produced == produced
+                    && (r.environment_digest == marker
+                        || matches!(
+                            r.result,
+                            VerificationOutcome::Pass | VerificationOutcome::Fail
+                        ))
+            });
+            if already_settled {
                 continue;
             }
             let mut result = VerificationResult {
