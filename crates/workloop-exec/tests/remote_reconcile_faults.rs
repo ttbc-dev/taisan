@@ -1565,6 +1565,66 @@ fn ensure_started_refuses_a_fenced_request() {
     assert!(transport.sent.is_empty());
 }
 
+/// A bound-incarnation `stopped` proof on record closes the start
+/// question: replaying the recorded `started` receipt must never
+/// resurrect liveness for a writer already proven gone — the same
+/// shape `writer_state` calls `Terminal`.
+#[test]
+fn ensure_started_never_resurrects_a_terminal_writer() {
+    let store = rig("terminal-start");
+    let seeded = seed(&store, "terminal-start", INCARNATION);
+    set_exec_state(&store, &seeded, ExecutionState::Running);
+    live_writer(&store, &seeded); // start + `started` receipt on record
+    // A bound-incarnation `stopped` proof then lands.
+    let observe = record_command(&store, &seeded, OperationKind::Observe, 1, json!({}));
+    attach_receipt(&store, &observe, INCARNATION, stopped(INCARNATION));
+
+    let mut transport = FakeTransport::new(INCARNATION, vec![]);
+    let outcome =
+        ensure_started(&store, &config(), &mut transport, &seeded.request_id, NOW).unwrap();
+
+    assert_eq!(outcome, StartOutcome::Terminal);
+    assert!(
+        transport.sent.is_empty(),
+        "the recorded start is never replayed against a terminal proof"
+    );
+}
+
+/// Contract §8: a minted operation carries the absolute deadline, the
+/// coordinator's send time, and the remaining budget — the payload
+/// never stuffs a mint-time remainder into the absolute field.
+#[test]
+fn a_minted_start_carries_the_absolute_deadline_triple() {
+    let store = rig("deadline-triple");
+    let seeded = seed(&store, "deadline-triple", INCARNATION);
+    set_exec_state(&store, &seeded, ExecutionState::Running);
+    prepared(&store, &seeded);
+
+    let mut transport = FakeTransport::new(
+        INCARNATION,
+        vec![Step::Answer(json!({
+            "status": "started",
+            "process": {"evidence_ref": "ev-1", "identity_digest": "f".repeat(64)}
+        }))],
+    );
+    let outcome =
+        ensure_started(&store, &config(), &mut transport, &seeded.request_id, NOW).unwrap();
+    assert!(matches!(outcome, StartOutcome::Started { .. }));
+
+    let start = ops(&store, &seeded.request_id)
+        .into_iter()
+        .find(|o| o.operation_kind == OperationKind::Start)
+        .unwrap();
+    let command = ExecutorCommandV1::parse(&start.command_body).unwrap();
+    assert_eq!(
+        command.payload["deadline_unix_ms"],
+        json!((NOW + 3600) * 1000),
+        "the absolute deadline — never the mint-time remainder"
+    );
+    assert_eq!(command.payload["sent_unix_ms"], json!(NOW * 1000));
+    assert_eq!(command.payload["remaining_ms"], json!(3600 * 1000));
+}
+
 // =====================================================================
 // The remote-bound boundary in the local loops
 // =====================================================================

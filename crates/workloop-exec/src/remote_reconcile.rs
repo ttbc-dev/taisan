@@ -175,6 +175,10 @@ pub enum StartOutcome {
     /// recorded incarnation — the endpoint restarted; a start under it
     /// is refused, and the reconcile pass fences the writer.
     ForeignIncarnation,
+    /// A bound-incarnation `stopped` proof is on record — the writer
+    /// is already proven gone, so the start question is closed; the
+    /// caller never re-reports liveness.
+    Terminal,
     /// The request's reconcile cursor records a fence — a fenced
     /// request mints and sends nothing (contract §14); the recorded
     /// start question waits on the reconcile pass, never a wire send.
@@ -260,6 +264,12 @@ pub fn ensure_started(
         return Ok(StartOutcome::ForeignIncarnation);
     }
     let ops = store.transact(|tx| tx.executor_operations_for_request(request_id))?;
+    // A bound-incarnation terminal record closes the start question:
+    // the recorded `started` receipt never out-votes a `stopped` proof
+    // (`writer_state` calls the same shape `Terminal`).
+    if terminal_receipt(&ops, &fields.bound_incarnation_id).is_some() {
+        return Ok(StartOutcome::Terminal);
+    }
     let start = ops
         .iter()
         .find(|o| o.operation_kind == OperationKind::Start);
@@ -287,16 +297,10 @@ pub fn ensure_started(
             }) else {
                 return Ok(StartOutcome::Unprepared);
             };
-            let command = mint_command(
-                &fields,
-                OperationKind::Start,
-                0,
-                json!({
-                    "prepared_id": prepared_id,
-                    "launch_config_digest": fields.launch_config_digest,
-                    "deadline_unix_ms": fields.deadline_unix_ms - now_unix_seconds * 1000,
-                }),
-            )?;
+            let mut payload = deadline_payload(&fields, now_unix_seconds);
+            payload["prepared_id"] = json!(prepared_id);
+            payload["launch_config_digest"] = json!(fields.launch_config_digest);
+            let command = mint_command(&fields, OperationKind::Start, 0, payload)?;
             let op = ExecutorOperation::new(&command)
                 .map_err(|e| ExecError::Fault(format!("start command cannot seal: {e}")))?;
             record_and_issue(store, transport, op)?
@@ -908,7 +912,7 @@ fn reconcile_driven(
             fields,
             OperationKind::Observe,
             count_kind(ops, OperationKind::Observe),
-            observe_payload(fields, now_unix_seconds),
+            deadline_payload(fields, now_unix_seconds),
         )?;
         let op = ExecutorOperation::new(&command)
             .map_err(|e| ExecError::Fault(format!("observe command cannot seal: {e}")))?;
@@ -988,9 +992,18 @@ fn reconcile_driven(
     Ok(())
 }
 
-fn observe_payload(fields: &ExecutorBindingFields, now_unix_seconds: i64) -> serde_json::Value {
+/// The contract §8 deadline triple every minted operation carries: the
+/// absolute authorized-runtime deadline, the coordinator's send time,
+/// and the remaining budget — all measured on the coordinator's
+/// monotonic clock. Replayed commands keep their original fields, so
+/// the absolute deadline (never the mint-time remainder) is what a
+/// restart re-derives a conservative window from.
+fn deadline_payload(fields: &ExecutorBindingFields, now_unix_seconds: i64) -> serde_json::Value {
+    let sent_unix_ms = now_unix_seconds * 1000;
     json!({
-        "deadline_unix_ms": fields.deadline_unix_ms - now_unix_seconds * 1000,
+        "deadline_unix_ms": fields.deadline_unix_ms,
+        "sent_unix_ms": sent_unix_ms,
+        "remaining_ms": fields.deadline_unix_ms - sent_unix_ms,
     })
 }
 
@@ -1026,7 +1039,7 @@ fn drive_stop(
         fields,
         OperationKind::RequestStop,
         count_kind(ops, OperationKind::RequestStop),
-        observe_payload(fields, now_unix_seconds),
+        deadline_payload(fields, now_unix_seconds),
     )?;
     let op = ExecutorOperation::new(&stop)
         .map_err(|e| ExecError::Fault(format!("request_stop command cannot seal: {e}")))?;
@@ -1070,7 +1083,7 @@ fn drive_stop(
         fields,
         OperationKind::Observe,
         count_kind(ops, OperationKind::Observe),
-        observe_payload(fields, now_unix_seconds),
+        deadline_payload(fields, now_unix_seconds),
     )?;
     let op = ExecutorOperation::new(&observe)
         .map_err(|e| ExecError::Fault(format!("observe command cannot seal: {e}")))?;
@@ -1140,7 +1153,7 @@ fn drive_observe(
         fields,
         OperationKind::Observe,
         count_kind(ops, OperationKind::Observe),
-        observe_payload(fields, now_unix_seconds),
+        deadline_payload(fields, now_unix_seconds),
     )?;
     let op = ExecutorOperation::new(&observe)
         .map_err(|e| ExecError::Fault(format!("observe command cannot seal: {e}")))?;
