@@ -89,10 +89,14 @@ pub struct HandoffLayout {
     pub verification: Option<VerificationSandbox>,
     /// The separate verification placement (#379,
     /// `docs/remote-executor.md` §2.2). `Local` is the recorded v0.3
-    /// runner; `Remote` never runs the local runner — each declared
-    /// requirement records one bounded `Inconclusive` naming the bound
-    /// executor and stays unproven until remote verification
-    /// machinery (#383) dispatches it.
+    /// runner; `Remote` never runs the local runner. For a row pinned
+    /// remote, each declared requirement without terminal evidence
+    /// records one bounded `Inconclusive` naming the bound executor and
+    /// stays unproven until remote verification machinery (#383)
+    /// dispatches it. The sole exception is a pre-pin row bound remote
+    /// on upgrade: a local `Pass`/`Fail` already recorded for the same
+    /// argv and produced commit is retained as valid evidence rather
+    /// than rewritten as a remote-pending marker.
     pub verification_placement: PlacementTarget,
     /// The bound remote executor identity deferred verification
     /// evidence names — `Some` exactly when
@@ -511,10 +515,12 @@ fn run_verifications(
     // verification never runs the local runner — the one remote
     // executor is owed the run, and local verification under a remote
     // placement would read as proof it never was. Each requirement
-    // records one bounded `Inconclusive` whose marker names the bound
-    // executor — written exactly once per
+    // without terminal evidence records one bounded `Inconclusive`
+    // whose marker names the bound executor — written exactly once per
     // (artifact, requirement, produced, executor), retried by
-    // nothing, unproven until #383 dispatches the remote run.
+    // nothing, unproven until #383 dispatches the remote run. A
+    // pre-pin row bound remote on upgrade keeps any local `Pass`/`Fail`
+    // already recorded for the same argv and produced commit (below).
     if placement.target == PlacementTarget::Remote {
         let executor = placement.executor.as_str();
         let marker = placement_bound_marker(executor);
