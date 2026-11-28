@@ -433,7 +433,9 @@ pub struct PlacementEndpointSection {
     pub endpoint_id: String,
     /// Transport kind (`ssh`).
     pub kind: String,
-    /// Bare host name or IP literal the transport dials.
+    /// Bare host name the transport dials — a DNS name or an IPv4
+    /// literal; an IPv6 literal is refused because its colons are not
+    /// a host-name label.
     pub host: String,
     pub port: u16,
     /// The pinned `endpoint_identity_digest` — the authenticated

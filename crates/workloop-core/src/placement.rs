@@ -61,7 +61,9 @@ pub struct BoundEndpoint {
     pub endpoint_id: String,
     /// Transport kind, one of [`TRANSPORT_KINDS`].
     pub kind: String,
-    /// Bare host name or IP literal the transport dials.
+    /// Bare host name the transport dials — a DNS name or an IPv4
+    /// literal; the validator never accepts an IPv6 literal, whose
+    /// colons are not a host-name label.
     pub host: String,
     pub port: u16,
     /// The pinned `endpoint_identity_digest` — the authenticated

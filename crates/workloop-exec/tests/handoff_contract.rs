@@ -2765,6 +2765,91 @@ fn a_conflict_binding_the_pre_pin_row_is_retryable() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Backfilling the pin on a legacy row must not advance its
+/// `recorded_seq`: that sequence is the recency order
+/// `latest_acknowledged_handoff` uses to pick a Work's predecessor
+/// artifact, so a pin write that allocated a new seq would promote an
+/// older produced commit above a newer one (#506 follow-up review).
+#[test]
+fn binding_a_pre_pin_row_preserves_its_recorded_seq() {
+    let root = tmp_root("verify-pin-recorded-seq");
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e) = admit(&store, "h-pin-recorded-seq");
+    let (layout, ws_dir) = layout(&root, &w);
+    let (base, _produced) = git_workspace(&ws_dir, &w);
+    let invocation = done_invocation(&e, "inv-pin-recorded-seq");
+    insert_invocation(&store, &invocation);
+    let aid = artifact_id(&invocation);
+
+    // Acknowledge with no declared argv, then rewind the row to the
+    // pre-pin shape while keeping the seq it was acknowledged at.
+    handoff::drive(
+        &store,
+        &layout,
+        &aid,
+        &seed(&invocation, &w, &base),
+        3,
+        &Ok(None),
+        &mut || 0,
+    )
+    .unwrap();
+    let mut legacy = row(&store, &aid).unwrap();
+    legacy.verification_placement = None;
+    persist(&store, &legacy);
+    let legacy_seq = row(&store, &aid).unwrap().recorded_seq;
+
+    // A newer acknowledged artifact of the same Work, ordered after the
+    // legacy row — the predecessor a follow-on role must keep binding.
+    let newer_aid = format!("{}/later", invocation.id.0);
+    let newer_seq = store
+        .transact(|tx| {
+            let seq = tx.alloc_seq()?;
+            tx.apply(&Effect::UpsertHandoff {
+                handoff: ArtifactHandoff {
+                    artifact_id: newer_aid.clone(),
+                    invocation_id: invocation.id.clone(),
+                    request_id: invocation.request_id.clone(),
+                    work_id: w.clone(),
+                    execution_id: e.clone(),
+                    base: base.clone(),
+                    produced: Some("cd".repeat(20)),
+                    manifest_digest: Some("ef".repeat(32)),
+                    state: HandoffState::Acknowledged,
+                    invalid_reason: None,
+                    attempt: 0,
+                    verification_placement: Some(VerificationPlacement {
+                        target: workloop_core::placement::PlacementTarget::Local,
+                        executor: "local".into(),
+                    }),
+                    recorded_seq: seq,
+                },
+                expected_seq: 0,
+            })?;
+            Ok(seq)
+        })
+        .unwrap();
+    assert!(newer_seq > legacy_seq);
+
+    let mut s = seed(&invocation, &w, &base);
+    s.verification_argv = vec![vec!["true".into()]];
+    handoff::drive(&store, &layout, &aid, &s, 3, &Ok(None), &mut || 0).unwrap();
+
+    let rebound = row(&store, &aid).unwrap();
+    assert!(
+        rebound.verification_placement.is_some(),
+        "the legacy row is bound by the pass"
+    );
+    assert_eq!(
+        rebound.recorded_seq, legacy_seq,
+        "backfilling the pin never re-orders the older artifact"
+    );
+    assert!(
+        row(&store, &newer_aid).unwrap().recorded_seq > rebound.recorded_seq,
+        "the newer produced artifact stays the Work's predecessor"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// One artifact whose legacy row disagrees with its recorded
 /// remote-pending markers must not starve every later seed: the pass
 /// drives the remaining artifacts, then surfaces the permanent conflict

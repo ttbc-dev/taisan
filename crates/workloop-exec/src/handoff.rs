@@ -435,9 +435,26 @@ fn resolve_verification_placement(
     }
     if handoff.verification_placement.is_none() {
         handoff.verification_placement = Some(resolved.clone());
-        persist(store, handoff)?;
+        persist_pin(store, handoff)?;
     }
     Ok(resolved)
+}
+
+/// Backfill the verification pin without advancing the row's recency.
+/// `recorded_seq` orders a Work's acknowledged handoffs — the newest
+/// produced commit a follow-on role binds — so re-writing a legacy row
+/// must not promote its older produced commit above a newer artifact.
+/// The write still uses the row's compare-and-set: a row actually
+/// advanced concurrently keeps its new seq and this becomes a retryable
+/// conflict instead of regressing the row.
+fn persist_pin(store: &impl Store, handoff: &mut ArtifactHandoff) -> Result<(), StoreError> {
+    let expected_seq = handoff.recorded_seq;
+    store.transact(|tx| {
+        tx.apply(&Effect::UpsertHandoff {
+            handoff: handoff.clone(),
+            expected_seq,
+        })
+    })
 }
 
 /// Each declared verification argv runs once per artifact on the exact
