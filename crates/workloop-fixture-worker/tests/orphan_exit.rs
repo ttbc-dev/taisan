@@ -65,17 +65,24 @@ fn read_pid(path: &Path) -> i32 {
 }
 
 fn last_beat_pid(path: &Path) -> i32 {
-    wait_for(
-        || std::fs::read_to_string(path).is_ok_and(|text| !text.trim().is_empty()),
-        "heartbeat",
-    );
-    std::fs::read_to_string(path)
-        .expect("read heartbeat")
-        .lines()
-        .filter_map(|line| line.strip_prefix("beat "))
-        .next_back()
-        .and_then(|pid| pid.trim().parse().ok())
-        .expect("heartbeat names its writer")
+    // `writeln!("beat {}", pid)` is several writes, so a read can land
+    // between the literal, the digits, and the newline. Only a
+    // newline-terminated line is known to be complete; parse inside the
+    // wait loop so a mid-write read cannot yield a truncated pid.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Some(pid) = std::fs::read_to_string(path).ok().and_then(|text| {
+            text.split_inclusive('\n')
+                .filter(|line| line.ends_with('\n'))
+                .filter_map(|line| line.strip_prefix("beat "))
+                .next_back()
+                .and_then(|pid| pid.trim().parse().ok())
+        }) {
+            return pid;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for heartbeat {}", path.display());
 }
 
 fn proc_state(pid: i32) -> Option<char> {
