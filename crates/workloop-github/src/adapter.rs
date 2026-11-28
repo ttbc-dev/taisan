@@ -2768,7 +2768,7 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                     pull.target_branch == *target_branch
                         && pull.title == *title
                         && pull.body == *body
-                        && (pending || pull.state == PullState::Open)
+                        && pull.state == PullState::Open
                 }) {
                     Some(pull) => {
                         let change = ChangeRequestRef {

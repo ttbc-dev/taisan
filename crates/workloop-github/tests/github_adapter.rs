@@ -16,7 +16,7 @@ use workloop_core::work::{
     HostTemplate, IngestReceipt, WorkloopConfig, admit_queued, handle_command,
 };
 use workloop_github::adapter::{GitHubAdapter, WebhookDelivery, WebhookFact};
-use workloop_github::api::GitHubApi;
+use workloop_github::api::{GitHubApi, PullState};
 use workloop_github::fixture::FixtureGithub;
 use workloop_github::port::IntegrationPort;
 use workloop_store::sqlite::SqliteStore;
@@ -1136,6 +1136,110 @@ fn unknown_open_with_no_landed_create_retries_through_the_transport_bound() {
     // The re-issued intent drains normally and lands.
     adapter.apply_outbox(&store, &config, NOW + 20).unwrap();
     assert_eq!(intent_status(&store, &reissued), HostActionStatus::Applied);
+}
+
+/// A landed create whose pull was then closed is a stale record for
+/// the re-issue too: the `unknown` intent reconciles `failed` (the
+/// open-only read never adopts it), the bounded retry re-mints the
+/// write, and the pending intent's pre-write read must not adopt the
+/// same closed pull at the recorded revision — only a fresh
+/// `open_pull` settles the stage with a live change.
+#[test]
+fn unknown_open_whose_landed_pull_closed_reissues_a_real_create() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let config = config();
+    let mut adapter = Adapter::new(InMemoryGitHub::new());
+    let (work_id, _eid) = waiting_for_publish(&store, "redrive-closed");
+    let branch = format!("work/{}", work_id.0);
+    insert_intent(
+        &store,
+        &work_id,
+        HostAction::PushRef {
+            branch: branch.clone(),
+            produced: rev("artifact-digest"),
+            expected_prior: None,
+        },
+    );
+    let open_id = insert_intent(
+        &store,
+        &work_id,
+        HostAction::OpenChangeRequest {
+            source_branch: branch.clone(),
+            target_branch: "main".into(),
+            title: "t".into(),
+            body: "b".into(),
+        },
+    );
+    // The create's response died after pr-1 landed; the remote then
+    // closed it unmerged — a stale record, never a live change.
+    adapter.client_mut().lose_response("open_pull");
+    adapter.apply_outbox(&store, &config, NOW).unwrap();
+    assert!(matches!(
+        intent_status(&store, &open_id),
+        HostActionStatus::Unknown { .. }
+    ));
+    adapter.client_mut().set_pull_closed(&repo(), "pr-1");
+
+    // The unfiltered reconcile read never adopts a closed pull — a
+    // definite no-effect verdict, settled `failed`, retry armed.
+    adapter
+        .reconcile_outbox_bounded(&store, &config, &mut || NOW + 5, None, None, 10)
+        .unwrap();
+    assert_eq!(
+        intent_status(&store, &open_id),
+        HostActionStatus::Failed {
+            reason: "reconciled: no matching change request".into()
+        }
+    );
+
+    // The due retry re-mints the open intent; its pre-write read sees
+    // the closed pr-1 at the recorded revision — still a stale
+    // record, so the guarded create runs and lands pr-2.
+    let scan = workloop_core::work::consume_due_recovery_intents(
+        &store,
+        &config,
+        &mut || NOW + 20,
+        None,
+        None,
+        10,
+    )
+    .unwrap();
+    assert_eq!(scan.consumed, 1, "{scan:?}");
+    let reissued = store
+        .transact(|tx| {
+            Ok(tx
+                .action_intents()?
+                .into_iter()
+                .find(|i| {
+                    matches!(i.action, HostAction::OpenChangeRequest { .. })
+                        && i.action_id != open_id
+                        && i.status == HostActionStatus::Pending
+                })
+                .map(|i| i.action_id))
+        })
+        .unwrap()
+        .expect("the retry re-minted the open intent");
+
+    adapter.apply_outbox(&store, &config, NOW + 20).unwrap();
+    assert_eq!(intent_status(&store, &reissued), HostActionStatus::Applied);
+    // The receipt names the fresh pull — the closed pr-1 was never
+    // adopted, and the re-create really ran.
+    match &intent_status_effects(&store, &reissued)[..] {
+        [NormalizedEffectFact::ChangeOpened { change, .. }] => {
+            assert_eq!(change.change_request.as_str(), "pr-2");
+        }
+        other => panic!("re-issued receipt missing ChangeOpened: {other:?}"),
+    }
+    assert_eq!(
+        adapter.client().pull(&repo(), "pr-2").map(|p| p.state),
+        Some(PullState::Open),
+        "the re-create landed a live pull"
+    );
+    assert_eq!(
+        adapter.client().pull(&repo(), "pr-1").map(|p| p.state),
+        Some(PullState::Closed),
+        "the stale record was left untouched"
+    );
 }
 
 /// #514's unfiltered reconcile read applies to `open_change_request`
