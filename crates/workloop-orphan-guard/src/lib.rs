@@ -12,10 +12,18 @@
 //! current parent pid: reparenting to a long-lived subreaper changes the
 //! parent, and a recycled pid must never keep an orphan alive.
 
+use std::os::unix::fs::MetadataExt;
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The kernel's fixed inode for the initial PID namespace
+/// (`PROC_PID_INIT_INO`). Every other PID namespace is allocated a fresh
+/// dynamic inode, so `/proc/self/ns/pid` against this value is the
+/// direct test for PID-namespace containment.
+const INITIAL_PID_NAMESPACE_INO: u64 = 0xEFFF_FFFC;
 
 /// The process that must remain alive for the fixture to keep running.
 #[derive(Clone, Copy)]
@@ -29,26 +37,50 @@ pub enum Guardian {
     Grandparent,
 }
 
+/// Capture the launcher ancestry at process start, before a dying
+/// launcher can reparent this process. Call once, as early as possible
+/// in the worker's `main`; `exit_when_orphaned` resolves the live parent
+/// chain instead when this was never called.
+pub fn capture_startup_guardian() {
+    let _ = startup();
+}
+
 /// Exit this process as soon as its guardian disappears.
 ///
 /// Called by each unbounded fixture mode at the point it starts waiting.
-/// A guardian that cannot be identified at launch is already gone; such a
-/// fixture has nothing left to supervise it and exits immediately. A
-/// process without an observable guardian inside its PID namespace (the
-/// `--unshare-pid` sandbox init) keeps waiting instead: containment owns
-/// its lifetime, and treating the absent parent as an orphan would end
-/// every contained unbounded run at startup.
+/// The guardian is the ancestry captured at process start, so a launcher
+/// that dies during startup is still observed after reparenting. When no
+/// guardian is observable (a PID-namespace init boundary), the process
+/// keeps waiting: containment owns its lifetime, and treating the absent
+/// parent as an orphan would end every contained unbounded run at
+/// startup.
 pub fn exit_when_orphaned(guardian: Guardian) {
+    let startup = startup();
+    let captured = match guardian {
+        Guardian::Parent => startup.parent,
+        Guardian::Grandparent => startup.grandparent,
+    };
+    if let Some(identity) = captured {
+        watch(identity);
+        return;
+    }
     let this_parent = parent_pid();
-    let contained = contained_in_namespace();
-    let guardian_pid = match resolve_guardian(guardian, this_parent, parent_of, contained) {
+    let guardian_pid = match resolve_guardian(guardian, this_parent, parent_of, startup.contained) {
         Resolution::Watch(pid) => pid,
-        Resolution::Unobservable => return,
+        Resolution::Unobservable => {
+            signal_ready();
+            return;
+        }
         Resolution::Orphaned => std::process::exit(0),
     };
     let Some(guardian) = identity(guardian_pid) else {
         std::process::exit(0);
     };
+    watch(guardian);
+}
+
+fn watch(guardian: Identity) {
+    signal_ready();
     std::thread::spawn(move || {
         loop {
             if !guardian.is_alive() {
@@ -57,6 +89,51 @@ pub fn exit_when_orphaned(guardian: Guardian) {
             std::thread::sleep(POLL_INTERVAL);
         }
     });
+}
+
+/// Test hook: once the watchdog is armed, touch the file named by
+/// `WORKLOOP_ORPHAN_GUARD_READY_FILE`. The orphan-exit regression test
+/// uses it to kill the launcher only after the guard is observing it,
+/// instead of racing process startup.
+fn signal_ready() {
+    if let Some(path) = std::env::var_os("WORKLOOP_ORPHAN_GUARD_READY_FILE") {
+        let _ = std::fs::write(path, b"");
+    }
+}
+
+/// Ancestry captured at process start. `None` means the guardian sits at
+/// a PID-namespace init boundary and cannot be observed from inside the
+/// namespace.
+#[derive(Clone, Copy)]
+struct Startup {
+    parent: Option<Identity>,
+    grandparent: Option<Identity>,
+    contained: bool,
+}
+
+static STARTUP: OnceLock<Startup> = OnceLock::new();
+
+fn startup() -> Startup {
+    *STARTUP.get_or_init(|| {
+        let this_parent = parent_pid();
+        let contained = contained_in_pid_namespace();
+        if this_parent <= 1 {
+            return Startup {
+                parent: None,
+                grandparent: None,
+                contained,
+            };
+        }
+        let parent = identity(this_parent);
+        let grandparent = parent_of(this_parent)
+            .filter(|pid| *pid > 1)
+            .and_then(identity);
+        Startup {
+            parent,
+            grandparent,
+            contained,
+        }
+    })
 }
 
 /// What the watchdog can prove about the guardian at launch.
@@ -104,33 +181,26 @@ where
     }
 }
 
-/// Whether this process runs in a non-initial user namespace — the marker
-/// of a bwrap containment launch (the reference profile always passes
-/// `--unshare-user`). It disambiguates pid 1: inside containment it is the
-/// namespace init/reaper; outside it is the host init a launcher's death
-/// reparents us to.
-fn contained_in_namespace() -> bool {
-    std::fs::read_to_string("/proc/self/uid_map")
-        .ok()
-        .is_some_and(|map| !uid_map_is_initial(&map))
+/// Whether this process runs in a non-initial PID namespace — the marker
+/// of a `--unshare-pid` containment launch. It disambiguates pid 1:
+/// inside containment it is the namespace init/reaper; outside it is the
+/// host init a launcher's death reparents us to.
+///
+/// This must inspect the PID namespace itself: a user namespace (rootless
+/// podman/Docker, `unshare -U`) does not contain the process tree, while a
+/// rootful `--unshare-pid` launch has no distinct `uid_map`. When `/proc`
+/// cannot answer, assume the initial namespace: exiting a possible orphan
+/// is safer than leaking it past the test.
+fn contained_in_pid_namespace() -> bool {
+    pid_namespace_is_contained(pid_namespace_inode("/proc/self/ns/pid"))
 }
 
-fn uid_map_is_initial(map: &str) -> bool {
-    let mut lines = map.lines().filter(|line| !line.trim().is_empty());
-    let Some(line) = lines.next() else {
-        return false;
-    };
-    if lines.next().is_some() {
-        return false;
-    }
-    let mut fields = line.split_whitespace();
-    matches!(
-        (fields.next(), fields.next(), fields.next(), fields.next()),
-        (Some(_), Some(_), Some(count), None)
-            if count
-                .parse::<u64>()
-                .is_ok_and(|count| count == u32::MAX as u64)
-    )
+fn pid_namespace_inode(path: &str) -> Option<u64> {
+    std::fs::metadata(path).ok().map(|meta| meta.ino())
+}
+
+fn pid_namespace_is_contained(inode: Option<u64>) -> bool {
+    inode.is_some_and(|inode| inode != INITIAL_PID_NAMESPACE_INO)
 }
 
 #[derive(Clone, Copy)]
@@ -340,16 +410,21 @@ mod tests {
     }
 
     #[test]
-    fn full_uid_map_is_the_initial_namespace() {
-        assert!(uid_map_is_initial("         0          0 4294967295\n"));
+    fn initial_pid_namespace_is_not_containment() {
+        assert!(!pid_namespace_is_contained(Some(INITIAL_PID_NAMESPACE_INO)));
     }
 
     #[test]
-    fn restricted_uid_map_marks_containment() {
-        assert!(!uid_map_is_initial("         0       1000          1\n"));
-        assert!(!uid_map_is_initial(
-            "         0       1000          1\n         1       1001          1\n"
-        ));
-        assert!(!uid_map_is_initial(""));
+    fn a_foreign_pid_namespace_marks_containment() {
+        assert!(pid_namespace_is_contained(Some(
+            INITIAL_PID_NAMESPACE_INO + 1
+        )));
+    }
+
+    #[test]
+    fn unobservable_pid_namespace_assumes_the_host() {
+        // Without `/proc` the containment claim cannot be proven, so the
+        // orphan guard stays armed rather than risking a leak.
+        assert!(!pid_namespace_is_contained(None));
     }
 }

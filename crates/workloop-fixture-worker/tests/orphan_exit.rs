@@ -28,6 +28,7 @@ fn harness(script: &str, root: &Path) -> Child {
         .current_dir(root)
         .env("FIXTURE", fixture())
         .env("ROOT", root)
+        .env("WORKLOOP_ORPHAN_GUARD_READY_FILE", root.join("guard-armed"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -46,12 +47,21 @@ fn wait_for(mut pred: impl FnMut() -> bool, what: &str) {
 }
 
 fn read_pid(path: &Path) -> i32 {
-    wait_for(|| path.exists(), "pid file");
-    std::fs::read_to_string(path)
-        .expect("read pid file")
-        .trim()
-        .parse()
-        .expect("pid")
+    // The harness writes with `> "$ROOT/child.pid"`, which creates and
+    // truncates the file before `printf` fills it. Wait for non-empty,
+    // parseable content instead of mere existence, and return that value
+    // rather than re-reading a file that could still be mid-write.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Some(pid) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.trim().parse().ok())
+        {
+            return pid;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    panic!("timed out waiting for pid file {}", path.display());
 }
 
 fn last_beat_pid(path: &Path) -> i32 {
@@ -108,6 +118,10 @@ fn hang_exits_when_its_launching_process_dies() {
     let mut harness = harness(script, &root);
     let worker = read_pid(&root.join("child.pid"));
     wait_until_running(worker, "hang fixture");
+    // Kill only after the watchdog is observing the harness: arming and
+    // the kill otherwise race under load, and a guard that starts after
+    // the reparent cannot see that the launcher is gone.
+    wait_for(|| root.join("guard-armed").exists(), "orphan guard to arm");
 
     // Kill only the harness, not the Worker: the fixture has no supervisor
     // left and must observe the lost parent instead of waiting forever.

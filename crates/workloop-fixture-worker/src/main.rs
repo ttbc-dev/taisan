@@ -524,6 +524,7 @@ fn run_request(args: &Args, ws: &Path) {
 }
 
 fn main() {
+    workloop_orphan_guard::capture_startup_guardian();
     let args = parse();
     let ws = workspace();
     match args.subcommand.as_deref() {
