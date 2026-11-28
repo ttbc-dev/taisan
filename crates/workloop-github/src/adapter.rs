@@ -55,7 +55,9 @@ use workloop_core::observation::{
     DeliveryScope, HostActionStatus, IssueState, NormalizedEffectFact, Observation,
     ObservationFact, OccurrenceInput, ReadSubject, RefRelation,
 };
-use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
+use workloop_core::store::{
+    Effect, HostAction, HostActionIntent, OutboxHoldKind, Store, StoreError,
+};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
 
 use crate::api::{
@@ -78,8 +80,9 @@ enum ProbeCredential {
 }
 use crate::fixture::{
     AttemptOutcome, CredentialBlock, OutboxReport, ReconcileReport, SkippedIntent,
-    SourceRefreshReport, declared_sources, latest_recorded_head, latest_recorded_issue,
-    latest_recorded_merge, latest_recorded_merge_check, latest_recorded_mergeability,
+    SourceRefreshReport, clear_outbox_hold, declared_sources, hold_deferred_outbox,
+    latest_recorded_head, latest_recorded_issue, latest_recorded_merge,
+    latest_recorded_merge_check, latest_recorded_mergeability, record_outbox_hold,
     recorded_change_pairs,
 };
 
@@ -352,8 +355,23 @@ impl<C: GitHubApi> GitHubAdapter<C> {
     ) -> Result<(), StoreError> {
         // The installation-level grant is the outermost control: a
         // revoked `host_write` stops the drain even for executions
-        // admitted under a more permissive configuration.
+        // admitted under a more permissive configuration. Every
+        // pending intent gets a durable hold so a denied drain does
+        // not starve intents invisibly.
         if !config.allowed_effects.host_write {
+            store.transact(|tx| {
+                for intent in tx.action_intents()? {
+                    if intent.status == HostActionStatus::Pending {
+                        tx.apply(&Effect::RecordOutboxHold {
+                            action_id: intent.action_id.clone(),
+                            work_id: intent.work_id.clone(),
+                            hold_kind: OutboxHoldKind::Skipped,
+                            reason: "host_write_denied".to_string(),
+                        })?;
+                    }
+                }
+                Ok(())
+            })?;
             return Ok(());
         }
         let mut attempted: HashSet<String> = HashSet::new();
@@ -365,7 +383,29 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             })?;
             let Some(intent) = next else { break };
             attempted.insert(intent.action_id.clone());
-            self.attempt(store, config, intent, now_unix_seconds)?;
+            match self.attempt(store, config, intent.clone(), now_unix_seconds)? {
+                AttemptOutcome::Attempted | AttemptOutcome::Crashed => {
+                    clear_outbox_hold(store, &intent.action_id)?;
+                }
+                AttemptOutcome::CredentialBlocked(code) => {
+                    record_outbox_hold(
+                        store,
+                        &intent.action_id,
+                        &intent.work_id,
+                        OutboxHoldKind::CredentialBlocked,
+                        code,
+                    )?;
+                }
+                AttemptOutcome::Skipped(reason) => {
+                    record_outbox_hold(
+                        store,
+                        &intent.action_id,
+                        &intent.work_id,
+                        OutboxHoldKind::Skipped,
+                        reason,
+                    )?;
+                }
+            }
         }
         Ok(())
     }
@@ -402,18 +442,27 @@ impl<C: GitHubApi> GitHubAdapter<C> {
         // The installation-level `host_write` grant denies the whole
         // drain — the pass still classifies every pending in-scope
         // intent `host_write_denied` instead of returning an empty
-        // report that hides the held work.
+        // report that hides the held work. The durable hold row
+        // records the same verdict so a denied drain cannot starve
+        // intents invisibly.
         if !config.allowed_effects.host_write {
             report.skipped = store.transact(|tx| {
-                Ok(tx
-                    .action_intents()?
-                    .into_iter()
-                    .filter(|i| i.status == HostActionStatus::Pending && in_scope(i))
-                    .map(|i| SkippedIntent {
-                        action_id: i.action_id,
-                        reason: "host_write_denied",
-                    })
-                    .collect())
+                let mut skipped = Vec::new();
+                for intent in tx.action_intents()? {
+                    if intent.status == HostActionStatus::Pending && in_scope(&intent) {
+                        tx.apply(&Effect::RecordOutboxHold {
+                            action_id: intent.action_id.clone(),
+                            work_id: intent.work_id.clone(),
+                            hold_kind: OutboxHoldKind::Skipped,
+                            reason: "host_write_denied".to_string(),
+                        })?;
+                        skipped.push(SkippedIntent {
+                            action_id: intent.action_id,
+                            reason: "host_write_denied",
+                        });
+                    }
+                }
+                Ok(skipped)
             })?;
             return Ok(report);
         }
@@ -424,18 +473,12 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             // the per-tick item budget and the tick deadline. Whichever
             // trips, the untouched remainder is reported, never dropped.
             if report.attempted >= max_items || deadline.is_some_and(|d| clock() >= d) {
-                report.deferred = store.transact(|tx| {
-                    Ok(tx
-                        .action_intents()?
-                        .into_iter()
-                        .filter(|i| {
-                            i.status == HostActionStatus::Pending
-                                && !attempted.contains(&i.action_id)
-                                && in_scope(i)
-                        })
-                        .map(|i| i.action_id)
-                        .collect())
-                })?;
+                let reason = if report.attempted >= max_items {
+                    "max_items"
+                } else {
+                    "deadline"
+                };
+                report.deferred = hold_deferred_outbox(store, &attempted, scope, reason)?;
                 break;
             }
             let next = store.transact(|tx| {
@@ -447,16 +490,34 @@ impl<C: GitHubApi> GitHubAdapter<C> {
             })?;
             let Some(intent) = next else { break };
             let action_id = intent.action_id.clone();
+            let work_id = intent.work_id.clone();
             attempted.insert(action_id.clone());
             match self.attempt(store, config, intent, now)? {
-                AttemptOutcome::Attempted => report.attempted += 1,
+                AttemptOutcome::Attempted => {
+                    report.attempted += 1;
+                    clear_outbox_hold(store, &action_id)?;
+                }
                 AttemptOutcome::CredentialBlocked(code) => {
+                    record_outbox_hold(
+                        store,
+                        &action_id,
+                        &work_id,
+                        OutboxHoldKind::CredentialBlocked,
+                        code,
+                    )?;
                     report.credential_blocked.push(CredentialBlock {
                         action_id: action_id.clone(),
                         code,
                     });
                 }
                 AttemptOutcome::Skipped(reason) => {
+                    record_outbox_hold(
+                        store,
+                        &action_id,
+                        &work_id,
+                        OutboxHoldKind::Skipped,
+                        reason,
+                    )?;
                     report.skipped.push(SkippedIntent {
                         action_id: action_id.clone(),
                         reason,
@@ -464,18 +525,9 @@ impl<C: GitHubApi> GitHubAdapter<C> {
                 }
                 AttemptOutcome::Crashed => {
                     report.attempted += 1;
-                    report.deferred = store.transact(|tx| {
-                        Ok(tx
-                            .action_intents()?
-                            .into_iter()
-                            .filter(|i| {
-                                i.status == HostActionStatus::Pending
-                                    && !attempted.contains(&i.action_id)
-                                    && in_scope(i)
-                            })
-                            .map(|i| i.action_id)
-                            .collect())
-                    })?;
+                    clear_outbox_hold(store, &action_id)?;
+                    report.deferred =
+                        hold_deferred_outbox(store, &attempted, scope, "attempt_crashed")?;
                     break;
                 }
             }

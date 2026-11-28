@@ -5052,6 +5052,63 @@ fn ingest_completion_clears_a_recorded_deferral() {
     );
 }
 
+/// #516: an outbox hold row is one record per `action_id` —
+/// re-recording preserves `since_seq` and advances `last_seen_seq`,
+/// `ClearOutboxHold` deletes it, and a settle receipt
+/// (`UpdateHostActionIntent`) supersedes it on every path.
+#[test]
+fn an_outbox_hold_is_upserted_cleared_and_superseded_on_settle() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, _e) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("oh1"), NOW).unwrap());
+    let record = |kind: OutboxHoldKind, reason: &str| Effect::RecordOutboxHold {
+        action_id: "act-hold".into(),
+        work_id: w.clone(),
+        hold_kind: kind,
+        reason: reason.into(),
+    };
+    let holds = |store: &SqliteStore| store.transact(|tx| tx.outbox_holds()).unwrap();
+
+    apply_effects(
+        &store,
+        &[record(OutboxHoldKind::Skipped, "missing_execution")],
+    );
+    let first = holds(&store);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].kind, OutboxHoldKind::Skipped);
+    assert_eq!(first[0].reason, "missing_execution");
+    assert_eq!(first[0].since_seq, first[0].last_seen_seq);
+
+    apply_effects(&store, &[record(OutboxHoldKind::Deferred, "max_items")]);
+    let again = holds(&store);
+    assert_eq!(again.len(), 1, "one row per intent, not a log per pass");
+    assert_eq!(again[0].since_seq, first[0].since_seq);
+    assert!(again[0].last_seen_seq > first[0].last_seen_seq);
+    assert_eq!(again[0].kind, OutboxHoldKind::Deferred);
+
+    // A receipt is the intent's newest outcome: the hold is
+    // superseded even when the update names no live intent row.
+    apply_effects(
+        &store,
+        &[Effect::UpdateHostActionIntent {
+            action_id: "act-hold".into(),
+            status: HostActionStatus::Applied,
+            authenticated_actor: None,
+            effects: vec![],
+        }],
+    );
+    assert!(holds(&store).is_empty(), "a settle supersedes the hold");
+
+    apply_effects(&store, &[record(OutboxHoldKind::Skipped, "host_mismatch")]);
+    apply_effects(
+        &store,
+        &[Effect::ClearOutboxHold {
+            action_id: "act-hold".into(),
+        }],
+    );
+    assert!(holds(&store).is_empty(), "an explicit clear deletes too");
+}
+
 /// S-3a (#149) review fix: `Done` records only that the check process
 /// resolved — the publish gate counts it solely on its own proven
 /// `Exited{0}` evidence. A failed, signaled, or status-unproven check
@@ -5628,7 +5685,7 @@ fn a_v2_store_upgrades_to_the_current_format_preserving_rows() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 18, "the upgrade lands on the current format");
+        assert_eq!(version, 19, "the upgrade lands on the current format");
     }
     // A second open must not re-migrate — the schema is already current.
     let _ = SqliteStore::open(&db, 1).unwrap();
@@ -5693,7 +5750,7 @@ fn a_v9_store_gains_the_retirement_generation_column() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 18, "the upgrade lands on the current format");
+        assert_eq!(version, 19, "the upgrade lands on the current format");
     }
     drop(store);
     // Re-opening after the upgrade is a no-op, not a second migration.
@@ -5745,7 +5802,7 @@ fn a_v12_store_gains_the_observation_execution_index() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 18, "the upgrade lands on the current format");
+        assert_eq!(version, 19, "the upgrade lands on the current format");
     }
     drop(store);
     // Re-opening after the upgrade is a no-op, not a second migration.
@@ -5754,7 +5811,7 @@ fn a_v12_store_gains_the_observation_execution_index() {
 }
 
 /// Regression (#379, #506): a v16 store lacks both the v17
-/// `invocation_requests.placement_binding` and the v18
+/// `invocation_requests.placement_binding` and the v19
 /// `artifact_handoffs.verification_placement` columns; opening it adds
 /// both inside the idempotent upgrade transaction, request rows survive
 /// and read back as pre-placement rows (`placement: None` — their
@@ -5840,12 +5897,12 @@ fn a_v16_store_gains_the_placement_binding_column() {
             .unwrap();
         assert!(
             has_handoff_pin,
-            "the v16->v18 path also adds handoff verification_placement"
+            "the v16->v19 path also adds handoff verification_placement"
         );
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 18, "the upgrade lands on the current format");
+        assert_eq!(version, 19, "the upgrade lands on the current format");
     }
     // The pre-placement request row reads back unbound — its executor
     // is the coordinator host's local one, never a retarget.
@@ -5861,7 +5918,7 @@ fn a_v16_store_gains_the_placement_binding_column() {
 }
 
 /// Regression (#506): a v17 store's `artifact_handoffs` lacks the
-/// v18 `verification_placement` column; opening it adds the column
+/// v19 `verification_placement` column; opening it adds the column
 /// inside the idempotent upgrade transaction. A pre-pin handoff row
 /// reads back with no placement, ready for the first verification
 /// pass to bind it.
@@ -5901,11 +5958,11 @@ fn a_v17_store_gains_the_handoff_verification_placement_column() {
             |r| r.get(0),
         )
         .unwrap();
-    assert!(has, "the v17->v18 migration adds verification_placement");
+    assert!(has, "the v17->v19 migration adds verification_placement");
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 18, "the upgrade lands on the current format");
+    assert_eq!(version, 19, "the upgrade lands on the current format");
     drop(conn);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -7976,7 +8033,7 @@ fn a_previous_release_v1_store_is_upgraded_in_place() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 18, "the upgrade lands on the current format");
+        assert_eq!(version, 19, "the upgrade lands on the current format");
     }
     // Re-opening after the upgrade is a no-op, not a second migration.
     drop(store);

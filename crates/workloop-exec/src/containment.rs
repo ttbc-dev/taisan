@@ -532,6 +532,15 @@ fn masked_file_dests_among(plan: &MountPlan, file: &Path, binds: &[&str]) -> Vec
 /// `None` admits the plan. Callers check before rendering argv: a
 /// refused plan never reaches `bwrap`.
 pub fn plan_denial(plan: &MountPlan) -> Option<String> {
+    plan_denial_with_homes(plan, &owner_home_dirs())
+}
+
+/// [`plan_denial`] against an explicit guarded-home set — the
+/// production value is [`owner_home_dirs`]; tests inject a crafted
+/// home beneath their own temp directory so the guard can be
+/// exercised without reading or writing the operator's account
+/// directory.
+fn plan_denial_with_homes(plan: &MountPlan, owner_homes: &[PathBuf]) -> Option<String> {
     for (source, what) in [
         (plan.toolchain.as_ref(), "verification toolchain"),
         (plan.provider_config.as_ref(), "provider config"),
@@ -568,7 +577,6 @@ pub fn plan_denial(plan: &MountPlan) -> Option<String> {
     // spelled at the home directory itself — or an ancestor of it —
     // would expose the whole tree, so the comparison is made on the
     // resolved spelling and cannot be dodged by a symlinked path.
-    let owner_homes = owner_home_dirs();
     let all_sources = [
         plan.workspace.as_ref().map(|(path, _)| path),
         plan.request.as_ref(),
@@ -2081,6 +2089,49 @@ mod tests {
         plan.masked_files = vec![dir.clone()];
         let reason = plan_denial(&plan).expect("an unshadowable entry refuses");
         assert!(reason.contains("not a regular file"), "{reason}");
+        // A mask-root tmpfs renders before every plan bind, so a
+        // supervised bind re-mounts the tree over it. The `/dev/null`
+        // shadow must render after that re-mount or the credential
+        // becomes visible again. `/usr/lib` grounds the mask root in a
+        // fixed system prefix; a host without that layout skips this
+        // ordering proof.
+        let system_root = Path::new("/usr/lib");
+        let system_file = std::fs::read_dir(system_root).ok().and_then(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .find(|path| path.is_file())
+        });
+        if let Some(system_file) = system_file {
+            let mut plan = plan_fixture();
+            plan.masked_files = vec![system_file.clone()];
+            plan.supervised_binds = vec![system_root.to_path_buf()];
+            plan.mask_roots = vec![system_root.to_path_buf()];
+            let args = bwrap_args(
+                Path::new("/usr/bin/bwrap"),
+                &plan,
+                &["worker".into()],
+                "/workspace",
+            );
+            let text = args.join(" ");
+            let tmpfs = text
+                .find("--tmpfs /usr/lib")
+                .expect("the mask root tmpfs renders");
+            let supervised = text
+                .find("--ro-bind /usr/lib /usr/lib")
+                .expect("the supervised bind re-mounts the mask root");
+            let mask = text
+                .find(&format!("--ro-bind /dev/null {}", system_file.display()))
+                .expect("the shadow renders after the re-mount");
+            assert!(
+                tmpfs < supervised && supervised < mask,
+                "tmpfs, then supervised re-mount, then the shadow: {text}"
+            );
+            assert!(
+                plan_denial(&plan).is_none(),
+                "the tmpfs-remounted credential still shadows: {text}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2433,27 +2484,37 @@ mod tests {
     /// the named path; the tmpfs `/home` keeps the rest invisible.
     #[test]
     fn plan_denial_refuses_the_owners_home_as_a_bind_source() {
-        let Some(home) = std::env::var_os("HOME")
-            .filter(|home| !home.is_empty())
-            .map(PathBuf::from)
-        else {
-            return;
-        };
+        // A crafted home beneath the test temp dir: the guard is
+        // exercised through the same env spelling it consumes in
+        // production, but nothing here reads or writes the operator's
+        // real account directory — a read-only home cannot panic the
+        // test and a failed assertion cannot leak a probe file.
+        let dir = tmp("home-guard");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let resolved_home = home.canonicalize().unwrap();
+        let homes = owner_home_dirs_from(Some(home.clone().into_os_string()));
+        assert!(
+            homes.contains(&resolved_home),
+            "the crafted HOME is a guarded home: {homes:?}"
+        );
+        let beneath = home.join("probe");
+        std::fs::write(&beneath, b"probe").unwrap();
         let mut plan = plan_fixture();
         plan.extra_binds = vec![home.clone()];
-        let reason = plan_denial(&plan).expect("the home directory refuses");
+        let reason = plan_denial_with_homes(&plan, &homes).expect("the home directory refuses");
         assert!(reason.contains("owner's home"), "{reason}");
-        // The guard decides on the resolved spelling, never on the
-        // filesystem: a never-created name strictly beneath the home
-        // exercises the same admission without writing into the
-        // operator's account directory — nothing here can panic on a
-        // read-only home or leak a probe file.
-        let beneath = home.join(format!("workloop-home-bind-{}", std::process::id()));
+        // An ancestor of the home exposes it just as completely.
+        plan.extra_binds = vec![dir.clone()];
+        let reason = plan_denial_with_homes(&plan, &homes).expect("an ancestor of home refuses");
+        assert!(reason.contains("owner's home"), "{reason}");
+        // A path strictly beneath the home mounts only the named path.
         plan.extra_binds = vec![beneath];
         assert!(
-            plan_denial(&plan).is_none(),
+            plan_denial_with_homes(&plan, &homes).is_none(),
             "a path beneath the home still binds only the named path"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The home guard must not lapse with the environment spelling:

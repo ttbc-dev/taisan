@@ -1,0 +1,12 @@
+[package]
+name = "workloop-orphan-guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Internal helper for the test-only fixture Workers; not a release
+# artifact.
+[package.metadata.dist]
+dist = false
+
+[dependencies]
