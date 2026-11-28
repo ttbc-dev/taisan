@@ -382,7 +382,8 @@ fn unsafe_names_are_refused_before_any_subprocess() {
         for result in [
             api.read_branch(&repo, branch).map(|_| ()),
             api.write_ref(&repo, branch, "new000", None).map(|_| ()),
-            api.list_pulls_on_branch(&repo, branch, "want1").map(|_| ()),
+            api.list_pulls_on_branch(&repo, branch, Some("want1"))
+                .map(|_| ()),
         ] {
             assert!(
                 matches!(result, Err(ApiError::Refused { .. })),
@@ -671,10 +672,16 @@ esac
     );
     let mut api = GhCliApi::with_gh(gh);
     let pulls = api
-        .list_pulls_on_branch(&repository(), "feature/x", "want1")
+        .list_pulls_on_branch(&repository(), "feature/x", Some("want1"))
         .unwrap();
     assert_eq!(pulls.len(), 1, "only the recorded head revision matches");
     assert_eq!(pulls[0].id, "PR_a");
+    // The unfiltered read (#514's `unknown` reconcile) sees every pull
+    // on the branch.
+    let all = api
+        .list_pulls_on_branch(&repository(), "feature/x", None)
+        .unwrap();
+    assert_eq!(all.len(), 2, "None lists the whole branch");
     // The branch filter rides `-f` fields, never a hand-joined query.
     let log = calls(&dir);
     assert!(

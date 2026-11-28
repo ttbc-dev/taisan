@@ -804,7 +804,7 @@ fn live_duplicate_delivery_single_effect() {
     // dedupe never minted a second.
     let pulls = adapter
         .client_mut()
-        .list_pulls_on_branch(&live_repo(&env), &branch, &sha)
+        .list_pulls_on_branch(&live_repo(&env), &branch, Some(&sha))
         .unwrap();
     assert_eq!(pulls.len(), 1, "one change request, one recorded effect");
     // Remote cleanup runs before the record is retained: a panic in
