@@ -2801,6 +2801,7 @@ fn assess(
                     | ObservationFact::Issue { .. }
                     | ObservationFact::Assessment { .. }
                     | ObservationFact::Mergeability { .. }
+                    | ObservationFact::RemoteFence { .. }
             ) =>
         {
             crate::projection::current_execution(tx, work_id)?
@@ -2903,6 +2904,74 @@ fn assess(
                     vec![RepairPrerequisite::OperatorDecision],
                     now_unix_seconds,
                 )?;
+            }
+            Ok(())
+        }
+        ObservationFact::RemoteFence {
+            invocation_id,
+            class,
+            detail,
+            ..
+        } => {
+            // A fenced remote writer is never released: the Invocation
+            // stays an unresolved writer (a live remote process may
+            // still exist) and is marked `unknown` — the outcome
+            // survives the resolution loop, which keeps driving the
+            // durable stop intent under any incarnation the contract
+            // permits, so a later provable answer still settles the
+            // writer under the recorded desired action. An Execution
+            // already carrying a cancel/fail/pause desire keeps it —
+            // `pause_for_repair` guards every state it cannot move —
+            // and a terminal Execution is never resurrected. The
+            // `remote_fence` classification on the decision ledger is
+            // what the named Attention derives from while the fence
+            // holds the Execution in `stopping`/`uncertain`/`paused`.
+            if let Some(invocation_id) = invocation_id {
+                mark_invocation(tx, invocation_id, |_| InvocationState::Unknown)?;
+            }
+            let detail = format!("repair: remote fence {}: {detail}", class.as_str());
+            let unheld = execution.desired_action.is_none()
+                || execution.desired_action == Some(DesiredAction::Continue);
+            let movable = matches!(
+                execution.state,
+                ExecutionState::Queued
+                    | ExecutionState::Ready
+                    | ExecutionState::Running
+                    | ExecutionState::Waiting
+                    | ExecutionState::Uncertain
+            );
+            if unheld && movable {
+                pause_for_repair(
+                    tx,
+                    &execution,
+                    "remote_fence",
+                    &detail,
+                    vec![RepairPrerequisite::OperatorDecision],
+                    now_unix_seconds,
+                )?;
+            } else if !execution.state.is_terminal() {
+                // An Execution already on its recorded stop/pause path —
+                // or carrying a recorded desire — is never moved, but the
+                // fence decision still lands on the ledger, or the named
+                // Attention has nothing to derive from (the same rule
+                // `escalate_conflict` applies to a human-held pause).
+                let usage = tx
+                    .work_usage(&execution.work_id)?
+                    .unwrap_or_else(|| WorkUsage::new(&execution.work_id));
+                let seq = tx.alloc_seq()?;
+                tx.apply(&Effect::InsertRecoveryDecision {
+                    decision: RecoveryDecision {
+                        id: new_id("rd"),
+                        work_id: execution.work_id.clone(),
+                        execution_id: Some(execution.id.clone()),
+                        classification: "remote_fence".into(),
+                        signature: None,
+                        prerequisites: vec![RepairPrerequisite::OperatorDecision],
+                        detail,
+                        usage_after: serde_json::to_value(&usage).unwrap_or_default(),
+                        seq,
+                    },
+                })?;
             }
             Ok(())
         }

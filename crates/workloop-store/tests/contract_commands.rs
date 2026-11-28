@@ -5924,7 +5924,7 @@ fn a_v2_store_upgrades_to_the_current_format_preserving_rows() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 19, "the upgrade lands on the current format");
+        assert_eq!(version, 20, "the upgrade lands on the current format");
     }
     // A second open must not re-migrate — the schema is already current.
     let _ = SqliteStore::open(&db, 1).unwrap();
@@ -5989,7 +5989,7 @@ fn a_v9_store_gains_the_retirement_generation_column() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 19, "the upgrade lands on the current format");
+        assert_eq!(version, 20, "the upgrade lands on the current format");
     }
     drop(store);
     // Re-opening after the upgrade is a no-op, not a second migration.
@@ -6041,7 +6041,7 @@ fn a_v12_store_gains_the_observation_execution_index() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 19, "the upgrade lands on the current format");
+        assert_eq!(version, 20, "the upgrade lands on the current format");
     }
     drop(store);
     // Re-opening after the upgrade is a no-op, not a second migration.
@@ -6141,7 +6141,7 @@ fn a_v16_store_gains_the_placement_binding_column() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 19, "the upgrade lands on the current format");
+        assert_eq!(version, 20, "the upgrade lands on the current format");
     }
     // The pre-placement request row reads back unbound — its executor
     // is the coordinator host's local one, never a retarget.
@@ -6201,7 +6201,7 @@ fn a_v17_store_gains_the_handoff_verification_placement_column() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 19, "the upgrade lands on the current format");
+    assert_eq!(version, 20, "the upgrade lands on the current format");
     drop(conn);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -8272,7 +8272,7 @@ fn a_previous_release_v1_store_is_upgraded_in_place() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 19, "the upgrade lands on the current format");
+        assert_eq!(version, 20, "the upgrade lands on the current format");
     }
     // Re-opening after the upgrade is a no-op, not a second migration.
     drop(store);

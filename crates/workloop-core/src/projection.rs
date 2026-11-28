@@ -412,6 +412,44 @@ fn attention_views(
             );
         }
     }
+    // A remote-executor fence (contract §14, #378) is a recorded
+    // decision too — the possibly-live writer keeps the Execution in
+    // `stopping`, `uncertain`, or `paused` while the fence class holds
+    // the writer reservation. The named Attention carries the fence
+    // class so the operator sees *which* failure family fenced it —
+    // `remote_fence:<class>` is the issue's "named Attention" for
+    // every reconciliation failure class. The fence detail doubles as
+    // the recorded pause reason by construction, so — unlike
+    // `conflict_unresolvable` — there is no `paused_judgment`
+    // suppression: while `stopping`/`uncertain` nothing else names the
+    // fence at all, and while `paused` the reservation a fence holds
+    // is exactly what the operator is deciding.
+    // The states a fence parks — plus any execution still carrying a
+    // recorded desire the fence could not override: a held execution
+    // never moves, but the fence decision on its ledger must surface or
+    // the writer's reservation is invisible while the desire waits.
+    if !execution.state.is_terminal()
+        && (matches!(
+            execution.state,
+            ExecutionState::Paused | ExecutionState::Stopping | ExecutionState::Uncertain
+        ) || execution.desired_action.is_some())
+    {
+        for decision in tx.recovery_decisions(work_id)? {
+            if decision.execution_id.as_ref() != Some(&execution.id)
+                || decision.classification != "remote_fence"
+                || decision.seq <= execution.enqueued_seq
+            {
+                continue;
+            }
+            push(
+                "remote_fence",
+                decision.id.clone(),
+                None,
+                "decide the fenced remote writer: stop, rebind, or abandon it",
+                vec![decision.detail.clone()],
+            );
+        }
+    }
     // No-progress: durable usage says nothing material happened inside the
     // policy window. Attention only — never proof of termination. A
     // progress record that cannot be classified (no basis, or predating

@@ -1,6 +1,6 @@
--- workloop v19 store: current-state tables enforcing structural
+-- workloop v20 store: current-state tables enforcing structural
 -- invariants, plus an append-only event_log carrying EventSequence.
--- `PRAGMA user_version = 19` marks the format; a stamped older file with
+-- `PRAGMA user_version = 20` marks the format; a stamped older file with
 -- the complete recognized schema upgrades additively at open, while an
 -- unversioned slice-0 database and a newer version are refused.
 -- v7 added work_usage.last_progress_basis; v8 added the intake run and
@@ -20,7 +20,9 @@
 -- the outbox_holds record (#516): why each held pending intent was not
 -- attempted in the pass that last recorded it; v19 added the
 -- artifact_handoffs.verification_placement column pinning the separate
--- verification placement and bound executor at handoff creation (#506).
+-- verification placement and bound executor at handoff creation (#506);
+-- v20 added the executor_reconcile durable reconciliation cursor (#378,
+-- docs/executor-transport-contract.md §14).
 
 CREATE TABLE IF NOT EXISTS store_meta (
     key TEXT PRIMARY KEY,
@@ -518,6 +520,23 @@ CREATE TABLE IF NOT EXISTS executor_collections (
         ('collecting', 'collected', 'acknowledged', 'invalid')),
     invalid_reason TEXT,
     recorded_seq INTEGER NOT NULL
+);
+
+-- The durable reconcile cursor for one bound request (`docs/executor-
+-- transport-contract.md` §14, #378): consecutive unproductive
+-- reconciliation steps, the emitted fence class, and the persisted
+-- backoff schedule. Durable because a transport fault that never
+-- reached an operation leaves no operation-ledger record — bounded
+-- retry cannot be reconstructed from `executor_operations` alone.
+-- `updated_seq` is the compare-and-set cursor the
+-- `UpsertExecutorReconcile` effect guards; `fenced_class` carries the
+-- contract §14 closed fence vocabulary once the fault budget is spent.
+CREATE TABLE IF NOT EXISTS executor_reconcile (
+    request_id TEXT PRIMARY KEY REFERENCES executor_bindings(request_id),
+    consecutive_faults INTEGER NOT NULL,
+    fenced_class TEXT,
+    next_attempt_unix_ms INTEGER NOT NULL,
+    updated_seq INTEGER NOT NULL
 );
 
 -- Two-phase bounded reclaim plans for explicit `retention cleanup`.

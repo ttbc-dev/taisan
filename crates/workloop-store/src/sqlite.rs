@@ -10,8 +10,8 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `19` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1` through `18`
+//! `PRAGMA user_version` is the format gate: `20` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1` through `19`
 //! must carry the complete recognized schema of its version and
 //! upgrades additively at open; a stamped file whose schema is foreign
 //! or incomplete, an unversioned database with user tables (a slice-0
@@ -64,8 +64,10 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// `19` adds the `artifact_handoffs.verification_placement` column —
 /// the verification placement and bound executor pinned when the
 /// handoff row is created (#506).
+/// `20` adds the `executor_reconcile` durable reconciliation cursor
+/// (`docs/executor-transport-contract.md` §14, #378).
 /// Older files upgrade additively at open.
-pub(crate) const FORMAT_VERSION: i64 = 19;
+pub(crate) const FORMAT_VERSION: i64 = 20;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -85,6 +87,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "executor_bindings",
     "executor_collections",
     "executor_operations",
+    "executor_reconcile",
     "finding_occurrences",
     "host_action_intents",
     "id_counters",
@@ -162,6 +165,11 @@ const V14_ADDED_TABLES: &[&str] = &["executor_collections"];
 /// The table the v17 → v18 migration adds (the durable outbox hold
 /// record, #516). Installed by the same `SCHEMA` batch on upgrade.
 const V17_ADDED_TABLES: &[&str] = &["outbox_holds"];
+
+/// The table the v19 → v20 migration adds (the durable remote
+/// reconciliation cursor, #378). Installed by the same `SCHEMA`
+/// batch on upgrade.
+const V19_ADDED_TABLES: &[&str] = &["executor_reconcile"];
 
 /// How long a writer waits on the file lock before `SQLITE_BUSY` surfaces.
 /// Connection-local (applies inside `transact` and during `init` itself) and
@@ -374,12 +382,13 @@ impl SqliteStore {
             // not a table), a v5–v7 file everything except the v8 and
             // v9 additions (v6 and v7 each add a column, not a table),
             // and a v8 file everything except the v9 addition, a
-            // v9–v13 file everything except the v13 and v14
-            // additions, a v14 file everything except v15's
-            // collection table, a v15–v17 file everything except
-            // v18's hold table (v16 and v17 each add a column, not a
-            // table), and a v18 file everything (v19 adds a column,
-            // not a table). A
+            // v9–v13 file everything except the v13, v14, v17, and
+            // v19 additions, a v14 file everything except the v14,
+            // v17, and v19 additions, a v15–v17 file everything
+            // except the v17 and v19 additions (v16 and v17 each
+            // add a column, not a table), and a v18 or v19 file
+            // everything except v20's reconcile cursor (v19 adds
+            // a column, not a table). A
             // foreign or
             // truncated stamped file fails this check untouched, and
             // the accepted difference is a previous release's store: it
@@ -401,6 +410,7 @@ impl SqliteStore {
                             && !V13_ADDED_TABLES.contains(t)
                             && !V14_ADDED_TABLES.contains(t)
                             && !V17_ADDED_TABLES.contains(t)
+                            && !V19_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version == 2 {
@@ -415,6 +425,7 @@ impl SqliteStore {
                             && !V13_ADDED_TABLES.contains(t)
                             && !V14_ADDED_TABLES.contains(t)
                             && !V17_ADDED_TABLES.contains(t)
+                            && !V19_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 5 {
@@ -428,6 +439,7 @@ impl SqliteStore {
                             && !V13_ADDED_TABLES.contains(t)
                             && !V14_ADDED_TABLES.contains(t)
                             && !V17_ADDED_TABLES.contains(t)
+                            && !V19_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 8 {
@@ -440,6 +452,7 @@ impl SqliteStore {
                             && !V13_ADDED_TABLES.contains(t)
                             && !V14_ADDED_TABLES.contains(t)
                             && !V17_ADDED_TABLES.contains(t)
+                            && !V19_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 9 {
@@ -451,6 +464,7 @@ impl SqliteStore {
                             && !V13_ADDED_TABLES.contains(t)
                             && !V14_ADDED_TABLES.contains(t)
                             && !V17_ADDED_TABLES.contains(t)
+                            && !V19_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 11 {
@@ -461,6 +475,7 @@ impl SqliteStore {
                             && !V13_ADDED_TABLES.contains(t)
                             && !V14_ADDED_TABLES.contains(t)
                             && !V17_ADDED_TABLES.contains(t)
+                            && !V19_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 14 {
@@ -470,29 +485,38 @@ impl SqliteStore {
                         !V13_ADDED_TABLES.contains(t)
                             && !V14_ADDED_TABLES.contains(t)
                             && !V17_ADDED_TABLES.contains(t)
+                            && !V19_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 15 {
                 // A v14 file holds every table the v13 → v14
-                // migration installed; only the v15 and v18 additions
-                // may be absent (v16 and v17 each add a column, not a
-                // table).
+                // migration installed; only the v15, v18, and v20
+                // additions may be absent (v16 and v17 each add a
+                // column, not a table, and v19 adds a column, not
+                // a table).
                 EXPECTED_TABLES
                     .iter()
-                    .filter(|t| !V14_ADDED_TABLES.contains(t) && !V17_ADDED_TABLES.contains(t))
+                    .filter(|t| {
+                        !V14_ADDED_TABLES.contains(t)
+                            && !V17_ADDED_TABLES.contains(t)
+                            && !V19_ADDED_TABLES.contains(t)
+                    })
                     .all(|t| present.contains(*t))
             } else if version < 18 {
                 // A v15–v17 file holds every table except the v18
-                // hold record (v16 and v17 each add a column, not a
-                // table).
+                // hold record and v20's reconcile cursor (v16 and
+                // v17 each add a column, not a table).
                 EXPECTED_TABLES
                     .iter()
-                    .filter(|t| !V17_ADDED_TABLES.contains(t))
+                    .filter(|t| !V17_ADDED_TABLES.contains(t) && !V19_ADDED_TABLES.contains(t))
                     .all(|t| present.contains(*t))
             } else {
-                // A v18 file holds every table; v19 adds a column,
-                // not a table.
-                EXPECTED_TABLES.iter().all(|t| present.contains(*t))
+                // A v18 or v19 file holds every table except v20's
+                // reconcile cursor (v19 adds a column, not a table).
+                EXPECTED_TABLES
+                    .iter()
+                    .filter(|t| !V19_ADDED_TABLES.contains(t))
+                    .all(|t| present.contains(*t))
             };
             if !required_complete {
                 return Err(StoreError::UnsupportedFormat {
@@ -1372,6 +1396,21 @@ fn executor_operation_from_row(
     })
 }
 
+const EXECUTOR_RECONCILE_COLS: &str =
+    "request_id, consecutive_faults, fenced_class, next_attempt_unix_ms, updated_seq";
+
+fn executor_reconcile_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<workloop_core::executor::ExecutorReconcile, rusqlite::Error> {
+    Ok(workloop_core::executor::ExecutorReconcile {
+        request_id: row.get(0)?,
+        consecutive_faults: row.get(1)?,
+        fenced_class: row.get(2)?,
+        next_attempt_unix_ms: row.get(3)?,
+        updated_seq: row.get(4)?,
+    })
+}
+
 const EXECUTOR_COLLECTION_COLS: &str = "request_id, invocation_id, collection_id, \
      collection_digest, collection_body, body_digest, state, invalid_reason, recorded_seq";
 
@@ -2228,6 +2267,33 @@ impl ReadView for Tx<'_> {
             }
         }
         Ok(operations)
+    }
+
+    fn executor_bindings(
+        &self,
+    ) -> Result<Vec<workloop_core::executor::ExecutorBinding>, StoreError> {
+        // Rows are returned verbatim: the reconcile driver verifies each
+        // binding's `fields()` per request and fences `record_corrupt`
+        // for the one that fails — a single corrupt row must never
+        // stall every other bound request's reconciliation.
+        self.query_all(
+            &format!("SELECT {EXECUTOR_BINDING_COLS} FROM executor_bindings ORDER BY request_id"),
+            params![],
+            executor_binding_from_row,
+        )
+    }
+
+    fn executor_reconcile(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<workloop_core::executor::ExecutorReconcile>, StoreError> {
+        self.query_opt(
+            &format!(
+                "SELECT {EXECUTOR_RECONCILE_COLS} FROM executor_reconcile WHERE request_id=?1"
+            ),
+            params![request_id],
+            executor_reconcile_from_row,
+        )
     }
 
     fn executor_collection(
@@ -3528,6 +3594,80 @@ impl TxView for Tx<'_> {
                         detail: format!(
                             "executor collection {} advanced concurrently",
                             collection.request_id
+                        ),
+                    });
+                }
+            }
+            Effect::UpsertExecutorReconcile {
+                cursor,
+                expected_seq,
+            } => {
+                let bound: Option<i64> = self.query_opt(
+                    "SELECT 1 FROM executor_bindings WHERE request_id=?1",
+                    params![cursor.request_id],
+                    |row| row.get(0),
+                )?;
+                if bound.is_none() {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "executor reconcile cursor names unbound request {}",
+                            cursor.request_id
+                        ),
+                    });
+                }
+                // The expectation is checked before the write: an
+                // insert claims absence (expected_seq == 0), an
+                // update names the seq it read — a mismatched
+                // expectation conflicts instead of silently losing a
+                // newer fault count.
+                let existing_seq: Option<i64> = self.query_opt(
+                    "SELECT updated_seq FROM executor_reconcile WHERE request_id=?1",
+                    params![cursor.request_id],
+                    |row| row.get(0),
+                )?;
+                match existing_seq {
+                    None if *expected_seq != 0 => {
+                        return Err(StoreError::ConstraintConflict {
+                            detail: format!(
+                                "executor reconcile cursor {} was believed recorded at \
+                                 seq {} but is absent",
+                                cursor.request_id, expected_seq
+                            ),
+                        });
+                    }
+                    Some(seq) if seq != *expected_seq => {
+                        return Err(StoreError::ConstraintConflict {
+                            detail: format!(
+                                "executor reconcile cursor {} advanced concurrently",
+                                cursor.request_id
+                            ),
+                        });
+                    }
+                    _ => {}
+                }
+                let n = self.exec(
+                    "INSERT INTO executor_reconcile \
+                     (request_id, consecutive_faults, fenced_class, \
+                      next_attempt_unix_ms, updated_seq) \
+                     VALUES (?1,?2,?3,?4,?5) \
+                     ON CONFLICT(request_id) DO UPDATE SET \
+                     consecutive_faults=?2, fenced_class=?3, \
+                     next_attempt_unix_ms=?4, updated_seq=?5 \
+                     WHERE executor_reconcile.updated_seq=?6",
+                    params![
+                        cursor.request_id,
+                        cursor.consecutive_faults,
+                        cursor.fenced_class,
+                        cursor.next_attempt_unix_ms,
+                        cursor.updated_seq,
+                        expected_seq,
+                    ],
+                )?;
+                if n == 0 {
+                    return Err(StoreError::ConstraintConflict {
+                        detail: format!(
+                            "executor reconcile cursor {} advanced concurrently",
+                            cursor.request_id
                         ),
                     });
                 }

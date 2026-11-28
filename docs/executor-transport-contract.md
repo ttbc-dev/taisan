@@ -651,3 +651,79 @@ old capability declaration.
 The second example does not authorize a new start. The coordinator keeps the
 writer reservation and reconciles or stops the possible process through the
 same Invocation identity.
+
+## 14. Coordinator lifecycle reconciliation
+
+The coordinator keeps a durable operation ledger (`executor_operations`) and a
+reconcile cursor (`executor_reconcile`) per bound request. A restart replays
+this ledger against the endpoint's own durable request/operation records;
+neither side invents work the other cannot verify. The following invariants
+hold for every bound request:
+
+- **Single writer.** One `start` command identity is admitted per request; the
+  `executor_one_start` index makes a second start row a structural conflict.
+  An unanswered or `unknown` start is queried under the recorded identity —
+  never re-dispatched, never minted under a fresh operation id.
+- **Persist-before-send.** Every command the coordinator sends is committed to
+  the operation ledger before the wire sees it; a coordinator restart replays
+  the same canonical bytes. Receipts attach only to their recorded command.
+- **Durable stop intent.** A recorded `request_stop` command is the stop
+  intent — durable evidence, not session state. Reconciliation re-drives
+  intent → signal → inspect until a `stopped` receipt carries a proof bound
+  to `bound_incarnation_id`.
+- **No release without proof.** Writer release requires a `stopped` receipt
+  whose `proof.incarnation_id` equals the binding's `bound_incarnation_id`.
+  `running`, `exited` (leader gone, descendants unproven), `unknown`,
+  `unavailable`, and transport faults never release the reservation.
+- **Idempotent start.** Re-issuing the recorded start identity returns the
+  recorded result; it never mints a second start row.
+- **Bounded retry.** Consecutive unproductive reconcile steps persist in the
+  reconcile cursor; `transport_max_retries` bounds them and the persisted
+  `transport_backoff_seconds` schedule gates re-drives. A fault that never
+  reached an operation still counts.
+- **Deadline carry.** The absolute deadline recorded in the binding bounds
+  every minted operation's remaining budget; replayed commands carry their
+  original fields — a restart can never refund runtime.
+
+### Fencing decision table
+
+A possibly-live writer is an unreceipted/`unknown`/`started` start, or a stop
+intent without a bound proof. Fences are fail-closed: the `RemoteFence` fact
+marks the Invocation `unknown` (never released), moves the Execution to its
+stop/pause hold, and derives the named Attention `remote_fence` carrying the
+class. A fenced request mints and sends nothing; only a durable terminal
+record minted by the bound incarnation is still adopted under a fence.
+
+| Evidence at reconcile time | Fence class | Coordinator behavior |
+| --- | --- | --- |
+| Responder/session incarnation ≠ `bound_incarnation_id`, writer possibly live, probe under the recorded binding cannot prove the stop | `incarnation_changed` | Fence; reservation held; the durable stop intent stays re-driveable only through durable records |
+| Same mismatch, but a recorded or freshly answered `stopped` receipt binds `bound_incarnation_id` | none | Adopt the terminal record; settle the writer through the normal stop-settle path |
+| Consecutive transport faults (connect, IO, or foreign/unverifiable receipts) reach `transport_max_retries` | `transport_exhausted` | Fence; backoff schedule was persisted per step |
+| Receipts answer `unknown`/`unavailable`, or `stop_requested`/still-live answers persist past the bound | `unanswerable` | Fence; unproven liveness is bounded like a fault |
+| The endpoint refuses a recorded operation as `conflicting_replay` | `conflicting_replay` | Fence; the two ledgers disagree — nothing proceeds |
+| A durable binding or operation row fails read-side verification | `record_corrupt` | Fence that request; other bound requests reconcile normally |
+| A reconcile write loses the cursor CAS or a local replay conflicts | `ledger_conflict` | Fence; an orchestration disagreement the pass cannot resolve alone |
+| `start` answered `known_not_started`/`refused` (non-`conflicting_replay`) | none | `LaunchRefused`; the writer is proven never to have existed |
+| Binding recorded, no `start` ever issued (crash between bind and start) | none | `awaiting_dispatch`; dispatch owns the next step |
+| `running`/`exited` answer under the bound incarnation | none | Adopt/keep observing; the reservation holds either way |
+
+### Failure taxonomy
+
+The closed `RemoteFenceClass` vocabulary — every reconciliation failure class
+names one of these so the Attention a fenced writer produces is named by its
+class:
+
+| Class | Meaning |
+| --- | --- |
+| `incarnation_changed` | Session responder incarnation differs from the recorded `bound_incarnation_id` while a writer may still live |
+| `transport_exhausted` | Connect/IO faults exceeded `transport_max_retries` |
+| `conflicting_replay` | The endpoint's replay fence refused a recorded command — the ledgers disagree |
+| `unanswerable` | `unknown`/`unavailable`/unproven answers persisted past the bounded budget |
+| `record_corrupt` | A durable binding or operation row failed verification — reconciliation never acts on corrupt evidence |
+| `ledger_conflict` | A local store write refused a reconcile step (CAS loss or conflicting replay) |
+
+Local lifecycle loops (poll, signal/inspect, deferred report collection,
+request consume) never touch a remote-bound invocation: presence of a durable
+`executor_bindings` row routes the request to the reconcile driver, and an
+unresolved remote writer blocks the local stop-settle without ever receiving
+a local signal.

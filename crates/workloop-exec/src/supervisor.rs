@@ -2380,6 +2380,16 @@ impl<P: ProcessControlPort> Supervisor<P> {
             return self.dispatch_remote(store, request, now_unix_seconds);
         }
 
+        // Remote-bound without a Remote placement (a pre-placement row,
+        // or a binding minted before the placement column existed): the
+        // reconcile driver owns this request's lifecycle — the local
+        // dispatch must neither spawn a writer for it nor inspect for
+        // one.
+        if self.remote_bound(store, &request.request_id)? {
+            self.mark_consumed(store, &request.request_id)?;
+            return Ok(());
+        }
+
         if let Some(invocation) =
             store.transact(|tx| tx.invocation_for_request(&request.request_id))?
         {
@@ -3742,6 +3752,17 @@ impl<P: ProcessControlPort> Supervisor<P> {
         Ok(())
     }
 
+    /// Whether the request carries a durable executor binding. Remote
+    /// placements own their lifecycle through `remote_reconcile`
+    /// (contract §14): the local signal/inspect/report paths hold no
+    /// identities they may trust for a remote writer and must leave it
+    /// to the reconcile driver.
+    fn remote_bound(&self, store: &impl Store, request_id: &str) -> Result<bool, ExecError> {
+        Ok(store
+            .transact(|tx| tx.executor_binding(request_id))?
+            .is_some())
+    }
+
     fn mark_consumed(&self, store: &impl Store, request_id: &str) -> Result<(), ExecError> {
         store
             .transact(|tx| {
@@ -3809,6 +3830,12 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 if !belongs {
                     continue;
                 }
+            }
+            // Remote-bound writers are driven by the remote reconcile
+            // pass — the local inspect path holds no identities it may
+            // trust for them.
+            if self.remote_bound(store, &invocation.request_id)? {
+                continue;
             }
             let Some(identity) = invocation.process_identity.clone() else {
                 // Prepared but never identified: the consume commit
@@ -3968,6 +3995,12 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 if !belongs {
                     continue;
                 }
+            }
+            // A remote-bound writer's report arrives through the
+            // remote collection contract — the local path would only
+            // ever find its absence.
+            if self.remote_bound(store, &invocation.request_id)? {
+                continue;
             }
             let Some(request) = store.transact(|tx| tx.request(&invocation.request_id))? else {
                 continue;
@@ -4973,11 +5006,22 @@ impl<P: ProcessControlPort> Supervisor<P> {
                 continue;
             }
             let invocations = store.transact(|tx| tx.invocations_for_execution(&execution.id))?;
-            let mut unresolved: Vec<Invocation> = invocations
+            // Remote-bound writers are partitioned out: the remote
+            // reconcile pass drives their stop intent to proof, and no
+            // local signal may target them — but an unresolved remote
+            // writer still blocks the local settle below.
+            let mut unresolved: Vec<Invocation> = Vec::new();
+            let mut remote_unresolved = false;
+            for invocation in invocations
                 .iter()
                 .filter(|i| i.state.is_unresolved_writer())
-                .cloned()
-                .collect();
+            {
+                if self.remote_bound(store, &invocation.request_id)? {
+                    remote_unresolved = true;
+                    continue;
+                }
+                unresolved.push(invocation.clone());
+            }
             // A resolved record is not stop proof on its own: an
             // unverified `Exited` report (e.g. a worker's own done claim)
             // resolves the Invocation while the process may still run,
@@ -4987,6 +5031,11 @@ impl<P: ProcessControlPort> Supervisor<P> {
             // stop intent's snapshot when one exists — verifies stopped.
             for invocation in &invocations {
                 if invocation.state.is_unresolved_writer() {
+                    continue;
+                }
+                // A remote-bound writer's proof lives in the receipt
+                // store, not in local identities.
+                if self.remote_bound(store, &invocation.request_id)? {
                     continue;
                 }
                 let intent = store.transact(|tx| tx.stop_intent(&invocation.id))?;
@@ -5001,7 +5050,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     unresolved.push(invocation.clone());
                 }
             }
-            if unresolved.is_empty() {
+            if unresolved.is_empty() && !remote_unresolved {
                 // Every recorded writer is resolved and every recorded
                 // process is verified stopped (or none ever ran):
                 // reporting the exit fact lets `work` settle the

@@ -19,6 +19,7 @@ pub mod remote_custody;
 pub mod remote_dispatch;
 pub mod remote_export;
 pub mod remote_prepare;
+pub mod remote_reconcile;
 pub mod remote_transfer;
 pub mod report_v2;
 pub mod request_v2;
