@@ -43,6 +43,7 @@ fn tmp_root(tag: &str) -> PathBuf {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),
@@ -346,6 +347,84 @@ fn a_lost_contained_launch_rebinds_by_the_wrapped_signature() {
         e.state,
         ExecutionState::Running,
         "the bwrap-wrapped orphan is found by the argv the spawn really exec'd"
+    );
+    let invocation = only_invocation(&store, &eid);
+    assert!(
+        invocation.process_identity.is_some(),
+        "the orphaned writer's identity is re-recorded"
+    );
+}
+
+/// The same lost contained launch, now with a runtime boundary
+/// installed: the spawn's argv bound the grant's per-launch staged
+/// credential (`runtime-auth.p<pid>.i<instance>.<seq>`) — a name the
+/// resolve pass can never rebuild, because its own `ensure` stages
+/// the NEXT seq (and a restarted supervisor stages under a new owner
+/// tag). The signature comparison must treat the staging-shaped
+/// token as canonical, or the orphan's real argv never compares
+/// equal and the lost writer is never re-bound.
+#[test]
+fn a_lost_contained_launch_rebinds_past_the_rotating_staged_name() {
+    use std::os::unix::fs::PermissionsExt;
+    let store = SqliteStore::in_memory(1).unwrap();
+    let root = tmp_root("lost-contained-auth");
+    let port = ScriptedProcessControl::new();
+    // Exactly the launch gate: the version probe plus the nine-probe
+    // battery. Every later probe — `describe` and the recovery pass's
+    // re-proof — falls through to the scripted auto-declaration.
+    for _ in 0..10 {
+        port.push_probe(Ok(ProbeOutcome::Exited {
+            stdout: b"bubblewrap 0.9.0\n".to_vec(),
+            success: true,
+        }));
+    }
+    // Spawn happened; the response was lost — the process may exist.
+    port.push_plan(SpawnPlan::Unknown {
+        reason: "timeout between spawn and response".into(),
+    });
+    let secret = root.join("provider-token");
+    std::fs::write(&secret, "dummy-credential").unwrap();
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let sup = Supervisor::new(port.clone(), root.clone(), vec!["/bin/sh".into()], config())
+        .with_isolation_profile(IsolationProfile {
+            id: "test-lost-contained-auth",
+            env_passthrough: &[],
+            sandbox_primitive: Some("sh"),
+            ca_trust_paths: &[],
+            commit_identity: None,
+        })
+        .with_runtime_boundary(workloop_exec::boundary::RuntimeBoundary::new(
+            workloop_exec::boundary::BoundaryConfig {
+                credential_ref: Some(format!("file:{}", secret.display())),
+                provider_config: None,
+                model_api_hosts: vec![],
+                runtime_dir: root.join(".runtime"),
+                egress_dir: root.join(".egress"),
+                relay_exe: PathBuf::from("/bin/sh"),
+            },
+        ));
+    let (_w, eid) = submit_and_admit(&store, "k-lost-contained-auth");
+    sup.consume_requests(&store, NOW).unwrap();
+    // The launch argv really did bind a per-grant staged name — the
+    // token the resolve pass cannot rebuild verbatim.
+    let spawned = port.spawned_commands();
+    assert!(
+        spawned[0].contains("runtime-auth.p"),
+        "the contained launch binds the per-grant staged credential: {}",
+        spawned[0]
+    );
+    sup.poll_invocations(&store, NOW).unwrap();
+    sup.run_once(&store, NOW + 1).unwrap();
+    assert_eq!(
+        port.spawn_calls(),
+        1,
+        "the lost start response never produces a second writer"
+    );
+    let e = store.transact(|tx| tx.execution(&eid)).unwrap().unwrap();
+    assert_eq!(
+        e.state,
+        ExecutionState::Running,
+        "the orphan is re-bound though resolve staged a different credential name"
     );
     let invocation = only_invocation(&store, &eid);
     assert!(
@@ -1596,6 +1675,7 @@ fn a_v1_review_launch_mounts_the_workspace_read_only() {
         .transact(|tx| {
             tx.apply(&Effect::InsertRequest {
                 request: InvocationRequest {
+                    placement: None,
                     request_id: format!("{}:inv:7", eid.0),
                     work_id: w.clone(),
                     execution_id: eid.clone(),
@@ -1788,6 +1868,7 @@ fn a_contained_assessment_binds_the_workspace_read_only() {
             })?;
             tx.apply(&Effect::InsertRequest {
                 request: InvocationRequest {
+                    placement: None,
                     request_id: format!("{}:inv:check", check_eid.0),
                     work_id: check_work.clone(),
                     execution_id: check_eid.clone(),

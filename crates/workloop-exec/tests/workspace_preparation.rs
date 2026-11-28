@@ -43,6 +43,7 @@ fn repo() -> RepositoryRef {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),
@@ -271,6 +272,7 @@ fn insert_request_row(
         .transact(|tx| {
             tx.apply(&Effect::InsertRequest {
                 request: InvocationRequest {
+                    placement: None,
                     request_id: request_id.into(),
                     work_id: work_id.clone(),
                     execution_id: execution_id.clone(),
@@ -322,6 +324,8 @@ fn layout(root: &Path) -> HandoffLayout {
         out_root: root.join("out"),
         state_root: None,
         verification: None,
+        verification_placement: workloop_core::placement::PlacementTarget::Local,
+        remote_verification_executor: None,
     }
 }
 
@@ -550,6 +554,7 @@ fn acknowledge_predecessor(
                     state: HandoffState::Acknowledged,
                     invalid_reason: None,
                     attempt: 0,
+                    verification_placement: None,
                     recorded_seq: seq,
                 },
                 expected_seq: 0,
@@ -989,6 +994,7 @@ fn fix_manifest_mismatch_and_non_descendant_refuse() {
                     state: HandoffState::Acknowledged,
                     invalid_reason: None,
                     attempt: 0,
+                    verification_placement: None,
                     recorded_seq: seq,
                 },
                 expected_seq: 0,

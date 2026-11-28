@@ -56,6 +56,7 @@ fn publisher() -> HostActorRef {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),
@@ -1086,6 +1087,96 @@ fn host_write_denied_leaves_the_outbox_pending() {
     gh.apply_outbox(&store, &config(), NOW).unwrap();
     assert_eq!(gh.applied(), &["push_ref:test-host/local-repo:head-1"]);
     assert_eq!(intent_status(&store, &action_id), HostActionStatus::Applied);
+}
+
+/// #516: the fixture drain records the same durable holds the real
+/// adapter does — a denied or skipped intent and a bound-tripped
+/// remainder each leave a kind + reason row, and a real attempt
+/// supersedes the record.
+#[test]
+fn a_held_intent_records_a_durable_hold() {
+    let holds = |store: &SqliteStore| store.transact(|tx| tx.outbox_holds()).unwrap();
+    let push = |branch: &str| HostAction::PushRef {
+        branch: branch.into(),
+        produced: rev("head-1"),
+        expected_prior: None,
+    };
+
+    // Installation-level `host_write` denied: a `skipped` hold per
+    // pending intent.
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (work_id, _eid) = submit(&store, "k-hold-deny");
+    let denied_id = insert_intent(&store, &work_id, push("work/denied"));
+    let mut denied = config();
+    denied.allowed_effects.host_write = false;
+    let mut gh = FixtureGithub::new();
+    let report = gh
+        .apply_outbox_bounded(&store, &denied, &mut || NOW, None, None, 10)
+        .unwrap();
+    assert!(
+        report.skipped.iter().any(|s| s.action_id == denied_id),
+        "{report:?}"
+    );
+    let hold = holds(&store)
+        .into_iter()
+        .find(|h| h.action_id == denied_id)
+        .expect("a denied intent records its hold");
+    assert_eq!(hold.kind, OutboxHoldKind::Skipped);
+    assert_eq!(hold.reason, "host_write_denied");
+    // The grant restored: the attempt supersedes the hold.
+    gh.apply_outbox(&store, &config(), NOW).unwrap();
+    assert_eq!(intent_status(&store, &denied_id), HostActionStatus::Applied);
+    assert!(
+        holds(&store).iter().all(|h| h.action_id != denied_id),
+        "an attempted intent supersedes its hold"
+    );
+
+    // Per-execution `host_write` denied: the intent is skipped without
+    // charging the budget and records its `skipped` hold.
+    let (denied_work, denied_e) = submit(&store, "k-hold-exec");
+    let exec_denied_id = insert_intent(&store, &denied_work, push("work/exec-denied"));
+    store
+        .transact(|tx| {
+            let mut execution = tx.execution(&denied_e)?.unwrap();
+            execution.allowed_effects.host_write = false;
+            tx.apply(&Effect::UpdateExecution {
+                execution,
+                expected_state: ExecutionState::Queued,
+            })
+        })
+        .unwrap();
+    let report = gh
+        .apply_outbox_bounded(&store, &config(), &mut || NOW, None, None, 10)
+        .unwrap();
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|s| s.action_id == exec_denied_id && s.reason == "host_write_denied"),
+        "{report:?}"
+    );
+    let hold = holds(&store)
+        .into_iter()
+        .find(|h| h.action_id == exec_denied_id)
+        .expect("a skipped intent records its hold");
+    assert_eq!(hold.kind, OutboxHoldKind::Skipped);
+    assert_eq!(hold.reason, "host_write_denied");
+
+    // The per-pass bound: the untouched remainder records `deferred`
+    // holds naming the bound that stopped the pass.
+    let (bound_work, _e2) = submit(&store, "k-hold-bound");
+    insert_intent(&store, &bound_work, push("work/head"));
+    let tail_id = insert_intent(&store, &bound_work, push("work/tail"));
+    let report = gh
+        .apply_outbox_bounded(&store, &config(), &mut || NOW, None, Some(&bound_work), 1)
+        .unwrap();
+    assert_eq!(report.deferred, vec![tail_id.clone()], "{report:?}");
+    let hold = holds(&store)
+        .into_iter()
+        .find(|h| h.action_id == tail_id)
+        .expect("a deferred intent records its hold");
+    assert_eq!(hold.kind, OutboxHoldKind::Deferred);
+    assert_eq!(hold.reason, "max_items");
 }
 
 /// A receipt that claims the change opened into a different target

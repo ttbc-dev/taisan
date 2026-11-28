@@ -27,6 +27,7 @@ use workloop_core::executor::{
     item_content_digest,
 };
 use workloop_core::observation::ArtifactFact;
+use workloop_core::placement::PlacementTarget;
 use workloop_core::store::{Effect, Store, StoreError};
 use workloop_core::worker_v2::WorkerRequestV2;
 
@@ -46,6 +47,15 @@ pub struct RemoteCollectLayout {
     pub repository: PathBuf,
     /// The retained-body store report/log bodies commit into.
     pub bodies: BodyStore,
+    /// The coordinator's verification placement at collection time. It
+    /// is pinned on the acknowledged handoff row when that row is
+    /// created, so a later config reload cannot retarget verification
+    /// (#506, `docs/remote-executor.md` §2.2).
+    pub verification_placement: PlacementTarget,
+    /// The bound remote executor identity deferred verification
+    /// evidence names — `Some` exactly when
+    /// `verification_placement == Remote`.
+    pub remote_verification_executor: Option<String>,
 }
 
 /// What a validated collection produced.
@@ -718,6 +728,16 @@ fn validate_produced(
                         ArtifactFact::Corrupt {
                             reason: Some("claimed digest disagrees with the produced blob".into()),
                         }
+                    } else if blob.is_empty() {
+                        // An internally consistent empty blob proves no
+                        // artifact bytes — the same rule the local
+                        // supervisor's `artifact_fact` applies before
+                        // digest evidence. A zero-byte required
+                        // artifact is `Missing`, never `Present`. An
+                        // inconsistent descriptor was already decided
+                        // `Corrupt` above, so this never downgrades a
+                        // rejected claim.
+                        ArtifactFact::Missing
                     } else if required
                         .expected_digest
                         .as_ref()
@@ -836,6 +856,17 @@ fn validate_produced(
             state: HandoffState::Acknowledged,
             invalid_reason: None,
             attempt: 0,
+            verification_placement: Some(
+                handoff::pinned_verification_placement(
+                    layout.verification_placement,
+                    layout.remote_verification_executor.as_deref(),
+                )
+                .ok_or_else(|| {
+                    ProducedRefusal::Fault(fault(
+                        "remote verification placement requires a bound executor",
+                    ))
+                })?,
+            ),
             recorded_seq: 0,
         };
         let upsert = store.transact(|tx| {

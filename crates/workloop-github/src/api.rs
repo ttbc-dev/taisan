@@ -53,6 +53,16 @@ pub struct RepositoryPermissions {
     pub pull: bool,
 }
 
+/// Whether the host lists the pull request as open. A closed pull is
+/// history, never a live change: reconciliation only ever adopts an
+/// `Open` pull as the present effect of `open_change_request` — a
+/// matching payload on a closed pull is a stale record (#514).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullState {
+    Open,
+    Closed,
+}
+
 /// A pull request as GitHub reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemotePull {
@@ -67,6 +77,8 @@ pub struct RemotePull {
     pub target_branch: String,
     pub title: String,
     pub body: String,
+    /// Whether the host lists the PR open.
+    pub state: PullState,
     /// Whether GitHub reports the PR merged. Nothing in this adapter
     /// can set it: merge is a human/policy action outside the port.
     pub merged: bool,
@@ -296,16 +308,19 @@ pub trait GitHubApi {
         marker: &str,
     ) -> Result<Option<RemoteComment>, ApiError>;
 
-    /// List the pull requests opened from `source_branch` whose head is
-    /// the recorded source revision — the reconciliation read for an
-    /// `open_change_request` whose response was lost. Filtering by the
-    /// recorded revision, not merely the branch, prevents adopting a
-    /// change request this Work never opened.
+    /// List the pull requests opened from `source_branch` — the
+    /// reconciliation read for an `open_change_request` whose response
+    /// was lost. `Some` binds the listing to the recorded source
+    /// revision: the head filter, not merely the branch, prevents
+    /// adopting a change request this Work never opened. `None` lists
+    /// every pull on the branch — the `unknown` intent's read, where
+    /// the create may have landed and then watched the pull's head
+    /// follow the source branch past the recorded revision (#514).
     fn list_pulls_on_branch(
         &mut self,
         repository: &RepositoryRef,
         source_branch: &str,
-        head_sha: &str,
+        head_sha: Option<&str>,
     ) -> Result<Vec<RemotePull>, ApiError>;
 
     /// The check runs GitHub reports for the exact `head_sha`.

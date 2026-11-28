@@ -14,7 +14,7 @@ use workloop_core::identity::{
 use workloop_core::observation::Observation;
 use workloop_core::store::{
     Deferral, Effect, HostActionIntent, IntakeCandidate, IntakeCandidateStatus, IntakeRun,
-    ReadView, RecoveryIntent, Store, StoreError, TxView,
+    OutboxHold, ReadView, RecoveryIntent, Store, StoreError, TxView,
 };
 use workloop_core::work::{HostTemplate, WorkloopConfig, handle_command};
 
@@ -26,6 +26,7 @@ fn host_instance() -> HostInstanceId {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: RepositoryRef::new(host_instance(), RepositoryId::trusted("local-repo")),
@@ -230,6 +231,9 @@ impl ReadView for FailingTx<'_> {
         unimplemented!()
     }
     fn deferrals(&self) -> Result<Vec<Deferral>, StoreError> {
+        unimplemented!()
+    }
+    fn outbox_holds(&self) -> Result<Vec<OutboxHold>, StoreError> {
         unimplemented!()
     }
     fn attention_acks(&self, _work_id: &WorkId) -> Result<Vec<String>, StoreError> {

@@ -17,6 +17,7 @@ use workloop_core::domain::*;
 use workloop_core::observation::{
     ArtifactFact, DeliveryId, DeliveryScope, Observation, ObservationFact, ProcessStateFact,
 };
+use workloop_core::placement::PlacementTarget;
 use workloop_core::ports::{
     ProbeOutcome, ProcessControlPort, ProcessEvidence, ProcessMatch, SignalOutcome, SpawnError,
     StopReceipt, WorkerEnv,
@@ -105,6 +106,38 @@ fn checked_ps_output(out: Output, allows_absence: bool) -> std::io::Result<Strin
 /// (spawn, snapshot, re-verify) must produce the same string.
 pub(crate) fn normalize_lstart(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `matching_processes`' equality — whitespace-normalized on both
+/// sides, with any token whose file name is a boundary staging shape
+/// (`runtime-auth`, the legacy `runtime-auth.<seq>`, the owner-tagged
+/// `runtime-auth.p<pid>.i<instance>.<seq>`, or its `.tmp` sibling)
+/// collapsed to one canonical basename. A contained launch's argv
+/// binds the grant's per-launch staged credential, and resolve
+/// rebuilds the signature from durable state where that exact name
+/// does not exist: `ensure` stages a fresh seq on every call, and a
+/// restarted supervisor stages under a new owner tag. The name is
+/// unreconstructable by design — a later grant must never rewrite a
+/// pending mount's path — so it cannot be a discriminating token in
+/// the comparison. Every other token — flags, bind destinations, all
+/// other paths — still compares literally, and a `runtime-auth*` name
+/// that is not one of these shapes (a purely numeric
+/// `runtime-auth.1.2.3` operator file) never normalizes.
+pub(crate) fn normalize_signature(s: &str) -> String {
+    s.split_whitespace()
+        .map(|token| {
+            let path = Path::new(token);
+            match path.file_name().and_then(|name| name.to_str()) {
+                Some(name) if crate::boundary::is_staging_name(name) => {
+                    let mut canonical = path.to_path_buf();
+                    canonical.set_file_name("runtime-auth.*");
+                    canonical.to_string_lossy().into_owned()
+                }
+                _ => token.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// One `ps` table row: `N` integer prefix fields followed by the
@@ -875,7 +908,7 @@ impl ProcessControlPort for PosixProcessControl {
         // behind a false absence. The scan is system-wide, not limited
         // to this process's children: a supervisor restart reparents an
         // orphaned writer, and only the launch signature still finds it.
-        let expected = normalize_lstart(command);
+        let expected = normalize_signature(command);
         let table = ps_output(&["-ewwo", "pid=,command="])
             .map_err(|e| format!("process scan failed: {e}"))?;
         let mut out = Vec::new();
@@ -883,7 +916,7 @@ impl ProcessControlPort for PosixProcessControl {
             let Some(([pid], actual)) = parse_table_row::<1>(line)? else {
                 continue;
             };
-            if normalize_lstart(&actual) != expected {
+            if normalize_signature(&actual) != expected {
                 continue;
             }
             // Re-verify after the snapshot: a matched pid that already
@@ -1236,6 +1269,12 @@ pub struct Supervisor<P: ProcessControlPort> {
     /// `None` fails report collection for v2 invocations rather than
     /// recording evidence that cannot resolve.
     pub body_store: Option<BodyStore>,
+    /// The remote-launch port a remote-bound request crosses
+    /// (`docs/remote-executor.md` §2.2, #379). `None` means no remote
+    /// driver is wired — a remote-bound request refuses as
+    /// `request.placement_unavailable`, the bound verdict, rather than
+    /// ever taking the local launch path.
+    pub remote_dispatch: Option<std::sync::Arc<dyn crate::remote_dispatch::RemoteDispatch>>,
     /// Installation-owned roots a contained launch masks with a fresh
     /// tmpfs when a fixed system bind would otherwise expose them —
     /// the state root holding the store and the workspace root
@@ -1270,6 +1309,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
             v2: None,
             runtime_boundary: None,
             body_store: None,
+            remote_dispatch: None,
             sandbox_mask_roots,
             locks: Mutex::new(HashMap::new()),
             incomplete_scans: Mutex::new(HashMap::new()),
@@ -1333,6 +1373,19 @@ impl<P: ProcessControlPort> Supervisor<P> {
     /// a typed launch refusal, never an ambient fallback.
     pub fn with_runtime_boundary(mut self, boundary: RuntimeBoundary) -> Self {
         self.runtime_boundary = Some(boundary);
+        self
+    }
+
+    /// Wire the remote-launch driver remote-bound requests dispatch
+    /// through (#379). The driver owns the whole remote-launch
+    /// sequence behind the port; reconcile and fencing (#378) plug in
+    /// behind the same trait. Absent means every remote-bound request
+    /// refuses `request.placement_unavailable` — never a local launch.
+    pub fn with_remote_dispatch(
+        mut self,
+        port: std::sync::Arc<dyn crate::remote_dispatch::RemoteDispatch>,
+    ) -> Self {
+        self.remote_dispatch = Some(port);
         self
     }
 
@@ -1543,6 +1596,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     ca_bundles: containment::ca_trust_binds(&self.isolation_profile),
                     extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
+                    supervised_binds: vec![],
                     worker: worker.clone(),
                     mask_roots: self.sandbox_mask_roots.clone(),
                     masked_files: vec![],
@@ -1852,6 +1906,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
         } else {
             Ok(None)
         };
+        let mut placement_conflict: Option<String> = None;
         for (artifact_id, seed, bound) in seeds {
             if deadline_reached(clock, deadline) {
                 break;
@@ -1878,11 +1933,23 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     )?;
                 }
                 Err(crate::handoff::HandoffError::Transport(_)) => {}
+                Err(crate::handoff::HandoffError::PlacementConflict(detail)) => {
+                    // A permanent conflict on one artifact must not starve
+                    // every later seed on every tick: keep driving the rest
+                    // of the pass, then surface the first conflict (retrying
+                    // cannot heal it).
+                    if placement_conflict.is_none() {
+                        placement_conflict = Some(detail);
+                    }
+                }
                 Err(crate::handoff::HandoffError::Store(e)) => {
                     return Err(ExecError::Store(e));
                 }
                 Err(crate::handoff::HandoffError::Io(e)) => return Err(ExecError::Io(e)),
             }
+        }
+        if let Some(detail) = placement_conflict {
+            return Err(ExecError::Fault(detail));
         }
         Ok(())
     }
@@ -2299,6 +2366,20 @@ impl<P: ProcessControlPort> Supervisor<P> {
         let lock = self.lock_for(&request.request_id);
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
 
+        // The recorded placement decides where this request runs
+        // (#379): a remote-bound request never crosses the local
+        // launch path and is never locally reconciled — remote
+        // lifecycle machinery (#378) owns everything after the
+        // decision. `None` is a pre-placement request; its executor
+        // is the coordinator host's local one.
+        if request
+            .placement
+            .as_ref()
+            .is_some_and(|p| p.target == PlacementTarget::Remote)
+        {
+            return self.dispatch_remote(store, request, now_unix_seconds);
+        }
+
         if let Some(invocation) =
             store.transact(|tx| tx.invocation_for_request(&request.request_id))?
         {
@@ -2664,6 +2745,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     ca_bundles: containment::ca_trust_binds(&self.isolation_profile),
                     extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
+                    supervised_binds: vec![],
                     worker: worker.clone(),
                     mask_roots: self.sandbox_mask_roots.clone(),
                     masked_files: vec![],
@@ -2791,6 +2873,158 @@ impl<P: ProcessControlPort> Supervisor<P> {
             }
         }
         Ok(())
+    }
+
+    /// Dispatch a remote-bound request through the placement port
+    /// (#379). The recorded binding is the only authority — the
+    /// endpoint descriptor is read from the request's stored
+    /// placement, never re-resolved from configuration. An
+    /// unavailable or unbindable endpoint is a
+    /// `request.placement_unavailable` dispatch refusal: terminal for
+    /// this `request_id`, a named Attention — never a Fault-retry and
+    /// never a silent local launch.
+    fn dispatch_remote(
+        &self,
+        store: &impl Store,
+        request: &InvocationRequest,
+        now_unix_seconds: i64,
+    ) -> Result<(), ExecError> {
+        // A remote-bound request that already produced an Invocation is
+        // #378's reconcile territory: the local process port cannot
+        // inspect remote identities. The request is consumed and the
+        // recorded lifecycle stands until remote reconcile exists.
+        if store
+            .transact(|tx| tx.invocation_for_request(&request.request_id))?
+            .is_some()
+        {
+            self.mark_consumed(store, &request.request_id)?;
+            return Ok(());
+        }
+
+        // The same Execution-state gate the local paths share: a
+        // request that can never launch spends no build or session.
+        let exec_state = store
+            .transact(|tx| tx.execution(&request.execution_id))?
+            .map(|e| e.state);
+        if exec_state != Some(ExecutionState::Ready) {
+            self.mark_consumed(store, &request.request_id)?;
+            return Ok(());
+        }
+
+        let invocation_id = InvocationId(store.transact(|tx| tx.alloc_id("inv"))?);
+        let unavailable = |detail: String| DispatchRefusal::PlacementUnavailable { detail };
+        let endpoint = request.placement.as_ref().and_then(|p| p.endpoint.as_ref());
+        let (Some(_endpoint), Some(port), Some(dispatch)) =
+            (endpoint, self.remote_dispatch.as_ref(), self.v2.as_ref())
+        else {
+            let detail = if endpoint.is_none() {
+                "remote-bound request carries no endpoint descriptor".to_string()
+            } else if self.v2.is_none() {
+                "remote placement requires the worker_dispatch profile — the \
+                 complete bound-request transport is the only remote dispatch \
+                 path"
+                    .to_string()
+            } else {
+                format!(
+                    "no remote dispatch driver is wired for endpoint {}",
+                    endpoint.map(|e| e.endpoint_id.as_str()).unwrap_or("")
+                )
+            };
+            return self.refuse_dispatch(
+                store,
+                request,
+                &invocation_id.0,
+                unavailable(detail),
+                now_unix_seconds,
+            );
+        };
+
+        // The remote run only ever carries the complete bound-request
+        // transport: the same immutable body a local v2 launch
+        // materializes, durable before any remote operation exists so
+        // report and assessment reads resolve it whichever side of the
+        // port the launch ran on. A recorded row is the launch record —
+        // a pass resuming a faulted dispatch replays its bytes and the
+        // Invocation identity it carries, never a rebuild from live
+        // state under a second identity.
+        let (invocation_id, body) =
+            match store.transact(|tx| tx.worker_request_body(&request.request_id))? {
+                Some(body) => {
+                    let invocation_id = WorkerRequestV2::parse(&body.canonical_body)
+                        .map(|wire| InvocationId(wire.invocation_id))
+                        .map_err(|e| {
+                            ExecError::Fault(format!(
+                                "recorded worker request body for {} does not parse: {e}",
+                                request.request_id
+                            ))
+                        })?;
+                    (invocation_id, body)
+                }
+                None => {
+                    let body = match crate::request_v2::build_request_body(
+                        store,
+                        dispatch,
+                        request,
+                        &invocation_id.0,
+                        now_unix_seconds,
+                    ) {
+                        Ok(body) => body,
+                        Err(crate::request_v2::BuildError::Refusal(refusal)) => {
+                            return self.refuse_dispatch(
+                                store,
+                                request,
+                                &invocation_id.0,
+                                refusal,
+                                now_unix_seconds,
+                            );
+                        }
+                        Err(crate::request_v2::BuildError::Fault(detail)) => {
+                            return Err(ExecError::Fault(detail));
+                        }
+                    };
+                    store.transact(|tx| {
+                        tx.apply(&Effect::InsertWorkerRequestBody { body: body.clone() })
+                    })?;
+                    (invocation_id, body)
+                }
+            };
+
+        let launch = crate::remote_dispatch::RemoteLaunch {
+            dispatch,
+            handoff_repo: self.handoff.as_ref().map(|h| h.repository.as_path()),
+            scratch_root: &crate::request_v2::invocation_io_root(&self.workspace_root),
+            now_unix_seconds,
+        };
+        match port.dispatch(store, request, &invocation_id, &body, &launch) {
+            Ok(outcome) => {
+                // The port's commit recorded the Invocation, the
+                // consumed mark, and the durable executor rows; the
+                // proven remote start reports as process evidence the
+                // same way a local spawn's does.
+                self.report(
+                    store,
+                    request,
+                    ObservationFact::ProcessState {
+                        invocation_id: outcome.invocation_id,
+                        process_identity: outcome.process_identity,
+                        state: ProcessStateFact::Running,
+                        exit_code: None,
+                    },
+                    now_unix_seconds,
+                )
+            }
+            Err(crate::remote_dispatch::RemoteDispatchError::Unavailable { detail }) => self
+                .refuse_dispatch(
+                    store,
+                    request,
+                    &invocation_id.0,
+                    unavailable(detail),
+                    now_unix_seconds,
+                ),
+            Err(crate::remote_dispatch::RemoteDispatchError::Fault(detail)) => {
+                Err(ExecError::Fault(detail))
+            }
+        }
     }
 
     /// The v2 consume path (`docs/v0.3.md` §4): materialize the
@@ -3229,6 +3463,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     ca_bundles: containment::ca_trust_binds(&self.isolation_profile),
                     extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
+                    supervised_binds: vec![],
                     worker: worker.clone(),
                     mask_roots: self.sandbox_mask_roots.clone(),
                     masked_files: vec![],
@@ -3871,7 +4106,10 @@ impl<P: ProcessControlPort> Supervisor<P> {
             );
         };
         // The signature is the full command line the spawn actually
-        // exec'd, which is the bare argv only for v1. A v2 launch
+        // exec'd — compared through `normalize_signature`, so the one
+        // token resolve cannot rebuild (the grant's staged credential
+        // name) is never discriminating — which is the bare argv only
+        // for v1. A v2 launch
         // appended the `run --request/--out` transport pair — the
         // sandbox paths under containment, the host io paths
         // uncontained — and the durable record does not name which
@@ -3970,6 +4208,7 @@ impl<P: ProcessControlPort> Supervisor<P> {
                     ca_bundles: containment::ca_trust_binds(&self.isolation_profile),
                     extra_binds: containment::extra_binds(&inner_argv, worker.as_deref()),
                     extra_rw_binds: vec![],
+                    supervised_binds: vec![],
                     worker: worker.clone(),
                     mask_roots: self.sandbox_mask_roots.clone(),
                     masked_files: vec![],
@@ -6511,6 +6750,8 @@ mod tests {
             PathBuf::from("/unused"),
             vec![],
             workloop_core::work::WorkloopConfig {
+                placement: Ok(workloop_core::placement::PlacementPolicy::default()),
+
                 host: workloop_core::work::HostTemplate {
                     adapter: workloop_core::identity::AdapterId::trusted("fixture"),
                     repository: workloop_core::identity::RepositoryRef::new(
@@ -6625,6 +6866,8 @@ mod tests {
 
     fn scripted_config() -> workloop_core::work::WorkloopConfig {
         workloop_core::work::WorkloopConfig {
+            placement: Ok(workloop_core::placement::PlacementPolicy::default()),
+
             host: workloop_core::work::HostTemplate {
                 adapter: workloop_core::identity::AdapterId::trusted("fixture"),
                 repository: workloop_core::identity::RepositoryRef::new(
@@ -6918,6 +7161,7 @@ mod tests {
             ca_bundles: vec![],
             extra_binds: vec![],
             extra_rw_binds: vec![],
+            supervised_binds: vec![],
             worker: None,
             mask_roots: vec![],
             masked_files: vec![],
@@ -6980,8 +7224,12 @@ mod tests {
             std::env::temp_dir().join(format!("taisan-boundary-grant-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let provider_config = dir.join("provider.toml");
-        std::fs::write(&provider_config, "model = \"demo\"\n").unwrap();
+        let provider_config = dir.join("provider.json");
+        std::fs::write(
+            &provider_config,
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"demo\"}\n",
+        )
+        .unwrap();
         let mut cfg = boundary_config(&dir);
         cfg.credential_ref = Some("env:TAISAN_CONTAINED_EXEC_TOKEN".into());
         cfg.provider_config = Some(provider_config.clone());
@@ -7067,5 +7315,68 @@ mod tests {
             env.vars
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `normalize_signature` folds every staging-shaped basename —
+    /// the legacy `runtime-auth`/`runtime-auth.<seq>` shapes and the
+    /// owner-tagged `runtime-auth.p<pid>.i<instance>.<seq>`, plus
+    /// `.tmp` siblings — to one canonical name, so a launch argv and
+    /// a resolve-rebuilt argv compare equal however their staged
+    /// names differ. Every other token stays literal.
+    #[test]
+    fn normalize_signature_folds_every_staging_shape() {
+        for name in [
+            "runtime-auth",
+            "runtime-auth.7",
+            "runtime-auth.p12.i3.7",
+            "runtime-auth.7.tmp",
+            "runtime-auth.p12.i3.7.tmp",
+        ] {
+            let folded = normalize_signature(&format!("/run/dir/{name}"));
+            assert_eq!(folded, "/run/dir/runtime-auth.*", "{name}");
+        }
+        // The launch's staged name and the resolve pass's fresh stage
+        // are indistinguishable to the signature — the whole point.
+        let launch = "bwrap --ro-bind /r/runtime-auth.p9.i1.0 /taisan/runtime-auth -- sh";
+        let rebuilt = "bwrap --ro-bind /r/runtime-auth.p9.i1.4 /taisan/runtime-auth -- sh";
+        assert_eq!(normalize_signature(launch), normalize_signature(rebuilt));
+        // A restarted supervisor stages under a new owner tag *and*
+        // seq; re-binding the orphan still finds the launch signature.
+        let restarted = "bwrap --ro-bind /r/runtime-auth.p77.i9.2 /taisan/runtime-auth -- sh";
+        assert_eq!(normalize_signature(launch), normalize_signature(restarted));
+        // Whitespace is normalized as part of the same pass.
+        assert_eq!(normalize_signature("a  b\tc"), "a b c");
+    }
+
+    /// The canonical fold must not leak discrimination away: an
+    /// operator file whose name merely starts `runtime-auth.` — a
+    /// purely numeric `runtime-auth.1.2.3` versioned input — is not a
+    /// staging shape and keeps comparing literally, and staged names
+    /// under different directories stay distinct. The `/taisan/`
+    /// bind-destination token folds too — its basename is
+    /// staging-shaped — but it is a fixed constant folded identically
+    /// on both sides, so equality is unaffected.
+    #[test]
+    fn normalize_signature_keeps_non_staging_names_and_dirs_literal() {
+        let numeric = "x --ro-bind /r/runtime-auth.1.2.3 /taisan/runtime-auth";
+        assert_eq!(
+            normalize_signature(numeric),
+            "x --ro-bind /r/runtime-auth.1.2.3 /taisan/runtime-auth.*",
+            "the operator name stays literal; only the staging-shaped \
+             destination basename folds (symmetrically on both sides)"
+        );
+        // A bare `runtime-auth.` prefix alone is not staging grammar.
+        let odd = "x /r/runtime-auth.foo y";
+        assert_eq!(normalize_signature(odd), odd);
+        // Same staged basename, different staging dir: distinct.
+        let a = normalize_signature("bwrap /a/runtime-auth.p1.i1.0 done");
+        let b = normalize_signature("bwrap /b/runtime-auth.p1.i1.0 done");
+        assert_ne!(a, b);
+        // A flag carrying a staging-shaped name still folds — any
+        // token is judged on its file name alone.
+        assert_eq!(
+            normalize_signature("--flag=/r/runtime-auth.p1.i1.0"),
+            "--flag=/r/runtime-auth.*"
+        );
     }
 }

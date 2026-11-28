@@ -1246,8 +1246,8 @@ mod tests {
     use workloop_core::store::{Effect, HostAction, HostActionIntent};
     use workloop_core::work::handle_command;
     use workloop_github::api::{
-        ApiError, GitHubApi, RemoteCheckRun, RemoteComment, RemoteIssue, RemotePull, RemoteReview,
-        RemoteReviewFinding, RepositoryPermissions,
+        ApiError, GitHubApi, PullState, RemoteCheckRun, RemoteComment, RemoteIssue, RemotePull,
+        RemoteReview, RemoteReviewFinding, RepositoryPermissions,
     };
 
     const NOW: i64 = 1_700_000_000;
@@ -1255,6 +1255,7 @@ mod tests {
 
     fn config() -> WorkloopConfig {
         WorkloopConfig {
+            placement: Ok(workloop_core::placement::PlacementPolicy::default()),
             host: workloop_core::work::HostTemplate {
                 adapter: AdapterId::trusted("fixture"),
                 repository: RepositoryRef::new(
@@ -2564,6 +2565,7 @@ mod tests {
                 target_branch: "main".into(),
                 title: "t".into(),
                 body: String::new(),
+                state: PullState::Open,
                 merged: false,
                 mergeable: None,
                 mergeable_state: String::new(),
@@ -2725,6 +2727,7 @@ mod tests {
                 target_branch: target_branch.to_string(),
                 title: title.to_string(),
                 body: body.to_string(),
+                state: PullState::Open,
                 merged: false,
                 mergeable: None,
                 mergeable_state: String::new(),
@@ -2825,7 +2828,7 @@ mod tests {
             &mut self,
             repository: &RepositoryRef,
             source_branch: &str,
-            head_sha: &str,
+            head_sha: Option<&str>,
         ) -> Result<Vec<RemotePull>, ApiError> {
             let fault = self.take_fault("list_pulls_on_branch");
             if let Some(ArmedFault::Refuse(e)) | Some(ArmedFault::Lose(e)) = &fault {
@@ -2838,7 +2841,8 @@ mod tests {
                 .filter(|(key, _)| key.starts_with(&prefix))
                 .filter_map(|(_, p)| match p {
                     Ok(pull)
-                        if pull.source_branch == source_branch && pull.head_sha == head_sha =>
+                        if pull.source_branch == source_branch
+                            && head_sha.is_none_or(|sha| pull.head_sha == sha) =>
                     {
                         Some(pull.clone())
                     }

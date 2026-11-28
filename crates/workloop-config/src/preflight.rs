@@ -46,7 +46,7 @@ use crate::profile::{
 /// store itself stays authoritative at open; this constant only lets
 /// `check` name a newer header without linking the store — `check`
 /// never opens, migrates, or writes the store.
-const KNOWN_STORE_FORMAT_MAX: i64 = 16;
+const KNOWN_STORE_FORMAT_MAX: i64 = 19;
 
 /// The SQLite header magic ("SQLite format 3\0") — a file without it
 /// is not a store at all.

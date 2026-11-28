@@ -154,7 +154,7 @@ stdout_cap_bytes = 33554432            # per-stream cap; not a separate budget
 stderr_cap_bytes = 33554432            # both streams share one runtime.log total
 report_cap_bytes = 1048576
 credential_ref = "env:TAISAN_MODEL_TOKEN"   # runtime credential only; never a host token
-provider_config = "/home/operator/.config/taisan/provider.toml"  # non-secret, absolute
+provider_config = "/home/operator/.config/taisan/worker-bindings.json"  # taisan.worker.bindings/1 contract, non-secret, absolute
 
 [worker.egress]
 model_api_hosts = ["model-api.example"]  # bare host names, CONNECT 443 only
@@ -172,7 +172,7 @@ Validation and delivery rules:
 - `schema_version = 2` requires the complete operational profile. A v2 profile that omits `[worker].credential_ref`, a non-empty model-API host set, the toolchain, or `[host_driver].mode` is a load error; there is no fallback to hygiene-only execution, an ambient runtime credential, or an unrestricted network.
 - `[host_driver].mode` accepts exactly `in_process` in v0.3. `separate` is reserved for a later owner decision and is refused now, as is an unknown value; the scenario bridge is not a valid production mode.
 - `[worker].credential_ref` uses the same `env:`/`file:`/`command:` provider rules as a role reference and resolves only at the supervisor boundary. It grants model access only. It is not a repository-host role and cannot be used for a `push_ref`, comment, review, or other host effect.
-- `[worker].provider_config` is an absolute path to a non-secret file or directory (model identity, endpoint host, limits, empty MCP configuration). It must be owner-readable and must not contain a credential value; a secret found there is a configuration error, not a tolerated convenience. The supervisor renders or validates it and mounts it read-only; `/workspace` cannot override it.
+- `[worker].provider_config` is an absolute path to exactly one regular file — the `taisan.worker.bindings/1` contract document ([runtime-bindings.md](runtime-bindings.md): model identity, endpoint host, adapter-owned extension members). It must be owner-readable and must not contain a credential value; a secret found there is a configuration error, not a tolerated convenience. The supervisor validates it before every dispatch and mounts it read-only; `/workspace` cannot override it.
 - `[worker].stdout_cap_bytes` and `[worker].stderr_cap_bytes` are per-stream truncation points, not separate budgets. Both streams and child-server output are copied into one `runtime.log` whose retained total is the request's shared `max_log_bytes` (32 MiB); the two per-stream values are clamped together by that shared cap and never total 64 MiB. Once the log is full, further bytes are dropped and truncation is recorded.
 - `[worker.egress].model_api_hosts` is a non-empty list of bare host names: no scheme, port, path, wildcard, IP literal, or empty entry. It is disjoint from every `[hosts.*].endpoint` host and from `[verification.egress].allowlist`; overlap is a load error. It is the only destination the Worker proxy may CONNECT to.
 - `[verification].toolchain` and every `cache_paths` entry are absolute, present, and readable before the first dispatch. They are mounted read-only into the verification sandbox. A missing toolchain or cache is a preflight failure, never a download at verification time.
@@ -388,7 +388,7 @@ Named checks for the configuration contract suite (CF). Planned contract scenari
 | CF-23 | Sanitized example parses | The documented example loads under the same validator |
 | CF-24 | Interrupted `init` publish | Either no config or a complete config exists; scratch residue never loads |
 | CF-25 | v2 operational profile missing a required key or containing a non-`in_process` driver | Load refused naming the key; no partial profile and no v1 fallback |
-| CF-26 | v2 provider config contains a secret, is workspace-supplied, or is not read-only | Refused/ignored; only the supervisor-rendered read-only config is used |
+| CF-26 | v2 provider config contains a secret, is workspace-supplied, or is not read-only | Refused/ignored; only the installation-authored, supervisor-validated read-only config is used |
 | CF-27 | v2 model-API host set contains a URL, port, wildcard, empty entry, host overlap, or verification-host overlap | Load error; no wildcard-like grant reaches the proxy |
 | CF-28 | v2 runtime credential is absent, unresolvable, or resolves to a host token | Environment repair; dispatch refused; the value never appears in output |
 | CF-29 | v2 verification toolchain/cache missing or writable | Preflight fails closed; verification never installs dependencies from an open network |

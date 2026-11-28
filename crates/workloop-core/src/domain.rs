@@ -131,6 +131,97 @@ pub fn canonical_json(value: &serde_json::Value) -> Vec<u8> {
     out
 }
 
+/// Parse a JSON document into a `serde_json::Value`, refusing
+/// duplicate object member names at every depth. A lenient last-wins
+/// parse would let a consumer validate only the final value while the
+/// document still carries the ambiguity — and a strict reader may
+/// reject the whole document where a lenient one accepted it, so two
+/// parsers of the same bytes can silently disagree. Every contract
+/// surface that refuses repeated member names shares this parse; the
+/// error names the rule, never the duplicated key.
+pub fn parse_unique_members(bytes: &[u8]) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::from_slice::<UniqueMembers>(bytes).map(|document| document.0)
+}
+
+/// A `serde_json::Value` whose object member names are unique at
+/// every depth — see [`parse_unique_members`].
+struct UniqueMembers(serde_json::Value);
+
+impl<'de> serde::Deserialize<'de> for UniqueMembers {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(UniqueVisitor)
+    }
+}
+
+struct UniqueVisitor;
+
+impl<'de> serde::de::Visitor<'de> for UniqueVisitor {
+    type Value = UniqueMembers;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(UniqueMembers(serde_json::Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(UniqueMembers(value.into()))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(UniqueMembers(value.into()))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+        serde_json::Number::from_f64(value)
+            .map(|n| UniqueMembers(serde_json::Value::Number(n)))
+            .ok_or_else(|| E::custom("non-finite number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(UniqueMembers(value.into()))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueMembers(serde_json::Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueMembers(serde_json::Value::Null))
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        <UniqueMembers as serde::Deserialize>::deserialize(deserializer)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+        while let Some(UniqueMembers(item)) = seq.next_element::<UniqueMembers>()? {
+            items.push(item);
+        }
+        Ok(UniqueMembers(serde_json::Value::Array(items)))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut object = serde_json::Map::new();
+        while let Some((key, UniqueMembers(value))) = map.next_entry::<String, UniqueMembers>()? {
+            if object.contains_key(&key) {
+                // A member name is document content — it may carry a
+                // secret — so the diagnostic names the rule and never
+                // echoes it.
+                return Err(serde::de::Error::custom("duplicate member name"));
+            }
+            object.insert(key, value);
+        }
+        Ok(UniqueMembers(serde_json::Value::Object(object)))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionState {
@@ -780,6 +871,14 @@ pub struct InvocationRequest {
     /// and is the only selection that may spawn this request.
     #[serde(default)]
     pub adapter_binding: Option<WorkerAdapterBinding>,
+    /// The executor-placement decision bound at admission (#379):
+    /// executor identity, resolved target, and the schema
+    /// version/config digest the decision was made under. `None` is a
+    /// request recorded before placement existed — its executor is the
+    /// coordinator host's local one. Once set it is immutable and is
+    /// never retargeted, including while the request stays pending.
+    #[serde(default)]
+    pub placement: Option<crate::placement::PlacementBinding>,
 }
 
 /// A resource a writer may change.
@@ -876,6 +975,21 @@ pub enum HandoffState {
     Invalid,
 }
 
+/// The separate verification placement pinned on the durable handoff
+/// record when the handoff is created (#379, #506). A configuration
+/// reload after the row exists binds only handoffs created after it:
+/// the pinned target and executor decide every later verification run,
+/// so a pending remote-placed requirement can never flip to a local
+/// run (or another executor) between handoff and verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationPlacement {
+    pub target: crate::placement::PlacementTarget,
+    /// The bound executor identity: `local` for a local target, the
+    /// endpoint's identity for a remote target. Recorded even for local
+    /// so the durable decision names the executor it was made under.
+    pub executor: String,
+}
+
 /// One durable artifact-handoff record. `attempt` counts export/import
 /// recovery attempts against the artifact-recovery bound — separate
 /// from `max_invocations`.
@@ -897,6 +1011,12 @@ pub struct ArtifactHandoff {
     /// `stale_base`, `digest_mismatch`, `recovery_exhausted`, ...).
     pub invalid_reason: Option<String>,
     pub attempt: u32,
+    /// The verification placement bound when this handoff was created.
+    /// `None` only on a row written before the pin existed; the first
+    /// verification pass backfills it and refuses to reinterpret an
+    /// existing remote-pending marker under a changed placement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_placement: Option<VerificationPlacement>,
     pub recorded_seq: EventSequence,
 }
 

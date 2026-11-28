@@ -7,7 +7,7 @@
 //! recheck, and the lifecycle assessment land in the same durable
 //! pipeline a real adapter would use.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use workloop_core::domain::{ExecutionId, WorkId, new_id};
@@ -23,7 +23,9 @@ use workloop_core::observation::{
     BranchState, Completeness, DeliveryId, DeliveryScope, HostActionStatus, IssueState,
     NormalizedEffectFact, Observation, ObservationFact, ReadRevision, ReadSubject, RefRelation,
 };
-use workloop_core::store::{HostAction, HostActionIntent, Store, StoreError};
+use workloop_core::store::{
+    Effect, HostAction, HostActionIntent, OutboxHoldKind, Store, StoreError,
+};
 use workloop_core::work::{IngestReceipt, WorkloopConfig, handle_observation};
 use workloop_selector::collect::{CollectedIssue, IssuePage, SourceReadError, SourceReader};
 
@@ -272,6 +274,66 @@ pub(crate) enum AttemptOutcome {
     /// receipt could persist — the test-armed crash point between
     /// apply and receipt-write.
     Crashed,
+}
+
+/// Record this pass's hold verdict for one pending intent — the
+/// durable trace a `Skipped`, `CredentialBlocked`, or `Deferred`
+/// outcome leaves so a held intent cannot starve invisibly.
+pub(crate) fn record_outbox_hold(
+    store: &impl Store,
+    action_id: &str,
+    work_id: &WorkId,
+    kind: OutboxHoldKind,
+    reason: &str,
+) -> Result<(), StoreError> {
+    store.transact(|tx| {
+        tx.apply(&Effect::RecordOutboxHold {
+            action_id: action_id.to_string(),
+            work_id: work_id.clone(),
+            hold_kind: kind,
+            reason: reason.to_string(),
+        })
+    })
+}
+
+/// An attempt ran (or died mid-attempt): the intent's newest outcome
+/// is the attempt itself, so any recorded hold is superseded.
+pub(crate) fn clear_outbox_hold(store: &impl Store, action_id: &str) -> Result<(), StoreError> {
+    store.transact(|tx| {
+        tx.apply(&Effect::ClearOutboxHold {
+            action_id: action_id.to_string(),
+        })
+    })
+}
+
+/// Record a `deferred` hold on every outstanding in-scope intent the
+/// drain never reached — `reason` names the bound that stopped the
+/// pass (`max_items`, `deadline`, `attempt_crashed`) — and return
+/// their ids for the report's `deferred` list.
+pub(crate) fn hold_deferred_outbox(
+    store: &impl Store,
+    attempted: &HashSet<String>,
+    scope: Option<&WorkId>,
+    reason: &'static str,
+) -> Result<Vec<String>, StoreError> {
+    store.transact(|tx| {
+        let mut deferred = Vec::new();
+        for intent in tx.action_intents()? {
+            if intent.status == HostActionStatus::Pending
+                && !attempted.contains(&intent.action_id)
+                && scope.is_none_or(|w| &intent.work_id == w)
+            {
+                tx.apply(&Effect::RecordOutboxHold {
+                    action_id: intent.action_id.clone(),
+                    work_id: intent.work_id.clone(),
+                    hold_kind: OutboxHoldKind::Deferred,
+                    reason: reason.to_string(),
+                })?;
+                deferred.push(intent.action_id);
+            }
+        }
+        Ok(deferred)
+    })
 }
 
 /// What the synthetic remote reports for one source issue read.
@@ -1391,14 +1453,36 @@ impl FixtureGithub {
         // intent may resolve on the next pass).
         // The installation-level grant is the outermost control: a
         // revoked `host_write` stops the drain even for executions that
-        // were admitted under a more permissive configuration.
+        // were admitted under a more permissive configuration. Every
+        // pending in-scope intent gets a `skipped` verdict and a durable
+        // hold rather than a silently empty report.
         let mut report = OutboxReport::default();
         if !config.allowed_effects.host_write {
+            report.skipped = store.transact(|tx| {
+                let mut skipped = Vec::new();
+                for intent in tx.action_intents()? {
+                    if intent.status == HostActionStatus::Pending
+                        && scope.is_none_or(|w| &intent.work_id == w)
+                    {
+                        tx.apply(&Effect::RecordOutboxHold {
+                            action_id: intent.action_id.clone(),
+                            work_id: intent.work_id.clone(),
+                            hold_kind: OutboxHoldKind::Skipped,
+                            reason: "host_write_denied".to_string(),
+                        })?;
+                        skipped.push(SkippedIntent {
+                            action_id: intent.action_id,
+                            reason: "host_write_denied",
+                        });
+                    }
+                }
+                Ok(skipped)
+            })?;
             return Ok(report);
         }
         let now = clock();
         let in_scope = |intent: &HostActionIntent| scope.is_none_or(|w| &intent.work_id == w);
-        let mut attempted = std::collections::HashSet::new();
+        let mut attempted = HashSet::new();
         loop {
             // Both bounds stop the drain before the next item starts:
             // the per-tick item budget and the tick deadline. Whichever
@@ -1409,19 +1493,12 @@ impl FixtureGithub {
             // budget, so a permanently pending intent never starves the
             // ready intents behind it.
             if report.attempted >= max_items || deadline.is_some_and(|d| clock() >= d) {
-                let pending: Vec<String> = store.transact(|tx| {
-                    Ok(tx
-                        .action_intents()?
-                        .into_iter()
-                        .filter(|i| {
-                            i.status == HostActionStatus::Pending
-                                && !attempted.contains(&i.action_id)
-                                && in_scope(i)
-                        })
-                        .map(|i| i.action_id)
-                        .collect())
-                })?;
-                report.deferred = pending;
+                let reason = if report.attempted >= max_items {
+                    "max_items"
+                } else {
+                    "deadline"
+                };
+                report.deferred = hold_deferred_outbox(store, &attempted, scope, reason)?;
                 break;
             }
             let next = store.transact(|tx| {
@@ -1433,16 +1510,34 @@ impl FixtureGithub {
             })?;
             let Some(intent) = next else { break };
             let action_id = intent.action_id.clone();
+            let work_id = intent.work_id.clone();
             attempted.insert(action_id.clone());
             match self.attempt(store, config, intent, now)? {
-                AttemptOutcome::Attempted => report.attempted += 1,
+                AttemptOutcome::Attempted => {
+                    report.attempted += 1;
+                    clear_outbox_hold(store, &action_id)?;
+                }
                 AttemptOutcome::CredentialBlocked(code) => {
+                    record_outbox_hold(
+                        store,
+                        &action_id,
+                        &work_id,
+                        OutboxHoldKind::CredentialBlocked,
+                        code,
+                    )?;
                     report.credential_blocked.push(CredentialBlock {
                         action_id: action_id.clone(),
                         code,
                     });
                 }
                 AttemptOutcome::Skipped(reason) => {
+                    record_outbox_hold(
+                        store,
+                        &action_id,
+                        &work_id,
+                        OutboxHoldKind::Skipped,
+                        reason,
+                    )?;
                     report.skipped.push(SkippedIntent {
                         action_id: action_id.clone(),
                         reason,
@@ -1455,18 +1550,9 @@ impl FixtureGithub {
                 // reported like a bound-exhausted remainder.
                 AttemptOutcome::Crashed => {
                     report.attempted += 1;
-                    report.deferred = store.transact(|tx| {
-                        Ok(tx
-                            .action_intents()?
-                            .into_iter()
-                            .filter(|i| {
-                                i.status == HostActionStatus::Pending
-                                    && !attempted.contains(&i.action_id)
-                                    && in_scope(i)
-                            })
-                            .map(|i| i.action_id)
-                            .collect())
-                    })?;
+                    clear_outbox_hold(store, &action_id)?;
+                    report.deferred =
+                        hold_deferred_outbox(store, &attempted, scope, "attempt_crashed")?;
                     break;
                 }
             }

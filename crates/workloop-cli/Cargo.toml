@@ -52,4 +52,4 @@ workloop-evidence-protocol = { version = "0.3.0", path = "../workloop-evidence-p
 [dev-dependencies]
 # The propose suite installs a deterministic mid-batch store fault
 # (a trigger aborting one decision save) directly on the SQLite store.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }

@@ -197,6 +197,23 @@ pub enum Effect {
     ClearDeferral {
         execution_id: ExecutionId,
     },
+    /// Why a pending outbox intent was not attempted this pass; the
+    /// durable "held" row the outbox drain records instead of leaving
+    /// a silently starving intent. One row per `action_id`: the first
+    /// record's `since_seq` is preserved on update while
+    /// `last_seen_seq` moves to the latest pass that re-recorded the
+    /// hold, so a continuous hold is one row, not a log per pass.
+    RecordOutboxHold {
+        action_id: String,
+        work_id: WorkId,
+        hold_kind: OutboxHoldKind,
+        reason: String,
+    },
+    /// The intent was attempted (or settled) — any recorded hold is
+    /// superseded.
+    ClearOutboxHold {
+        action_id: String,
+    },
     InsertAttentionAck {
         work_id: WorkId,
         attention_id: String,
@@ -589,6 +606,43 @@ pub struct Deferral {
     pub since_seq: EventSequence,
 }
 
+/// Which outbox-drain outcome held a pending intent this pass. Closed
+/// vocabulary — persisted as snake_case tags and CHECK-constrained in
+/// SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboxHoldKind {
+    /// The intent was reached but no host attempt ran: another host
+    /// instance owns it, its Execution is missing, its `host_write`
+    /// grant is denied, or the pre-write read was indeterminate. The
+    /// `reason` carries the drain's skip verdict.
+    Skipped,
+    /// The credential binding failed before any host call; `reason`
+    /// is the `credential.*` failure class, never the ref or a secret.
+    CredentialBlocked,
+    /// The drain never reached the intent: the tick deadline, the
+    /// per-tick item budget, or a crashed attempt stopped the pass
+    /// first. `reason` names which.
+    Deferred,
+}
+
+/// An outbox hold: why a pending intent stayed unattempted in a pass,
+/// keyed by `action_id` — the `anomalies` census's explanation of a
+/// starving outbox intent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutboxHold {
+    pub action_id: String,
+    pub work_id: WorkId,
+    pub kind: OutboxHoldKind,
+    pub reason: String,
+    /// The event position the hold was first recorded at; preserved
+    /// across re-records so hold age is queue-order time.
+    pub since_seq: EventSequence,
+    /// The event position of the most recent pass that re-recorded
+    /// this hold — a row still held every pass stays at the frontier.
+    pub last_seen_seq: EventSequence,
+}
+
 /// Closed lifecycle of a durable recovery intent. A restart cannot
 /// resurrect a `retired` intent or re-fire a `consumed` one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -722,6 +776,29 @@ pub trait ReadView {
         idempotency_key: &str,
     ) -> Result<Option<(String, CommandDecision)>, StoreError>;
 
+    /// At most `limit` distinct idempotency keys carrying a saved
+    /// decision for `(origin, actor)` that start with `prefix`, in key
+    /// order. Intake uses this to size a selector request beyond the
+    /// known replay identities: re-presenting a saved decision creates
+    /// no new pending position, so a replay must not consume the
+    /// budget that new proposals need.
+    ///
+    /// The prefix and limit keep the read bounded: the commands ledger
+    /// is never pruned, so an unbounded read would grow with every
+    /// admission. Only as many keys as the ask can use are returned.
+    ///
+    /// The default has no durable history to report; the SQLite store
+    /// overrides it with the command ledger.
+    fn decided_idempotency_keys(
+        &self,
+        _origin: &Origin,
+        _actor: &Actor,
+        _prefix: &str,
+        _limit: u32,
+    ) -> Result<Vec<String>, StoreError> {
+        Ok(Vec::new())
+    }
+
     fn command_decision(
         &self,
         command_id: &CommandId,
@@ -758,6 +835,19 @@ pub trait ReadView {
 
     /// Approved requests not yet consumed by `execution`.
     fn pending_requests(&self) -> Result<Vec<InvocationRequest>, StoreError>;
+    /// Every durable request row for `execution`, consumed or not, in
+    /// committed order. Inspection needs the consumed-by-gate rows too:
+    /// a request can be consumed with neither an Invocation nor a
+    /// dispatch-refusal fact, so the pending set alone would hide it.
+    ///
+    /// The default has no durable request log to enumerate; the SQLite
+    /// store overrides it with the invocation_requests table.
+    fn requests_for_execution(
+        &self,
+        _execution_id: &ExecutionId,
+    ) -> Result<Vec<InvocationRequest>, StoreError> {
+        Ok(Vec::new())
+    }
     fn request(&self, request_id: &str) -> Result<Option<InvocationRequest>, StoreError>;
     fn invocations_for_execution(
         &self,
@@ -866,6 +956,10 @@ pub trait ReadView {
     /// Recorded dispatch deferrals, keyed by Execution — the `capacity`
     /// Query's explanation of queue stalls.
     fn deferrals(&self) -> Result<Vec<Deferral>, StoreError>;
+
+    /// Recorded outbox holds, keyed by intent — why each held pending
+    /// intent was not attempted in the pass that last recorded it.
+    fn outbox_holds(&self) -> Result<Vec<OutboxHold>, StoreError>;
 
     /// Attention IDs already acknowledged for a Work.
     fn attention_acks(&self, work_id: &WorkId) -> Result<Vec<String>, StoreError>;

@@ -138,6 +138,7 @@ fn execution(exec_id: &str, work_id: &str, state: ExecutionState) -> Execution {
 fn request(req_id: &str, work_id: &str, exec_id: &str, role: InvocationRole) -> Effect {
     Effect::InsertRequest {
         request: InvocationRequest {
+            placement: None,
             request_id: req_id.into(),
             work_id: WorkId(work_id.into()),
             execution_id: ExecutionId(exec_id.into()),
@@ -186,6 +187,7 @@ fn handoff(
             state,
             invalid_reason: None,
             attempt: 0,
+            verification_placement: None,
             recorded_seq: 0,
         },
         expected_seq: 0,

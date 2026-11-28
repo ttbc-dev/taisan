@@ -53,6 +53,7 @@ fn publisher() -> HostActorRef {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),
@@ -759,6 +760,7 @@ fn dispatch_conflict_defers_that_item_and_later_items_still_admit() {
     // InsertRequest trips the uniqueness constraint — the shape of a
     // lost request-ID race with another process.
     let seeded = InvocationRequest {
+        placement: None,
         request_id: format!("{}:inv:0", e1.0),
         work_id: w1,
         execution_id: e1.clone(),
@@ -2132,6 +2134,7 @@ fn admission_rolls_back_on_request_persistence_failure() {
         &store,
         &[Effect::InsertRequest {
             request: InvocationRequest {
+                placement: None,
                 request_id: format!("{}:inv:0", e1.0),
                 work_id: work_id.clone(),
                 execution_id: e1.clone(),
@@ -4669,6 +4672,18 @@ fn sweep_conflict_during_reassessment_is_deferred_not_fatal() {
     );
 }
 
+/// An assessment the check declared incomplete — `complete:false`
+/// with no judged items — the honest "could not evaluate" that parked
+/// the lane forever before the #515 re-drive.
+fn incomplete_assessment(head: &str) -> ObservationFact {
+    ObservationFact::Assessment {
+        target: target(head),
+        set_digest: "invariants".into(),
+        complete: false,
+        items: vec![],
+    }
+}
+
 /// An inconclusive lane assessment fact on the current target — the
 /// verdict that parked the lane forever before the #469 re-drive.
 fn inconclusive_assessment(head: &str) -> ObservationFact {
@@ -4679,6 +4694,23 @@ fn inconclusive_assessment(head: &str) -> ObservationFact {
         items: vec![AssessmentItem {
             id: "inv-1".into(),
             verdict: AssessmentVerdict::Inconclusive,
+            refs: vec![],
+        }],
+    }
+}
+
+/// A conclusive lane violation fact on the current target — the shape
+/// `bind_invariant_check` records for a `Negative` report
+/// (`complete:false` with the violating member's `Negative` verdict),
+/// conclusive evidence, never "could not evaluate".
+fn violation_assessment(head: &str) -> ObservationFact {
+    ObservationFact::Assessment {
+        target: target(head),
+        set_digest: "invariants".into(),
+        complete: false,
+        items: vec![AssessmentItem {
+            id: "inv-1".into(),
+            verdict: AssessmentVerdict::Negative,
             refs: vec![],
         }],
     }
@@ -4723,6 +4755,7 @@ fn record_verification_result(
                         state: HandoffState::Acknowledged,
                         invalid_reason: None,
                         attempt: 1,
+                        verification_placement: None,
                         recorded_seq: handoff_seq,
                     },
                     expected_seq: 0,
@@ -4837,6 +4870,7 @@ fn bind_check_request_body(
             // wrote it at mint and consumed it at spawn.
             Effect::InsertRequest {
                 request: InvocationRequest {
+                    placement: None,
                     request_id: request.request_id.clone(),
                     work_id: w.clone(),
                     execution_id: eid.clone(),
@@ -5013,6 +5047,216 @@ fn an_older_unbound_conclusive_result_does_not_remint() {
     );
 }
 
+/// #515: a `complete:false` assessment is not lane-terminal — the
+/// timed sweep re-mints the invariant check through the same
+/// `waiting → ready` path the missing-check trigger uses, bounded to
+/// two rechecks per produced revision, then pauses for an operator
+/// decision instead of minting checks forever.
+#[test]
+fn an_incomplete_assessment_rechecks_then_pauses_for_the_operator() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("ic1"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "ic1");
+    // The wedge shape: the newest assessment declares itself
+    // incomplete — honest evidence the completion gate can never
+    // accept, re-collected only if a fresh check judges it.
+    record_unassessed_observation(&store, &w, incomplete_assessment("sha-1"));
+
+    // One recheck's resolution: the re-minted check resolved `Done` on
+    // a proven exit 0 and judged the evidence incomplete again.
+    let recheck = |check_id: &str| {
+        force_state(&store, &e1, ExecutionState::Waiting);
+        let mut invocation = recorded_check_invocation(&e1, check_id);
+        invocation.request_id = format!("{}:inv:{}", e1.0, check_id);
+        apply_effects(
+            &store,
+            &[
+                Effect::InsertInvocation { invocation },
+                Effect::InsertObservation {
+                    observation: check_exit_observation(&e1, check_id),
+                },
+            ],
+        );
+        record_unassessed_observation(&store, &w, incomplete_assessment("sha-1"));
+    };
+    let pending_checks = |store: &SqliteStore| {
+        store
+            .transact(|tx| tx.pending_requests())
+            .unwrap()
+            .iter()
+            .filter(|r| r.role == InvocationRole::InvariantCheck)
+            .count()
+    };
+
+    // Recheck 1: the lane re-arms through the same mint the
+    // missing-check and unjudged-evidence triggers use.
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(
+        read_execution(&store, &e1).state,
+        ExecutionState::Ready,
+        "the incomplete assessment re-minted the check: {report:?}"
+    );
+    assert_eq!(pending_checks(&store), 1);
+
+    // Recheck 2 judges incomplete again — one mint remains.
+    recheck("ic1-check-2");
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(
+        read_execution(&store, &e1).state,
+        ExecutionState::Ready,
+        "{report:?}"
+    );
+    assert_eq!(pending_checks(&store), 2);
+
+    // The bound is spent: the lane pauses with an operator-decision
+    // prerequisite — the same hold an unsupported intent takes —
+    // instead of minting a third recheck.
+    recheck("ic1-check-3");
+    let report = sweep(&store, &config(), NOW).unwrap();
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Paused,
+        "the spent bound hands the wedge to an operator: {report:?}"
+    );
+    assert!(
+        e.repair_prerequisites
+            .iter()
+            .any(|p| matches!(p, RepairPrerequisite::OperatorDecision)),
+        "the hold requires an operator decision: {:?}",
+        e.repair_prerequisites
+    );
+    assert!(
+        e.pause_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("invariant assessment still incomplete")),
+        "the pause names its cause: {:?}",
+        e.pause_reason
+    );
+    assert_eq!(pending_checks(&store), 2, "no third check was minted");
+
+    // The lane holds: a further sweep never re-arms it.
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(
+        read_execution(&store, &e1).state,
+        ExecutionState::Paused,
+        "{report:?}"
+    );
+    assert_eq!(pending_checks(&store), 2);
+}
+
+/// A `Negative` item is a conclusive violation, never the #515
+/// "could not evaluate" shape — `bind_invariant_check` seals a
+/// `Negative` report as `complete:false` too (`complete = covered &&
+/// !Negative`), so the verdict item, not the flag, separates them.
+/// The lane pauses for an operator decision on the spot with the
+/// violation named, rather than spending the recheck bound re-judging
+/// a verdict no recheck on the same revision can overturn.
+#[test]
+fn a_recorded_violation_pauses_the_lane_without_rechecks() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("iv1"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "iv1");
+    // The settled violation: the newest assessment on the current
+    // target carries a `Negative` verdict — the check affirmatively
+    // judged an invariant violated.
+    record_unassessed_observation(&store, &w, violation_assessment("sha-1"));
+
+    let pending_checks = |store: &SqliteStore| {
+        store
+            .transact(|tx| tx.pending_requests())
+            .unwrap()
+            .iter()
+            .filter(|r| r.role == InvocationRole::InvariantCheck)
+            .count()
+    };
+
+    // One pass settles the lane to the operator hold — conclusive
+    // evidence never mints a recheck.
+    let report = sweep(&store, &config(), NOW).unwrap();
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Paused,
+        "the recorded violation hands the lane to an operator: {report:?}"
+    );
+    assert!(
+        e.repair_prerequisites
+            .iter()
+            .any(|p| matches!(p, RepairPrerequisite::OperatorDecision)),
+        "the hold requires an operator decision: {:?}",
+        e.repair_prerequisites
+    );
+    assert!(
+        e.pause_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("violation")),
+        "the pause names the violation, not 'still incomplete': {:?}",
+        e.pause_reason
+    );
+    assert_eq!(pending_checks(&store), 0, "no recheck was minted");
+
+    // The lane holds: a further sweep never re-arms it.
+    let report = sweep(&store, &config(), NOW).unwrap();
+    assert_eq!(
+        read_execution(&store, &e1).state,
+        ExecutionState::Paused,
+        "{report:?}"
+    );
+    assert_eq!(pending_checks(&store), 0);
+}
+
+/// The one thing that outranks a recorded violation: *unjudged*
+/// conclusive evidence. A newer `Pass` the satisfied check's bound
+/// request never carried makes the recorded verdict stale — the lane
+/// re-mints its check for a fresh judgment instead of pausing on the
+/// old one.
+#[test]
+fn a_violation_with_unjudged_evidence_rejudges_instead_of_pausing() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, e1) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("iv2"), NOW).unwrap());
+    seed_completion_evidence_minus_assessment(&store, &w, &e1, "iv2");
+    let artifact = "iv2-coding/artifact.json";
+    // The check judged an inconclusive run…
+    let judged = record_verification_result(
+        &store,
+        &e1,
+        artifact,
+        "verification_argv[0]",
+        VerificationOutcome::Inconclusive,
+    );
+    bind_check_request_body(&store, &w, &e1, "iv2-check", artifact, &[judged]);
+    // …and recorded a violation — but a newer conclusive result the
+    // bound request never carried means the violation is not the
+    // freshest judgment.
+    record_unassessed_observation(&store, &w, violation_assessment("sha-1"));
+    record_verification_result(
+        &store,
+        &e1,
+        artifact,
+        "verification_argv[1]",
+        VerificationOutcome::Pass,
+    );
+
+    let report = sweep(&store, &config(), NOW).unwrap();
+    let e = read_execution(&store, &e1);
+    assert_eq!(
+        e.state,
+        ExecutionState::Ready,
+        "unjudged conclusive evidence takes precedence over the recorded violation: {report:?}"
+    );
+    let pending = store.transact(|tx| tx.pending_requests()).unwrap();
+    assert!(
+        pending
+            .iter()
+            .any(|r| r.execution_id == e1 && r.role == InvocationRole::InvariantCheck),
+        "a new InvariantCheck re-judges the fresher evidence: {pending:?}"
+    );
+}
+
 /// Settlement clears recorded deferrals on EVERY completion path: a
 /// `sweep_conflict` left against a `waiting` Execution must not
 /// survive when ingest assessment settles it. Terminal Executions are
@@ -5045,6 +5289,63 @@ fn ingest_completion_clears_a_recorded_deferral() {
             .all(|d| d.execution_id != e1),
         "a terminal Execution is never a deferred one"
     );
+}
+
+/// #516: an outbox hold row is one record per `action_id` —
+/// re-recording preserves `since_seq` and advances `last_seen_seq`,
+/// `ClearOutboxHold` deletes it, and a settle receipt
+/// (`UpdateHostActionIntent`) supersedes it on every path.
+#[test]
+fn an_outbox_hold_is_upserted_cleared_and_superseded_on_settle() {
+    let store = SqliteStore::in_memory(1).unwrap();
+    let (w, _e) =
+        accepted_with_execution(&handle_command(&store, &config(), &submit("oh1"), NOW).unwrap());
+    let record = |kind: OutboxHoldKind, reason: &str| Effect::RecordOutboxHold {
+        action_id: "act-hold".into(),
+        work_id: w.clone(),
+        hold_kind: kind,
+        reason: reason.into(),
+    };
+    let holds = |store: &SqliteStore| store.transact(|tx| tx.outbox_holds()).unwrap();
+
+    apply_effects(
+        &store,
+        &[record(OutboxHoldKind::Skipped, "missing_execution")],
+    );
+    let first = holds(&store);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].kind, OutboxHoldKind::Skipped);
+    assert_eq!(first[0].reason, "missing_execution");
+    assert_eq!(first[0].since_seq, first[0].last_seen_seq);
+
+    apply_effects(&store, &[record(OutboxHoldKind::Deferred, "max_items")]);
+    let again = holds(&store);
+    assert_eq!(again.len(), 1, "one row per intent, not a log per pass");
+    assert_eq!(again[0].since_seq, first[0].since_seq);
+    assert!(again[0].last_seen_seq > first[0].last_seen_seq);
+    assert_eq!(again[0].kind, OutboxHoldKind::Deferred);
+
+    // A receipt is the intent's newest outcome: the hold is
+    // superseded even when the update names no live intent row.
+    apply_effects(
+        &store,
+        &[Effect::UpdateHostActionIntent {
+            action_id: "act-hold".into(),
+            status: HostActionStatus::Applied,
+            authenticated_actor: None,
+            effects: vec![],
+        }],
+    );
+    assert!(holds(&store).is_empty(), "a settle supersedes the hold");
+
+    apply_effects(&store, &[record(OutboxHoldKind::Skipped, "host_mismatch")]);
+    apply_effects(
+        &store,
+        &[Effect::ClearOutboxHold {
+            action_id: "act-hold".into(),
+        }],
+    );
+    assert!(holds(&store).is_empty(), "an explicit clear deletes too");
 }
 
 /// S-3a (#149) review fix: `Done` records only that the check process
@@ -5623,7 +5924,7 @@ fn a_v2_store_upgrades_to_the_current_format_preserving_rows() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 16, "the upgrade lands on the current format");
+        assert_eq!(version, 19, "the upgrade lands on the current format");
     }
     // A second open must not re-migrate — the schema is already current.
     let _ = SqliteStore::open(&db, 1).unwrap();
@@ -5688,7 +5989,7 @@ fn a_v9_store_gains_the_retirement_generation_column() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 16, "the upgrade lands on the current format");
+        assert_eq!(version, 19, "the upgrade lands on the current format");
     }
     drop(store);
     // Re-opening after the upgrade is a no-op, not a second migration.
@@ -5740,11 +6041,168 @@ fn a_v12_store_gains_the_observation_execution_index() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 16, "the upgrade lands on the current format");
+        assert_eq!(version, 19, "the upgrade lands on the current format");
     }
     drop(store);
     // Re-opening after the upgrade is a no-op, not a second migration.
     let _ = SqliteStore::open(&db, 1).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Regression (#379, #506): a v16 store lacks both the v17
+/// `invocation_requests.placement_binding` and the v19
+/// `artifact_handoffs.verification_placement` columns; opening it adds
+/// both inside the idempotent upgrade transaction, request rows survive
+/// and read back as pre-placement rows (`placement: None` — their
+/// executor is the coordinator host's local one), and handoff rows read
+/// back with no pin.
+#[test]
+fn a_v16_store_gains_the_placement_binding_column() {
+    let root = temp_root("upgrade-v16");
+    let db = root.join("store.db");
+    let request_id = {
+        let store = SqliteStore::open(&db, 1).unwrap();
+        let request = submit("k-upgrade-v16");
+        let (work_id, execution_id) =
+            accepted_with_execution(&handle_command(&store, &config(), &request, NOW).unwrap());
+        store
+            .transact(|tx| {
+                tx.apply(&Effect::InsertRequest {
+                    request: InvocationRequest {
+                        request_id: format!("{}:inv:0", execution_id.0),
+                        work_id: work_id.clone(),
+                        execution_id: execution_id.clone(),
+                        role: InvocationRole::Coding,
+                        spec_revision: 1,
+                        payload: serde_json::json!({}),
+                        adapter_binding: None,
+                        placement: None,
+                    },
+                })?;
+                Ok(())
+            })
+            .unwrap();
+        format!("{}:inv:0", execution_id.0)
+    };
+    // Reshape into a faithful v16 file: both later columns absent, stamp 16.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE invocation_requests DROP COLUMN placement_binding; \
+             ALTER TABLE artifact_handoffs DROP COLUMN verification_placement; \
+             PRAGMA user_version=16;",
+        )
+        .unwrap();
+        let has_placement_binding: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('invocation_requests') \
+                 WHERE name='placement_binding')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let has_verification_placement: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('artifact_handoffs') \
+                 WHERE name='verification_placement')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !has_placement_binding && !has_verification_placement,
+            "the reshaped file is a real v16 table"
+        );
+    }
+    let store = SqliteStore::open(&db, 1).expect("a v16 store upgrades in place");
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let has: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('invocation_requests') \
+                 WHERE name='placement_binding')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(has, "the v16->v17 migration adds placement_binding");
+        let has_handoff_pin: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('artifact_handoffs') \
+                 WHERE name='verification_placement')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            has_handoff_pin,
+            "the v16->v19 path also adds handoff verification_placement"
+        );
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 19, "the upgrade lands on the current format");
+    }
+    // The pre-placement request row reads back unbound — its executor
+    // is the coordinator host's local one, never a retarget.
+    let request = store
+        .transact(|tx| tx.request(&request_id))
+        .unwrap()
+        .expect("the v16 request row survives the upgrade");
+    assert!(request.placement.is_none());
+    drop(store);
+    // Re-opening after the upgrade is a no-op, not a second migration.
+    let _ = SqliteStore::open(&db, 1).unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Regression (#506): a v17 store's `artifact_handoffs` lacks the
+/// v19 `verification_placement` column; opening it adds the column
+/// inside the idempotent upgrade transaction. A pre-pin handoff row
+/// reads back with no placement, ready for the first verification
+/// pass to bind it.
+#[test]
+fn a_v17_store_gains_the_handoff_verification_placement_column() {
+    let root = temp_root("upgrade-v17-handoff");
+    let db = root.join("store.db");
+    {
+        let store = SqliteStore::open(&db, 1).unwrap();
+        drop(store);
+    }
+    // Reshape into a faithful v17 file: the column absent, stamp 17.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE artifact_handoffs DROP COLUMN verification_placement; \
+             PRAGMA user_version=17;",
+        )
+        .unwrap();
+        let has: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('artifact_handoffs') \
+                 WHERE name='verification_placement')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!has, "the reshaped file is a real v17 table");
+    }
+    let _store = SqliteStore::open(&db, 1).expect("a v17 store upgrades in place");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let has: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('artifact_handoffs') \
+             WHERE name='verification_placement')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(has, "the v17->v19 migration adds verification_placement");
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 19, "the upgrade lands on the current format");
+    drop(conn);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -6360,6 +6818,7 @@ fn the_push_intent_names_the_acknowledged_produced_commit() {
                     state: HandoffState::Acknowledged,
                     invalid_reason: None,
                     attempt: 0,
+                    verification_placement: None,
                     recorded_seq: 0,
                 },
                 expected_seq: 0,
@@ -6452,6 +6911,7 @@ fn publication_waits_for_the_acknowledged_produced_commit() {
             state,
             invalid_reason: None,
             attempt: 0,
+            verification_placement: None,
             recorded_seq: 0,
         },
         expected_seq: 0,
@@ -6624,6 +7084,7 @@ fn a_v2_finish_before_the_handoff_row_records_no_push_intent() {
         &[
             Effect::InsertRequest {
                 request: InvocationRequest {
+                    placement: None,
                     request_id: invocation.request_id.clone(),
                     work_id: w.clone(),
                     execution_id: e1.clone(),
@@ -7811,7 +8272,7 @@ fn a_previous_release_v1_store_is_upgraded_in_place() {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 16, "the upgrade lands on the current format");
+        assert_eq!(version, 19, "the upgrade lands on the current format");
     }
     // Re-opening after the upgrade is a no-op, not a second migration.
     drop(store);

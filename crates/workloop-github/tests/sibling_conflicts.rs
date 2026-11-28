@@ -25,7 +25,7 @@ use workloop_core::observation::{
 use workloop_core::store::{Effect, HostAction, HostActionIntent, Store};
 use workloop_core::work::{HostTemplate, WorkloopConfig, handle_command};
 use workloop_github::adapter::GitHubAdapter;
-use workloop_github::api::{GitHubApi, RemotePull};
+use workloop_github::api::{GitHubApi, PullState, RemotePull};
 use workloop_github::fixture::FixtureGithub;
 use workloop_store::sqlite::SqliteStore;
 
@@ -63,6 +63,7 @@ fn rev(object: &str) -> CommitRevision {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),
@@ -1881,6 +1882,7 @@ fn the_mergeability_verdict_never_guesses_a_conflict_from_the_tristate() {
         target_branch: "main".into(),
         title: String::new(),
         body: String::new(),
+        state: PullState::Open,
         merged: false,
         mergeable,
         mergeable_state: state.into(),

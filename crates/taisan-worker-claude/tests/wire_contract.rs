@@ -1841,6 +1841,296 @@ fn auth_token_reaches_runtime_but_not_verification() {
     assert!(!verify_env.contains("gh-secret-should-strip"));
 }
 
+/// The contract's `proxy_endpoint` member is a worker-owned override:
+/// the runtime child gets exactly one proxy pair carrying the
+/// configured endpoint — the supervisor-delivered relay URL is
+/// replaced outright, never duplicated into ambiguous ordering.
+#[test]
+fn provider_proxy_endpoint_replaces_the_supervisor_proxy_env() {
+    let dir = tmp("proxyenv");
+    let ws = workspace(&dir);
+    let provider = dir.join("provider.json");
+    fs::write(
+        &provider,
+        "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\",\"proxy_endpoint\":\"http://127.0.0.1:9123\"}\n",
+    )
+    .unwrap();
+    let env_capture = dir.join("env.txt");
+    let fake = dir.join("fake-env-claude");
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nenv | grep -iE '^https_proxy=' > {}\ncat {}\nexit 0\n",
+            env_capture.display(),
+            events_file(&dir, "done", json!({})).display(),
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let req = request_json(
+        "coding",
+        json!({"kind": "coding", "goal": goal_ref(), "issues": [],
+               "constraints": [], "verification_argv": []}),
+        &ws,
+        false,
+    );
+    let (request_path, _, out_dir) = dispatch("proxyenv", &req, &[("goal.md", "goal\n")]);
+    let out = Command::new(shim())
+        .args(["--runtime"])
+        .arg(&fake)
+        .args(["--provider-config"])
+        .arg(&provider)
+        .args(["run", "--request"])
+        .arg(&request_path)
+        .args(["--out"])
+        .arg(&out_dir)
+        .current_dir(&ws)
+        // The supervisor-delivered contained env — the relay URL.
+        .env("HTTPS_PROXY", "http://127.0.0.1:18080")
+        .env("https_proxy", "http://127.0.0.1:18080")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{:?}", out.stderr);
+    let runtime_env = fs::read_to_string(&env_capture).unwrap();
+    let proxy_lines: Vec<&str> = runtime_env.lines().collect();
+    assert_eq!(
+        proxy_lines.len(),
+        2,
+        "exactly one proxy pair reaches the runtime: {runtime_env}"
+    );
+    assert!(
+        runtime_env.contains("http://127.0.0.1:9123"),
+        "the configured proxy_endpoint wins: {runtime_env}"
+    );
+    assert!(
+        !runtime_env.contains("18080"),
+        "the supervisor relay URL is replaced, not duplicated: {runtime_env}"
+    );
+}
+
+/// The provider mount is a *versioned* contract: a present document
+/// that fails the contract refuses the launch outright — non-zero
+/// exit, the provider-config refusal on stderr, and no report minted
+/// (the contract's `absent` class) — rather than silently degrading
+/// to defaults. An absent path stays the optional binding: the run
+/// proceeds on the default config, and a valid document carrying
+/// adapter-owned extension members is accepted.
+#[test]
+fn a_present_provider_document_must_carry_the_contract_version() {
+    for (name, body) in [
+        (
+            "wrongver",
+            "{\"format_version\":\"taisan.worker.bindings/2\",\"model\":\"m\"}\n"
+                .to_string(),
+        ),
+        ("noversion", "{\"model\":\"m\"}\n".to_string()),
+        ("malformed", "not json\n".to_string()),
+        // A sequence document satisfies the derived struct's fields
+        // in declaration order — the contract mount is a JSON object,
+        // so the array form refuses like every other non-object.
+        (
+            "arraydoc",
+            "[\"taisan.worker.bindings/1\",\"m\",null,null]\n".to_string(),
+        ),
+        // A repeated member name — here inside an adapter-owned
+        // extension member — is not a contract document at any depth.
+        (
+            "dupmember",
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\",\"ext\":{\"a\":1,\"a\":2}}\n"
+                .to_string(),
+        ),
+        (
+            "nomodel",
+            "{\"format_version\":\"taisan.worker.bindings/1\"}\n".to_string(),
+        ),
+        (
+            "blankmodel",
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"   \"}\n".to_string(),
+        ),
+        (
+            "blankendpoint",
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\",\"endpoint\":\" \\t \"}\n"
+                .to_string(),
+        ),
+        (
+            "longmodel",
+            format!(
+                "{{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"{}\"}}\n",
+                "m".repeat(1025)
+            ),
+        ),
+        (
+            "oversized",
+            format!(
+                "{{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\",\"pad\":\"{}\"}}",
+                "x".repeat(64 * 1024)
+            ),
+        ),
+    ] {
+        let dir = tmp(name);
+        let ws = workspace(&dir);
+        let provider = dir.join("provider.json");
+        fs::write(&provider, body).unwrap();
+        assert_provider_config_refuses(&dir, &ws, &provider, name);
+    }
+
+    // A non-regular source — a directory, a symlink to a *valid*
+    // document, and a fifo — is refused at the stat before the open:
+    // the link is never followed and the fifo never parks the open on
+    // a writer. A stat error that is not NotFound (ENOTDIR through a
+    // regular file) is `unreadable`, not "absent".
+    let dir = tmp("notregular");
+    let ws = workspace(&dir);
+    let dir_source = dir.join("a-directory");
+    fs::create_dir(&dir_source).unwrap();
+    assert_provider_config_refuses(&dir, &ws, &dir_source, "dirsrc");
+    let file_source = dir.join("a-file");
+    fs::write(&file_source, "x").unwrap();
+    assert_provider_config_refuses(&dir, &ws, &file_source.join("provider.json"), "enotdir");
+    #[cfg(unix)]
+    {
+        let target = dir.join("real.json");
+        fs::write(
+            &target,
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\"}\n",
+        )
+        .unwrap();
+        let link = dir.join("a-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_provider_config_refuses(&dir, &ws, &link, "linksrc");
+        let fifo = dir.join("a-fifo");
+        let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(status.success(), "mkfifo failed");
+        assert_provider_config_refuses(&dir, &ws, &fifo, "fifosrc");
+    }
+
+    // A valid bindings/1 document — extension members are
+    // adapter-owned and stay tolerated — is consumed normally, and a
+    // member or document exactly at its bound is still inside the
+    // contract.
+    for (name, body) in [
+        (
+            "validver",
+            "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\",\"adapter_option\":{\"nested\":true}}\n"
+                .to_string(),
+        ),
+        (
+            "maxmodel",
+            format!(
+                "{{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"{}\"}}\n",
+                "m".repeat(1024)
+            ),
+        ),
+        ("atbound", at_bound_document()),
+    ] {
+        let dir = tmp(name);
+        let ws = workspace(&dir);
+        let fake = fake_runtime(&dir);
+        let provider = dir.join("provider.json");
+        fs::write(&provider, body).unwrap();
+        let events = events_file(&dir, "done", json!({}));
+        let req = request_json(
+            "coding",
+            json!({"kind": "coding", "goal": goal_ref(), "issues": [],
+                   "constraints": [], "verification_argv": []}),
+            &ws,
+            false,
+        );
+        let (request_path, _, out_dir) = dispatch(name, &req, &[("goal.md", "goal\n")]);
+        let out = Command::new(shim())
+            .args(["--runtime"])
+            .arg(&fake)
+            .args(["--provider-config"])
+            .arg(&provider)
+            .args(["run", "--request"])
+            .arg(&request_path)
+            .args(["--out"])
+            .arg(&out_dir)
+            .current_dir(&ws)
+            .env("FAKE_EVENTS", &events)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{name}: a valid contract document is consumed: {out:?}"
+        );
+        assert!(out_dir.join("report.json").exists());
+    }
+}
+
+/// A valid contract document whose total size sits exactly on the
+/// 64 KiB bound — the bound is inclusive.
+fn at_bound_document() -> String {
+    let prefix = "{\"format_version\":\"taisan.worker.bindings/1\",\"model\":\"m\",\"pad\":\"";
+    let suffix = "\"}";
+    let pad = 64 * 1024 - prefix.len() - suffix.len();
+    format!("{prefix}{}{suffix}", "x".repeat(pad))
+}
+
+/// One refused launch: non-zero exit, the `provider_config.*` refusal
+/// on stderr (so the failure is the contract gate, not any other
+/// error), and no report minted.
+fn assert_provider_config_refuses(dir: &Path, ws: &Path, provider: &Path, name: &str) {
+    let fake = fake_runtime(dir);
+    let req = request_json(
+        "coding",
+        json!({"kind": "coding", "goal": goal_ref(), "issues": [],
+               "constraints": [], "verification_argv": []}),
+        ws,
+        false,
+    );
+    let (request_path, _, out_dir) = dispatch(name, &req, &[("goal.md", "goal\n")]);
+    let mut child = Command::new(shim())
+        .args(["--runtime"])
+        .arg(&fake)
+        .args(["--provider-config"])
+        .arg(provider)
+        .args(["run", "--request"])
+        .arg(&request_path)
+        .args(["--out"])
+        .arg(&out_dir)
+        .current_dir(ws)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The wait is bounded: a regression that opens the source before
+    // the stat check parks on a fifo's writer forever, and the test
+    // must report that failure, not hang the suite on it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let out = loop {
+        if child.try_wait().unwrap().is_some() {
+            break child.wait_with_output().unwrap();
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "{name}: the provider-config refusal did not exit within the bound — \
+                 a non-regular source must be refused at the stat, not parked on the open"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    assert!(
+        !out.status.success(),
+        "{name}: an invalid present document must refuse: {out:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("provider_config."),
+        "{name}: the refusal names the provider config gate: {:?}",
+        out.stderr
+    );
+    assert!(
+        !out_dir.join("report.json").exists(),
+        "{name}: a refused launch mints no report"
+    );
+}
+
 /// Recompute `request_digest` after mutating a minted request.
 fn redigest(req: &mut Value) {
     let digest = request_v2_digest(&canonical_json(&{

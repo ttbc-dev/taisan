@@ -46,8 +46,8 @@ use workloop_core::identity::{
 use workloop_core::observation::{CheckConclusion, IssueState};
 
 use crate::api::{
-    ApiError, GitHubApi, RemoteCheckRun, RemoteComment, RemoteIssue, RemotePull, RemoteReview,
-    RemoteReviewFinding, RepositoryPermissions,
+    ApiError, GitHubApi, PullState, RemoteCheckRun, RemoteComment, RemoteIssue, RemotePull,
+    RemoteReview, RemoteReviewFinding, RepositoryPermissions,
 };
 use crate::credential::{CredentialError, ResolvedCredential};
 
@@ -828,6 +828,13 @@ impl GhCliApi {
             target_branch: base_str("ref"),
             title: str_field("title"),
             body: str_field("body"),
+            // Anything but an explicit `open` is not a live change —
+            // a missing or unrecognized state is never adopted.
+            state: if str_field("state") == "open" {
+                PullState::Open
+            } else {
+                PullState::Closed
+            },
             merged: value
                 .get("merged")
                 .and_then(|v| v.as_bool())
@@ -1349,7 +1356,7 @@ impl GitHubApi for GhCliApi {
         &mut self,
         repository: &RepositoryRef,
         source_branch: &str,
-        head_sha: &str,
+        head_sha: Option<&str>,
     ) -> Result<Vec<RemotePull>, ApiError> {
         let slug = Self::slug(repository)?;
         if !valid_branch(source_branch) {
@@ -1357,9 +1364,11 @@ impl GitHubApi for GhCliApi {
                 reason: format!("invalid branch name: {source_branch:?}"),
             });
         }
-        if !valid_revision(head_sha) {
+        if let Some(sha) = head_sha
+            && !valid_revision(sha)
+        {
             return Err(ApiError::Refused {
-                reason: format!("invalid revision: {head_sha:?}"),
+                reason: format!("invalid revision: {sha:?}"),
             });
         }
         let owner = slug.split('/').next().unwrap_or_default();
@@ -1377,9 +1386,11 @@ impl GitHubApi for GhCliApi {
         pulls
             .iter()
             .filter(|pull| {
-                pull.pointer("/head/sha")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|sha| sha == head_sha)
+                head_sha.is_none_or(|sha| {
+                    pull.pointer("/head/sha")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|head| head == sha)
+                })
             })
             .map(Self::remote_pull)
             .collect()

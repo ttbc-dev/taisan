@@ -21,6 +21,7 @@
 //! | `parked_selector_starvation` | `deferrals` aged past the event-sequence threshold plus `capacity_slots`/`resource_reservations` context |
 //! | `stale_spec_halts` | `not_applicable_v0.1` — no spec-halt record exists in v0.1; reported explicitly, never dropped |
 //! | `source_gate_holds` | `works.source_gate` ∈ {changed, needs_check}; Executions `waiting` with `waiting_reason = human_judgment` |
+//! | `outbox_holds` | `outbox_holds` rows: pending intents the last drain pass recorded a `skipped`/`credential_blocked`/`deferred` verdict for (#516) |
 //!
 //! Orphaned-finding ownership resolves the durable chain
 //! occurrence → `review_rounds` → `works` → `works.binding`. `proven`
@@ -40,7 +41,7 @@ use crate::domain::{
     RoundJudgment, WaitingReason, Work, WorkId,
 };
 use crate::identity::{HostInstanceId, RepositoryRef, SourceGate};
-use crate::store::{CommandRecord, ReadView, StoreError};
+use crate::store::{CommandRecord, OutboxHoldKind, ReadView, StoreError};
 
 /// Census bounds. Every detector is individually capped; `truncated`
 /// on a section reports the cap honestly rather than silently
@@ -128,6 +129,9 @@ pub struct AnomalyCensus {
     /// Source-gate holds and human-judgment waits (spec:ambiguous /
     /// needs-human sweeps).
     pub source_gate_holds: DetectorSection<SourceGateItem>,
+    /// Pending outbox intents the last drain pass did not attempt,
+    /// each with the recorded hold verdict (#516).
+    pub outbox_holds: DetectorSection<HeldOutboxIntent>,
 }
 
 /// One `judgment_waits` finding.
@@ -252,6 +256,28 @@ pub struct ParkedDeferral {
     /// a deferral on a terminal or missing Execution is itself notable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution_state: Option<ExecutionState>,
+}
+
+/// One `outbox_holds` item: a pending intent the last drain pass
+/// recorded a hold verdict for. Unlike deferrals, every hold is
+/// reported — the row itself is the anomaly record; `stale` marks
+/// holds aged past the event-sequence threshold.
+#[derive(Debug, Clone, Serialize)]
+pub struct HeldOutboxIntent {
+    pub action_id: String,
+    pub work_id: WorkId,
+    /// `skipped` / `credential_blocked` / `deferred`.
+    pub kind: OutboxHoldKind,
+    pub reason: String,
+    /// The event position the hold was first recorded at.
+    pub since_seq: EventSequence,
+    /// The event position of the most recent pass that re-recorded
+    /// this hold.
+    pub last_seen_seq: EventSequence,
+    /// `last_seq - since_seq` at census time.
+    pub age_events: i64,
+    /// `age_events` exceeds the census threshold.
+    pub stale: bool,
 }
 
 /// One `source_gate_holds` item.
@@ -839,6 +865,35 @@ pub fn anomaly_census(
     }
     let source_gate_holds = section(true, None, gate_items, limit, None);
 
+    // --- Detector 7: outbox holds ---------------------------------------
+    // Every pending intent the last drain pass skipped, credential-
+    // blocked, or deferred carries a durable hold row (#516). The
+    // census reports all of them — the hold row is the anomaly — with
+    // age in queue-order events so a continuously starving intent is
+    // distinguishable from a freshly held one.
+    let hold_rows = tx.outbox_holds()?;
+    let hold_items: Vec<HeldOutboxIntent> = hold_rows
+        .iter()
+        .map(|h| {
+            let age = as_of - h.since_seq;
+            HeldOutboxIntent {
+                action_id: h.action_id.clone(),
+                work_id: h.work_id.clone(),
+                kind: h.kind,
+                reason: h.reason.clone(),
+                since_seq: h.since_seq,
+                last_seen_seq: h.last_seen_seq,
+                age_events: age,
+                stale: age > bounds.deferral_age_events,
+            }
+        })
+        .collect();
+    let hold_context = serde_json::json!({
+        "holds_total": hold_rows.len(),
+        "hold_age_threshold_events": bounds.deferral_age_events,
+    });
+    let outbox_holds = section(true, None, hold_items, limit, Some(hold_context));
+
     Ok(AnomalyCensus {
         as_of,
         judgment_waits,
@@ -847,5 +902,6 @@ pub fn anomaly_census(
         parked_selector_starvation,
         stale_spec_halts,
         source_gate_holds,
+        outbox_holds,
     })
 }

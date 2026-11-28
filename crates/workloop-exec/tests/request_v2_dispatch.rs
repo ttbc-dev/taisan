@@ -86,6 +86,7 @@ fn repo() -> RepositoryRef {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),
@@ -355,6 +356,8 @@ fn layout(root: &Path) -> HandoffLayout {
         out_root: root.join("out"),
         state_root: None,
         verification: None,
+        verification_placement: workloop_core::placement::PlacementTarget::Local,
+        remote_verification_executor: None,
     }
 }
 
@@ -467,6 +470,7 @@ fn insert_request(
         .transact(|tx| {
             tx.apply(&Effect::InsertRequest {
                 request: InvocationRequest {
+                    placement: None,
                     request_id: request_id.into(),
                     work_id: work_id.clone(),
                     execution_id: execution_id.clone(),
@@ -545,6 +549,7 @@ fn done_writer_with_handoff(
                     state: HandoffState::Acknowledged,
                     invalid_reason: None,
                     attempt: 0,
+                    verification_placement: None,
                     recorded_seq: seq,
                 },
                 expected_seq: 0,
@@ -4773,6 +4778,7 @@ fn an_interrupted_v2_handoff_resumes_from_its_durable_stage() {
         state: HandoffState::ExportStarted,
         invalid_reason: None,
         attempt: 0,
+        verification_placement: None,
         recorded_seq: 0,
     };
     store
@@ -7436,6 +7442,7 @@ fn a_recovery_detected_refusal_charges_no_attempt() {
                     state: HandoffState::Acknowledged,
                     invalid_reason: None,
                     attempt: 0,
+                    verification_placement: None,
                     recorded_seq: seq,
                 },
                 expected_seq: 0,

@@ -1,4 +1,5 @@
 {
+  "format_version": "taisan.worker.bindings/1",
   "model": "claude-sonnet-4-5",
   "endpoint": "https://api.anthropic.com"
 }

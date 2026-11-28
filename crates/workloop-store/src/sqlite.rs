@@ -10,8 +10,8 @@
 //! with `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT` when a writer or a newer commit
 //! intervened rather than waiting on the lock.
 //!
-//! `PRAGMA user_version` is the format gate: `16` is the current format
-//! (see `FORMAT_VERSION`). A file stamped `1` through `15`
+//! `PRAGMA user_version` is the format gate: `19` is the current format
+//! (see `FORMAT_VERSION`). A file stamped `1` through `18`
 //! must carry the complete recognized schema of its version and
 //! upgrades additively at open; a stamped file whose schema is foreign
 //! or incomplete, an unversioned database with user tables (a slice-0
@@ -29,8 +29,8 @@ use workloop_core::observation::{DeliveryId, DeliveryScope, Observation};
 use workloop_core::ports::ProcessEvidence;
 use workloop_core::store::{
     CommandRecord, Deferral, Effect, HostActionIntent, IntakeCandidate, IntakeCandidateStatus,
-    IntakeRun, IntakeRunState, IntakeSettingsRecord, IntakeSourceOwner, ReadView, RecoveryIntent,
-    RecoveryIntentState, Store, StoreError, TxView,
+    IntakeRun, IntakeRunState, IntakeSettingsRecord, IntakeSourceOwner, OutboxHold, ReadView,
+    RecoveryIntent, RecoveryIntentState, Store, StoreError, TxView,
 };
 use workloop_core::worker::WorkerRequestExport;
 
@@ -56,8 +56,16 @@ const SCHEMA: &str = include_str!("schema.sql");
 /// record (`docs/executor-transport-contract.md` §6, #376);
 /// `16` adds the usage row's per-pair `merge_check_services` cursor,
 /// which replaces the merge-check service record's observation rows.
+/// `17` adds the `invocation_requests.placement_binding` column —
+/// the immutable executor-placement record every request carries at
+/// admission (`docs/remote-executor.md` §2.2, #379);
+/// `18` adds the `outbox_holds` record (#516) — why each held pending
+/// intent was not attempted in the pass that last recorded it.
+/// `19` adds the `artifact_handoffs.verification_placement` column —
+/// the verification placement and bound executor pinned when the
+/// handoff row is created (#506).
 /// Older files upgrade additively at open.
-pub(crate) const FORMAT_VERSION: i64 = 16;
+pub(crate) const FORMAT_VERSION: i64 = 19;
 
 /// The tables `SCHEMA` installs. A file stamped `user_version=1` must
 /// hold all of them before any mutating pragma runs — the version stamp
@@ -87,6 +95,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "invocation_requests",
     "issue_claims",
     "observations",
+    "outbox_holds",
     "reclaim_plan_entries",
     "reclaim_plans",
     "recovery_decisions",
@@ -149,6 +158,10 @@ const V13_ADDED_TABLES: &[&str] = &["executor_bindings", "executor_operations"];
 /// collection record). Installed by the same `SCHEMA` batch on
 /// upgrade.
 const V14_ADDED_TABLES: &[&str] = &["executor_collections"];
+
+/// The table the v17 → v18 migration adds (the durable outbox hold
+/// record, #516). Installed by the same `SCHEMA` batch on upgrade.
+const V17_ADDED_TABLES: &[&str] = &["outbox_holds"];
 
 /// How long a writer waits on the file lock before `SQLITE_BUSY` surfaces.
 /// Connection-local (applies inside `transact` and during `init` itself) and
@@ -363,8 +376,10 @@ impl SqliteStore {
             // and a v8 file everything except the v9 addition, a
             // v9–v13 file everything except the v13 and v14
             // additions, a v14 file everything except v15's
-            // collection table, and a v15 file everything (v16 adds
-            // a column, not a table). A
+            // collection table, a v15–v17 file everything except
+            // v18's hold table (v16 and v17 each add a column, not a
+            // table), and a v18 file everything (v19 adds a column,
+            // not a table). A
             // foreign or
             // truncated stamped file fails this check untouched, and
             // the accepted difference is a previous release's store: it
@@ -385,6 +400,7 @@ impl SqliteStore {
                             && !V10_ADDED_TABLES.contains(t)
                             && !V13_ADDED_TABLES.contains(t)
                             && !V14_ADDED_TABLES.contains(t)
+                            && !V17_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version == 2 {
@@ -398,6 +414,7 @@ impl SqliteStore {
                             && !V10_ADDED_TABLES.contains(t)
                             && !V13_ADDED_TABLES.contains(t)
                             && !V14_ADDED_TABLES.contains(t)
+                            && !V17_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 5 {
@@ -410,6 +427,7 @@ impl SqliteStore {
                             && !V10_ADDED_TABLES.contains(t)
                             && !V13_ADDED_TABLES.contains(t)
                             && !V14_ADDED_TABLES.contains(t)
+                            && !V17_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 8 {
@@ -421,6 +439,7 @@ impl SqliteStore {
                             && !V10_ADDED_TABLES.contains(t)
                             && !V13_ADDED_TABLES.contains(t)
                             && !V14_ADDED_TABLES.contains(t)
+                            && !V17_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 9 {
@@ -431,6 +450,7 @@ impl SqliteStore {
                             && !V10_ADDED_TABLES.contains(t)
                             && !V13_ADDED_TABLES.contains(t)
                             && !V14_ADDED_TABLES.contains(t)
+                            && !V17_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 11 {
@@ -440,23 +460,37 @@ impl SqliteStore {
                         !V10_ADDED_TABLES.contains(t)
                             && !V13_ADDED_TABLES.contains(t)
                             && !V14_ADDED_TABLES.contains(t)
+                            && !V17_ADDED_TABLES.contains(t)
                     })
                     .all(|t| present.contains(*t))
             } else if version < 14 {
                 EXPECTED_TABLES
                     .iter()
-                    .filter(|t| !V13_ADDED_TABLES.contains(t) && !V14_ADDED_TABLES.contains(t))
+                    .filter(|t| {
+                        !V13_ADDED_TABLES.contains(t)
+                            && !V14_ADDED_TABLES.contains(t)
+                            && !V17_ADDED_TABLES.contains(t)
+                    })
                     .all(|t| present.contains(*t))
             } else if version < 15 {
                 // A v14 file holds every table the v13 → v14
-                // migration installed; only the v15 addition may be
-                // absent.
+                // migration installed; only the v15 and v18 additions
+                // may be absent (v16 and v17 each add a column, not a
+                // table).
                 EXPECTED_TABLES
                     .iter()
-                    .filter(|t| !V14_ADDED_TABLES.contains(t))
+                    .filter(|t| !V14_ADDED_TABLES.contains(t) && !V17_ADDED_TABLES.contains(t))
+                    .all(|t| present.contains(*t))
+            } else if version < 18 {
+                // A v15–v17 file holds every table except the v18
+                // hold record (v16 and v17 each add a column, not a
+                // table).
+                EXPECTED_TABLES
+                    .iter()
+                    .filter(|t| !V17_ADDED_TABLES.contains(t))
                     .all(|t| present.contains(*t))
             } else {
-                // A v15 file holds every table; v16 adds a column,
+                // A v18 file holds every table; v19 adds a column,
                 // not a table.
                 EXPECTED_TABLES.iter().all(|t| present.contains(*t))
             };
@@ -473,8 +507,10 @@ impl SqliteStore {
             // work_usage.last_progress_basis,
             // recovery_intents.retirement_generation,
             // finding_occurrences.summary,
-            // work_usage.merge_check_services, and the pin-ledger
-            // reconstruction. A crash leaves the old stamp and the
+            // work_usage.merge_check_services,
+            // invocation_requests.placement_binding,
+            // artifact_handoffs.verification_placement, and the
+            // pin-ledger reconstruction. A crash leaves the old stamp and the
             // migration reruns idempotently (CREATE IF NOT EXISTS; each
             // column check guards a partial ALTER; the ledger insert is
             // guarded by NOT EXISTS).
@@ -579,6 +615,34 @@ impl SqliteStore {
             if !has_merge_check_services {
                 tx.execute_batch("ALTER TABLE work_usage ADD COLUMN merge_check_services TEXT")
                     .map_err(internal)?;
+            }
+            let has_placement_binding: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('invocation_requests') \
+                     WHERE name='placement_binding')",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(internal)?;
+            if !has_placement_binding {
+                tx.execute_batch(
+                    "ALTER TABLE invocation_requests ADD COLUMN placement_binding TEXT",
+                )
+                .map_err(internal)?;
+            }
+            let has_handoff_verification_placement: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('artifact_handoffs') \
+                     WHERE name='verification_placement')",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(internal)?;
+            if !has_handoff_verification_placement {
+                tx.execute_batch(
+                    "ALTER TABLE artifact_handoffs ADD COLUMN verification_placement TEXT",
+                )
+                .map_err(internal)?;
             }
             // A pre-ledger store recorded protection as the bare
             // `pinned` boolean. Reconstruct the ledger row under the
@@ -1229,7 +1293,7 @@ fn invocation_from_row(row: &rusqlite::Row<'_>) -> Result<Invocation, rusqlite::
 
 const HANDOFF_COLS: &str = "artifact_id, invocation_id, request_id, work_id, \
     execution_id, base, produced, manifest_digest, state, invalid_reason, \
-    attempt, recorded_seq";
+    attempt, verification_placement, recorded_seq";
 
 fn handoff_from_row(row: &rusqlite::Row<'_>) -> Result<ArtifactHandoff, rusqlite::Error> {
     Ok(ArtifactHandoff {
@@ -1244,7 +1308,8 @@ fn handoff_from_row(row: &rusqlite::Row<'_>) -> Result<ArtifactHandoff, rusqlite
         state: untag(&row.get::<_, String>(8)?)?,
         invalid_reason: row.get(9)?,
         attempt: row.get::<_, u32>(10)?,
-        recorded_seq: row.get(11)?,
+        verification_placement: opt_de_row(row.get::<_, Option<String>>(11)?)?,
+        recorded_seq: row.get(12)?,
     })
 }
 
@@ -1349,9 +1414,10 @@ fn request_from_row(row: &rusqlite::Row<'_>) -> Result<InvocationRequest, rusqli
         work_id: WorkId(row.get::<_, String>(1)?),
         execution_id: ExecutionId(row.get::<_, String>(2)?),
         role: untag(&row.get::<_, String>(3)?)?,
-        spec_revision: row.get(4)?,
+        spec_revision: row.get::<_, i64>(4)? as u64,
         payload: de_row(&row.get::<_, String>(5)?)?,
         adapter_binding: opt_de_row(row.get::<_, Option<String>>(6)?)?,
+        placement: opt_de_row(row.get::<_, Option<String>>(7)?)?,
     })
 }
 
@@ -1391,10 +1457,10 @@ const OBSERVATION_COLS: &str = "delivery_scope, delivery_host, delivery_source, 
 fn work_from_row(row: &rusqlite::Row<'_>) -> Result<Work, rusqlite::Error> {
     Ok(Work {
         id: WorkId(row.get::<_, String>(0)?),
-        version: row.get::<_, u64>(1)?,
+        version: row.get::<_, i64>(1)? as u64,
         binding: de_row(&row.get::<_, String>(2)?)?,
-        spec: row.get(3)?,
-        approved_spec: row.get(4)?,
+        spec: row.get::<_, i64>(3)? as u64,
+        approved_spec: row.get::<_, i64>(4)? as u64,
         source_gate: untag(&row.get::<_, String>(5)?)?,
         policy: de_row(&row.get::<_, String>(6)?)?,
         created_seq: row.get(7)?,
@@ -1407,7 +1473,7 @@ const WORK_COLS: &str =
 fn spec_from_row(row: &rusqlite::Row<'_>) -> Result<SpecSnapshot, rusqlite::Error> {
     Ok(SpecSnapshot {
         work_id: WorkId(row.get::<_, String>(0)?),
-        revision: row.get(1)?,
+        revision: row.get::<_, i64>(1)? as u64,
         payload: de_row(&row.get::<_, String>(2)?)?,
         digest: row.get(3)?,
         approved_by: de_row(&row.get::<_, String>(4)?)?,
@@ -1444,7 +1510,7 @@ fn round_from_row(row: &rusqlite::Row<'_>) -> Result<ReviewRound, rusqlite::Erro
         source_revision: row.get(4)?,
         completeness: row.get(5)?,
         set_digest: row.get(6)?,
-        generation: row.get(7)?,
+        generation: row.get::<_, i64>(7)? as u64,
         seq: row.get(8)?,
     })
 }
@@ -1468,10 +1534,10 @@ fn usage_from_row(row: &rusqlite::Row<'_>) -> Result<WorkUsage, rusqlite::Error>
         transport_retries_used: row.get(2)?,
         equivalent_failure_streak: row.get(3)?,
         equivalent_signature: row.get(4)?,
-        automatic_seconds_used: row.get(5)?,
+        automatic_seconds_used: row.get::<_, i64>(5)? as u64,
         first_dispatch_unix_seconds: row.get(6)?,
         last_progress_unix_seconds: row.get(7)?,
-        human_wait_seconds_total: row.get(8)?,
+        human_wait_seconds_total: row.get::<_, i64>(8)? as u64,
         last_progress_basis: row
             .get::<_, Option<String>>(9)?
             .and_then(|s| MaterialProgressBasis::parse(&s)),
@@ -1597,13 +1663,13 @@ fn update_work(tx: &Tx<'_>, work: &Work, expected: u64) -> Result<(), StoreError
          source_gate=?6, policy=?7 WHERE id=?1 AND version=?8",
         params![
             work.id.0,
-            work.version,
+            work.version as i64,
             json(&work.binding)?,
-            work.spec,
-            work.approved_spec,
+            work.spec as i64,
+            work.approved_spec as i64,
             tag(&work.source_gate),
             json(&work.policy)?,
-            expected,
+            expected as i64,
         ],
     )?;
     if n == 0 {
@@ -1612,11 +1678,11 @@ fn update_work(tx: &Tx<'_>, work: &Work, expected: u64) -> Result<(), StoreError
             .query_row(
                 "SELECT version FROM works WHERE id=?1",
                 params![work.id.0],
-                |r| r.get(0),
+                |r| r.get::<_, i64>(0),
             )
             .optional()
             .map_err(map_err)?
-            .unwrap_or(0);
+            .unwrap_or(0) as u64;
         return Err(StoreError::VersionConflict {
             work_id: work.id.clone(),
             current_version: current,
@@ -1631,7 +1697,7 @@ fn insert_spec(tx: &Tx<'_>, spec: &SpecSnapshot) -> Result<(), StoreError> {
          recorded_seq) VALUES (?1,?2,?3,?4,?5,?6)",
         params![
             spec.work_id.0,
-            spec.revision,
+            spec.revision as i64,
             json(&spec.payload)?,
             spec.digest,
             json(&spec.approved_by)?,
@@ -1684,6 +1750,39 @@ impl ReadView for Tx<'_> {
         )
     }
 
+    fn decided_idempotency_keys(
+        &self,
+        origin: &Origin,
+        actor: &Actor,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<String>, StoreError> {
+        let actor_kind = tag(&actor.kind);
+        // Range-scan the unique (origin, actor_kind, actor_id,
+        // idempotency_key) index instead of materializing the whole
+        // unpruned ledger; `LIMIT` bounds how many keys cross into
+        // Rust. An empty prefix has no meaningful upper bound, and a
+        // non-ASCII prefix cannot be byte-incremented safely.
+        let Some(upper) = prefix_upper_bound(prefix) else {
+            return Ok(Vec::new());
+        };
+        self.query_all(
+            "SELECT idempotency_key FROM commands \
+             WHERE origin=?1 AND actor_kind=?2 AND actor_id=?3 \
+               AND idempotency_key >= ?4 AND idempotency_key < ?5 \
+             ORDER BY idempotency_key LIMIT ?6",
+            params![
+                origin.0,
+                actor_kind,
+                actor.external_id,
+                prefix,
+                upper,
+                limit
+            ],
+            |row| row.get(0),
+        )
+    }
+
     fn command_decision(
         &self,
         command_id: &CommandId,
@@ -1712,7 +1811,7 @@ impl ReadView for Tx<'_> {
             Some(rev) => self.query_opt(
                 "SELECT work_id, revision, payload, digest, approved_by, \
                  recorded_seq FROM specs WHERE work_id=?1 AND revision=?2",
-                params![work_id.0, rev],
+                params![work_id.0, rev as i64],
                 spec_from_row,
             ),
             None => self.query_opt(
@@ -1877,9 +1976,22 @@ impl ReadView for Tx<'_> {
     fn pending_requests(&self) -> Result<Vec<InvocationRequest>, StoreError> {
         self.query_all(
             "SELECT request_id, work_id, execution_id, role, spec_revision, \
-             payload, adapter_binding FROM invocation_requests \
+             payload, adapter_binding, placement_binding FROM invocation_requests \
              WHERE consumed=0 ORDER BY rowid",
             [],
+            request_from_row,
+        )
+    }
+
+    fn requests_for_execution(
+        &self,
+        execution_id: &ExecutionId,
+    ) -> Result<Vec<InvocationRequest>, StoreError> {
+        self.query_all(
+            "SELECT request_id, work_id, execution_id, role, spec_revision, \
+             payload, adapter_binding, placement_binding FROM invocation_requests \
+             WHERE execution_id=?1 ORDER BY rowid",
+            params![execution_id.0],
             request_from_row,
         )
     }
@@ -1887,7 +1999,7 @@ impl ReadView for Tx<'_> {
     fn request(&self, request_id: &str) -> Result<Option<InvocationRequest>, StoreError> {
         self.query_opt(
             "SELECT request_id, work_id, execution_id, role, spec_revision, \
-             payload, adapter_binding FROM invocation_requests WHERE request_id=?1",
+             payload, adapter_binding, placement_binding FROM invocation_requests WHERE request_id=?1",
             params![request_id],
             request_from_row,
         )
@@ -2225,6 +2337,24 @@ impl ReadView for Tx<'_> {
                     reason: row.get(1)?,
                     diagnostic: row.get(2)?,
                     since_seq: row.get(3)?,
+                })
+            },
+        )
+    }
+
+    fn outbox_holds(&self) -> Result<Vec<OutboxHold>, StoreError> {
+        self.query_all(
+            "SELECT action_id, work_id, kind, reason, \
+             since_seq, last_seen_seq FROM outbox_holds ORDER BY action_id",
+            [],
+            |row| {
+                Ok(OutboxHold {
+                    action_id: row.get(0)?,
+                    work_id: WorkId(row.get(1)?),
+                    kind: untag(&row.get::<_, String>(2)?)?,
+                    reason: row.get(3)?,
+                    since_seq: row.get(4)?,
+                    last_seen_seq: row.get(5)?,
                 })
             },
         )
@@ -2661,6 +2791,25 @@ fn intake_run_from_row(row: &rusqlite::Row<'_>) -> Result<IntakeRun, rusqlite::E
     })
 }
 
+/// The exclusive upper bound for a `BINARY` range scan over every key
+/// starting with `prefix`. The last ASCII byte below `0x7f` is
+/// incremented so `prefix <= key < upper` selects exactly the keys
+/// sharing the prefix within the index order. An empty or non-ASCII
+/// prefix has no such bound and returns `None`.
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    if prefix.is_empty() || !prefix.is_ascii() {
+        return None;
+    }
+    let mut bytes = prefix.as_bytes().to_vec();
+    while let Some(last) = bytes.pop() {
+        if last < 0x7f {
+            bytes.push(last + 1);
+            return String::from_utf8(bytes).ok();
+        }
+    }
+    None
+}
+
 fn intake_candidate_from_row(row: &rusqlite::Row<'_>) -> Result<IntakeCandidate, rusqlite::Error> {
     Ok(IntakeCandidate {
         run_id: row.get(0)?,
@@ -2794,10 +2943,10 @@ impl TxView for Tx<'_> {
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                     params![
                         work.id.0,
-                        work.version,
+                        work.version as i64,
                         json(&work.binding)?,
-                        work.spec,
-                        work.approved_spec,
+                        work.spec as i64,
+                        work.approved_spec as i64,
                         tag(&work.source_gate),
                         json(&work.policy)?,
                         work.created_seq,
@@ -2826,10 +2975,10 @@ impl TxView for Tx<'_> {
                         usage.transport_retries_used,
                         usage.equivalent_failure_streak,
                         usage.equivalent_signature,
-                        usage.automatic_seconds_used,
+                        usage.automatic_seconds_used as i64,
                         usage.first_dispatch_unix_seconds,
                         usage.last_progress_unix_seconds,
-                        usage.human_wait_seconds_total,
+                        usage.human_wait_seconds_total as i64,
                         usage.last_progress_basis.map(|b| b.as_str()),
                         json(&usage.merge_check_services)?,
                     ],
@@ -2908,16 +3057,18 @@ impl TxView for Tx<'_> {
             Effect::InsertRequest { request } => {
                 self.exec(
                     "INSERT INTO invocation_requests (request_id, work_id, \
-                     execution_id, role, spec_revision, payload, adapter_binding) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                     execution_id, role, spec_revision, payload, adapter_binding, \
+                     placement_binding) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                     params![
                         request.request_id,
                         request.work_id.0,
                         request.execution_id.0,
                         tag(&request.role),
-                        request.spec_revision,
+                        request.spec_revision as i64,
                         json(&request.payload)?,
                         request.adapter_binding.as_ref().map(json).transpose()?,
+                        request.placement.as_ref().map(json).transpose()?,
                     ],
                 )?;
             }
@@ -3555,6 +3706,13 @@ impl TxView for Tx<'_> {
                         json(effects)?,
                     ],
                 )?;
+                // A receipt is the intent's newest outcome: any
+                // recorded hold is superseded on every settle path —
+                // write drain, reconcile read, or manual record.
+                self.exec(
+                    "DELETE FROM outbox_holds WHERE action_id=?1",
+                    params![action_id],
+                )?;
             }
             Effect::InsertReviewRound { round, occurrences } => {
                 self.exec(
@@ -3569,7 +3727,7 @@ impl TxView for Tx<'_> {
                         round.source_revision,
                         round.completeness,
                         round.set_digest,
-                        round.generation,
+                        round.generation as i64,
                         round.seq,
                     ],
                 )?;
@@ -3632,10 +3790,10 @@ impl TxView for Tx<'_> {
                         usage.transport_retries_used,
                         usage.equivalent_failure_streak,
                         usage.equivalent_signature,
-                        usage.automatic_seconds_used,
+                        usage.automatic_seconds_used as i64,
                         usage.first_dispatch_unix_seconds,
                         usage.last_progress_unix_seconds,
-                        usage.human_wait_seconds_total,
+                        usage.human_wait_seconds_total as i64,
                         usage.last_progress_basis.map(|b| b.as_str()),
                         json(&usage.merge_check_services)?,
                     ],
@@ -4271,6 +4429,33 @@ impl TxView for Tx<'_> {
                     params![execution_id.0],
                 )?;
             }
+            Effect::RecordOutboxHold {
+                action_id,
+                work_id,
+                hold_kind,
+                reason,
+            } => {
+                self.exec(
+                    "INSERT INTO outbox_holds (action_id, work_id, \
+                     kind, reason, since_seq, last_seen_seq) \
+                     VALUES (?1,?2,?3,?4,?5,?5) \
+                     ON CONFLICT(action_id) DO UPDATE SET work_id=?2, \
+                     kind=?3, reason=?4, last_seen_seq=?5",
+                    params![
+                        action_id,
+                        work_id.0,
+                        tag(hold_kind),
+                        reason,
+                        self.last_seq()?,
+                    ],
+                )?;
+            }
+            Effect::ClearOutboxHold { action_id } => {
+                self.exec(
+                    "DELETE FROM outbox_holds WHERE action_id=?1",
+                    params![action_id],
+                )?;
+            }
             Effect::InsertAttentionAck {
                 work_id,
                 attention_id,
@@ -4303,11 +4488,12 @@ impl TxView for Tx<'_> {
                     "INSERT INTO artifact_handoffs (artifact_id, invocation_id, \
                      request_id, work_id, execution_id, base, produced, \
                      manifest_digest, state, invalid_reason, attempt, \
-                     recorded_seq) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12) \
+                     verification_placement, recorded_seq) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) \
                      ON CONFLICT(artifact_id) DO UPDATE SET base=?6, produced=?7, \
                      manifest_digest=?8, state=?9, invalid_reason=?10, \
-                     attempt=?11, recorded_seq=?12 \
-                     WHERE artifact_handoffs.recorded_seq=?13",
+                     attempt=?11, verification_placement=?12, recorded_seq=?13 \
+                     WHERE artifact_handoffs.recorded_seq=?14",
                     params![
                         handoff.artifact_id,
                         handoff.invocation_id.0,
@@ -4320,6 +4506,12 @@ impl TxView for Tx<'_> {
                         tag(&handoff.state),
                         handoff.invalid_reason,
                         handoff.attempt,
+                        handoff
+                            .verification_placement
+                            .as_ref()
+                            .map(serde_json::to_string)
+                            .transpose()
+                            .map_err(|e| internal(Box::new(e)))?,
                         handoff.recorded_seq,
                         expected_seq,
                     ],

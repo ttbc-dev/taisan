@@ -5,6 +5,7 @@
 
 pub mod adapter;
 pub mod assessment_v2;
+pub mod bindings;
 pub mod bodies;
 pub mod boundary;
 pub mod bounded;
@@ -15,6 +16,7 @@ pub mod handoff;
 pub mod isolation;
 pub mod remote_collect;
 pub mod remote_custody;
+pub mod remote_dispatch;
 pub mod remote_export;
 pub mod remote_prepare;
 pub mod remote_transfer;

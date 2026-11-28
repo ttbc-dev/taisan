@@ -1,0 +1,5 @@
+{
+  "format_version": "taisan.worker.bindings/1",
+  "model": "example-model-1",
+  "endpoint": "https://api.example-runtime.example"
+}

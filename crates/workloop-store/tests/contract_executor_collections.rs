@@ -33,6 +33,7 @@ fn repo() -> RepositoryRef {
 
 fn config() -> WorkloopConfig {
     WorkloopConfig {
+        placement: Ok(workloop_core::placement::PlacementPolicy::default()),
         host: HostTemplate {
             adapter: AdapterId::trusted("fixture"),
             repository: repo(),
@@ -118,6 +119,7 @@ fn seeded_request(store: &SqliteStore, key: &str) -> String {
         store,
         &[Effect::InsertRequest {
             request: InvocationRequest {
+                placement: None,
                 request_id: request_id.clone(),
                 work_id,
                 execution_id,
@@ -642,7 +644,7 @@ fn a_v14_store_gains_the_collections_table() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 16, "the upgrade lands on the current format");
+    assert_eq!(version, 19, "the upgrade lands on the current format");
     assert!(
         store
             .transact(|tx| tx.executor_collection(&request_id))
@@ -696,7 +698,7 @@ fn a_v13_store_upgrades_through_v14_and_v15() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 16, "the upgrade lands on the current format");
+    assert_eq!(version, 19, "the upgrade lands on the current format");
     // The request row survived; re-attach the binding the v13 reshape
     // dropped so the collection's foreign key holds.
     assert!(

@@ -49,6 +49,13 @@ checksum = "sha256"
 unix-archive = ".tar.xz"
 # Where to host releases
 hosting = "github"
+# Sign SLSA build provenance for the release artifacts (#492).
+# allow-dirty = ["ci"] above means `dist generate` will not re-emit
+# release.yml today — the matching `Attest release artifacts` step is
+# hand-applied in the `host` job there instead, along with the
+# id-token:write / attestations:write grants cargo-dist cannot express.
+github-attestations = true
+github-attestations-phase = "host"
 # Static files copied into every app's release archive. The licensing
 # audit (docs/licensing-prep.md) requires each binary bundle to carry
 # both license texts, the third-party inventory, and the full license
